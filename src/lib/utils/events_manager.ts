@@ -1,4 +1,4 @@
-import { TAbstractFile, TFile, TFolder, Menu, MenuItem, normalizePath } from "obsidian";
+import { TAbstractFile, TFile, TFolder, Menu, MenuItem, Platform, normalizePath } from "obsidian";
 
 import { noteModify, noteDelete, noteRename, noteDeleteByPath } from "../sync/operator_note";
 import { fileModify, fileDelete, fileRename, fileDeleteByPath } from "../sync/operator_file";
@@ -158,6 +158,17 @@ export class EventManager {
       this.resumeTimer = null
       const websocket = this.plugin.websocket
       if (!websocket) return
+
+      // iOS may suspend the WebView while leaving its JavaScript WebSocket
+      // object in an OPEN state. A mobile resume must therefore rebuild the
+      // transport even when the cached client state still says "open".
+      // Desktop minimized windows can keep a healthy socket alive, so retain
+      // the non-destructive path there.
+      if (Platform.isMobile) {
+        dump(`Resume event (${source}); forcing a fresh mobile sync connection`)
+        websocket.forceReconnect()
+        return
+      }
 
       // A healthy socket is already the silent background-sync path. Rebuilding
       // it here would interrupt in-flight page ACKs and can strand a sync round.

@@ -18,6 +18,7 @@ const transpiled = ts.transpileModule(source, {
 
 const listeners = new Map();
 const documentStub = { visibilityState: "hidden" };
+const platformStub = { isMobile: true };
 const timers = new Map();
 let nextTimerId = 0;
 const windowStub = {
@@ -52,7 +53,7 @@ vm.runInNewContext(
         case "obsidian":
           return {
             TAbstractFile: class TAbstractFile {},
-            Platform: { isMobile: true },
+            Platform: platformStub,
             TFile: class TFile {},
             TFolder: class TFolder {},
             Menu: class Menu {},
@@ -113,6 +114,7 @@ vm.runInNewContext(
 const { EventManager } = module.exports;
 let unregisterCount = 0;
 let reconnectCount = 0;
+let forceReconnectCount = 0;
 let shareRefreshCount = 0;
 let unload;
 
@@ -140,6 +142,9 @@ const plugin = {
     triggerReconnect: () => {
       reconnectCount += 1;
     },
+    forceReconnect: () => {
+      forceReconnectCount += 1;
+    },
   },
   shareIndicatorManager: {
     syncWithServer: async () => {
@@ -163,8 +168,8 @@ listeners.get("offline")();
 assert.equal(unregisterCount, 0);
 assert.equal(reconnectCount, 0);
 
-// Contract: returning to the foreground refreshes state, but a healthy socket is
-// left alone so in-flight page ACKs are not interrupted.
+// Contract: returning to the foreground refreshes state and forces a fresh
+// mobile socket because the WebView may retain a stale OPEN object.
 documentStub.visibilityState = "visible";
 listeners.get("visibilitychange")();
 assert.equal(reconnectCount, 0);
@@ -177,15 +182,25 @@ listeners.get("online")();
 assert.equal(timers.size, 1);
 flushTimers();
 assert.equal(reconnectCount, 0);
+assert.equal(forceReconnectCount, 1);
 
-// Contract: once the connection is actually down, the same event burst causes
-// exactly one ordinary reconnect and never a forced socket replacement.
+// Contract: even when the client still reports OPEN, a mobile resume performs
+// exactly one forced replacement for the coalesced event burst.
 plugin.websocket.isOpen = false;
 listeners.get("focus")();
 listeners.get("visibilitychange")();
 listeners.get("online")();
 flushTimers();
-assert.equal(reconnectCount, 1);
+assert.equal(reconnectCount, 0);
+assert.equal(forceReconnectCount, 2);
+
+// Contract: a desktop resume keeps a healthy socket untouched.
+platformStub.isMobile = false;
+plugin.websocket.isOpen = true;
+listeners.get("focus")();
+flushTimers();
+assert.equal(reconnectCount, 0);
+assert.equal(forceReconnectCount, 2);
 
 unload();
 assert.equal(listeners.size, 0);
