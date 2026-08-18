@@ -59,6 +59,7 @@ export class WebSocketClient {
   private hasNotifiedReconnectFailure = false;
   public count = 0;
   private registerPromise: Promise<void> | null = null;
+  private connectionGeneration = 0;
   public isRegister = true;
   
   private statusListeners: Set<(status: boolean) => void> = new Set();
@@ -136,34 +137,57 @@ export class WebSocketClient {
     return this.isOpen;
   }
 
-  public async register() {
-    if (this.ws && (this.ws.readyState === WebSocket.CONNECTING || this.ws.readyState === WebSocket.OPEN)) {
+  public async register(force = false) {
+    const generation = this.connectionGeneration;
+
+    if (!force && this.ws && (this.ws.readyState === WebSocket.CONNECTING || this.ws.readyState === WebSocket.OPEN)) {
       dump("WebSocket already connecting or open, skipping register");
       return;
     }
 
     if (this.registerPromise) {
-      await this.registerPromise;
+      const pendingRegister = this.registerPromise;
+      await pendingRegister;
+      // A foreground event can arrive while a health probe or socket creation
+      // is still in flight. The first attempt may have been invalidated by a
+      // later forceReconnect(), so the latest request must get its own socket.
+      if (force && generation === this.connectionGeneration && this.isRegister) {
+        await this.register(true);
+      } else if (!force && this.isRegister && !this.ws) {
+        // unRegister() intentionally invalidates an in-flight probe. A caller
+        // that immediately registers again must not inherit the cancelled task.
+        await this.register();
+      }
       return;
     }
 
-    this.registerPromise = this._doRegister();
-    try {
-      await this.registerPromise;
-    } finally {
-      this.registerPromise = null;
-    }
+    const registerTask = this._doRegister(generation);
+    let trackedTask: Promise<void>;
+    trackedTask = registerTask.finally(() => {
+      if (this.registerPromise === trackedTask) {
+        this.registerPromise = null;
+      }
+    });
+    this.registerPromise = trackedTask;
+    await trackedTask;
   }
 
-  private async _doRegister() {
+  private async _doRegister(generation: number) {
     if (this.ws) {
-      this.cleanupWebSocket(this.ws);
+      const previousWs = this.ws;
+      this.cleanupWebSocket(previousWs);
+      if (this.ws === previousWs) {
+        this.ws = null as unknown as WebSocket;
+      }
     }
 
     this.isRegister = true;
 
     if (this.options.preConnectProbe) {
       const isHealthy = await this.options.preConnectProbe();
+      if (generation !== this.connectionGeneration) {
+        return;
+      }
       if (!isHealthy) {
         dump("Health check failed before ws connect, scheduling reconnect...");
         this.isOpen = false;
@@ -173,24 +197,31 @@ export class WebSocketClient {
       }
     }
 
+    if (generation !== this.connectionGeneration || !this.isRegister) {
+      return;
+    }
+
     const wsUrl = this.options.getWsUrl(this.count);
     if (isWsUrl(wsUrl)) {
-      this.ws = new WebSocket(wsUrl);
-      this.ws.binaryType = "arraybuffer";
+      const ws = new WebSocket(wsUrl);
+      this.ws = ws;
+      ws.binaryType = "arraybuffer";
       this.count++;
       this.plugin.app.saveLocalStorage(getWsCountStorageKey(this.plugin), this.count.toString());
 
-      this.ws.onerror = (error: Event) => {
+      ws.onerror = (error: Event) => {
+        if (this.ws !== ws) return;
         dump("WebSocket error:", {
           timestamp: safeMoment().format("YYYY-MM-DD HH:mm:ss.SSS"),
           url: wsUrl,
-          readyState: this.ws.readyState,
+          readyState: ws.readyState,
           error: error
         });
         this.notifyStatusChange(false);
       };
 
-      this.ws.onopen = (e: Event): void => {
+      ws.onopen = (e: Event): void => {
+        if (this.ws !== ws) return;
         this.timeConnect = 0;
         this.hasNotifiedReconnectFailure = false;
         this.isAuth = false;
@@ -203,7 +234,8 @@ export class WebSocketClient {
         this.options.onOpen?.(this);
       };
 
-      this.ws.onclose = (e: CloseEvent) => {
+      ws.onclose = (e: CloseEvent) => {
+        if (this.ws !== ws) return;
         this.isAuth = false;
         this.useProtobuf = false;
         this.isOpen = false;
@@ -230,7 +262,8 @@ export class WebSocketClient {
         dump("Service close");
       };
 
-      this.ws.onmessage = (event: MessageEvent) => {
+      ws.onmessage = (event: MessageEvent) => {
+        if (this.ws !== ws) return;
         if (event.data instanceof ArrayBuffer || event.data instanceof Blob) {
           void (async () => {
             let buf: ArrayBuffer;
@@ -311,7 +344,18 @@ export class WebSocketClient {
     }
   }
 
+  private closeCurrentWebSocket() {
+    const ws = this.ws;
+    if (!ws) return;
+
+    this.cleanupWebSocket(ws);
+    if (this.ws === ws) {
+      this.ws = null as unknown as WebSocket;
+    }
+  }
+
   public unRegister(setUnregistered = false) {
+    this.connectionGeneration++;
     window.clearTimeout(this.checkReConnectTimeout);
     this.timeConnect = 0;
     this.hasNotifiedReconnectFailure = false;
@@ -322,10 +366,7 @@ export class WebSocketClient {
       this.isRegister = false;
     }
 
-    if (this.ws) {
-      this.cleanupWebSocket(this.ws);
-      this.ws = null as unknown as WebSocket;
-    }
+    this.closeCurrentWebSocket();
 
     this.notifyStatusChange(false);
     dump("Service unregister");
@@ -362,6 +403,30 @@ export class WebSocketClient {
     this.hasNotifiedReconnectFailure = false;
     window.clearTimeout(this.checkReConnectTimeout);
     void this.register();
+  }
+
+  /**
+   * Rebuild the socket after a mobile foreground/network transition.
+   * A WebSocket can remain OPEN in the WebView while its underlying transport
+   * is already dead, so the normal register() guard is insufficient here.
+   */
+  public forceReconnect() {
+    if (!this.isRegister) {
+      dump("Force reconnect skipped because WebSocket registration is disabled");
+      return;
+    }
+
+    dump("Forcing WebSocket reconnect after foreground/network transition");
+    this.connectionGeneration++;
+    window.clearTimeout(this.checkReConnectTimeout);
+    this.timeConnect = 0;
+    this.hasNotifiedReconnectFailure = false;
+    this.isOpen = false;
+    this.isAuth = false;
+    this.useProtobuf = false;
+    this.closeCurrentWebSocket();
+    this.notifyStatusChange(false);
+    void this.register(true);
   }
 
   private async waitForBufferDrain(maxBufferSize = 5 * 1024 * 1024): Promise<void> {

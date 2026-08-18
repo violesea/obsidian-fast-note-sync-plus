@@ -238,6 +238,9 @@ export class WebSocketManager {
   public triggerReconnect() {
     this.client.triggerReconnect();
   }
+  public forceReconnect() {
+    this.client.forceReconnect();
+  }
   public SendMessage(action: WSAction.WSSendAction, data: unknown, before?: () => boolean, after?: () => void, context?: string) {
     const injectedData = this.injectContext(data, context);
     return this.client.SendMessage(action, injectedData, before, () => {

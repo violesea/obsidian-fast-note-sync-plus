@@ -38,6 +38,7 @@ vm.runInNewContext(
         case "obsidian":
           return {
             TAbstractFile: class TAbstractFile {},
+            Platform: { isMobile: true },
             TFile: class TFile {},
             TFolder: class TFolder {},
             Menu: class Menu {},
@@ -97,7 +98,7 @@ vm.runInNewContext(
 
 const { EventManager } = module.exports;
 let unregisterCount = 0;
-let reconnectCount = 0;
+let forceReconnectCount = 0;
 let shareRefreshCount = 0;
 let unload;
 
@@ -121,7 +122,10 @@ const plugin = {
       unregisterCount += 1;
     },
     triggerReconnect: () => {
-      reconnectCount += 1;
+      throw new Error("background recovery must use forceReconnect");
+    },
+    forceReconnect: () => {
+      forceReconnectCount += 1;
     },
   },
   shareIndicatorManager: {
@@ -138,16 +142,24 @@ manager.registerEvents();
 assert.equal(listeners.has("blur"), false);
 listeners.get("visibilitychange")();
 assert.equal(unregisterCount, 0);
-assert.equal(reconnectCount, 0);
+assert.equal(forceReconnectCount, 0);
+
+// Contract: going offline does not unregister the socket or clear its retry lifecycle.
+listeners.get("offline")();
+assert.equal(unregisterCount, 0);
+assert.equal(forceReconnectCount, 0);
 
 // Contract: returning to the foreground retries the connection and refreshes state.
 documentStub.visibilityState = "visible";
 listeners.get("visibilitychange")();
-assert.equal(reconnectCount, 1);
+assert.equal(forceReconnectCount, 1);
 assert.equal(shareRefreshCount, 1);
 
 listeners.get("focus")();
-assert.equal(reconnectCount, 2);
+assert.equal(forceReconnectCount, 2);
+
+listeners.get("online")();
+assert.equal(forceReconnectCount, 3);
 
 unload();
 assert.equal(listeners.size, 0);

@@ -1,4 +1,4 @@
-import { TAbstractFile, TFile, TFolder, Menu, MenuItem, normalizePath } from "obsidian";
+import { TAbstractFile, Platform, TFile, TFolder, Menu, MenuItem, normalizePath } from "obsidian";
 
 import { noteModify, noteDelete, noteRename, noteDeleteByPath } from "../sync/operator_note";
 import { fileModify, fileDelete, fileRename, fileDeleteByPath } from "../sync/operator_file";
@@ -68,7 +68,7 @@ export class EventManager {
   }
 
   private recordOfflineModify(file: TAbstractFile): boolean {
-    if (this.plugin.websocket?.isAuth) return false
+    if (this.plugin.websocket?.isAuth && !this.isBrowserOffline()) return false
     if (file.path === "/" || isPathExcluded(file.path, this.plugin)) return true
 
     if (file instanceof TFolder) {
@@ -81,7 +81,7 @@ export class EventManager {
   }
 
   private recordOfflineDelete(file: TAbstractFile): boolean {
-    if (this.plugin.websocket?.isAuth) return false
+    if (this.plugin.websocket?.isAuth && !this.isBrowserOffline()) return false
     if (file.path === "/" || isPathExcluded(file.path, this.plugin)) return true
 
     if (file instanceof TFolder) {
@@ -94,7 +94,7 @@ export class EventManager {
   }
 
   private recordOfflineRename(file: TAbstractFile, oldPath: string): boolean {
-    if (this.plugin.websocket?.isAuth) return false
+    if (this.plugin.websocket?.isAuth && !this.isBrowserOffline()) return false
 
     const oldExcluded = isPathExcluded(oldPath, this.plugin)
     const newExcluded = isPathExcluded(file.path, this.plugin)
@@ -112,23 +112,23 @@ export class EventManager {
 
   private onOnline = () => {
     dump(`Network restored (Event).`)
-    if (this.plugin.websocket) {
-      this.plugin.websocket.triggerReconnect()
-    }
+    this.plugin.websocket?.forceReconnect()
   }
 
   private onOffline = () => {
     dump(`Network lost (Event).`)
-    if (this.plugin.websocket) {
-      this.plugin.websocket.unRegister()
-    }
+    // Do not unregister here. The WebView may emit offline while the process
+    // is still alive; closing the socket would also clear its retry schedule.
+    // Local vault events are queued while navigator.onLine is false.
   }
 
   private onWindowFocus = () => {
     // Foregrounding is a recovery opportunity, not a prerequisite for sync.
-    // Reconnect only when needed; WebSocketClient ignores an already-open socket.
+    // Force a fresh socket because a mobile WebView can preserve a stale OPEN
+    // object after the OS suspended its underlying transport.
     dump("Obsidian window focus; background sync remains enabled")
-    this.plugin.websocket?.triggerReconnect()
+    if (Platform.isMobile) this.plugin.websocket?.forceReconnect()
+    else this.plugin.websocket?.triggerReconnect()
   }
 
   private onVisibilityChange = () => {
@@ -139,9 +139,14 @@ export class EventManager {
     } else {
       // Foregrounding resets backoff and drains any durable changes queued while
       // the process was offline or suspended.
-      this.plugin.websocket?.triggerReconnect()
+      if (Platform.isMobile) this.plugin.websocket?.forceReconnect()
+      else this.plugin.websocket?.triggerReconnect()
       void this.plugin.shareIndicatorManager?.syncWithServer()
     }
+  }
+
+  private isBrowserOffline(): boolean {
+    return typeof navigator !== "undefined" && navigator.onLine === false
   }
 
   private watchModify = (file: TAbstractFile, ctx?: unknown) => {
