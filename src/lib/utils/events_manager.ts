@@ -1,4 +1,4 @@
-import { TAbstractFile, Platform, TFile, TFolder, Menu, MenuItem, normalizePath } from "obsidian";
+import { TAbstractFile, TFile, TFolder, Menu, MenuItem, normalizePath } from "obsidian";
 
 import { noteModify, noteDelete, noteRename, noteDeleteByPath } from "../sync/operator_note";
 import { fileModify, fileDelete, fileRename, fileDeleteByPath } from "../sync/operator_file";
@@ -11,8 +11,10 @@ import { $ } from "../../i18n/lang";
 
 
 export class EventManager {
+  private static readonly RESUME_DEBOUNCE_MS = 1000
   private plugin: FastSync
   private rawEventTimers: Map<string, number> = new Map()
+  private resumeTimer: number | null = null
   //保存待处理的重命名文件的路径，用于跳过同时触发的 modify 事件
   private pendingRenamePaths: Set<string> = new Set()
 
@@ -64,6 +66,10 @@ export class EventManager {
   public stop() {
     this.rawEventTimers.forEach((timer) => window.clearTimeout(timer))
     this.rawEventTimers.clear()
+    if (this.resumeTimer !== null) {
+      window.clearTimeout(this.resumeTimer)
+      this.resumeTimer = null
+    }
     this.pendingRenamePaths.clear()
   }
 
@@ -112,7 +118,7 @@ export class EventManager {
 
   private onOnline = () => {
     dump(`Network restored (Event).`)
-    this.plugin.websocket?.forceReconnect()
+    this.scheduleResume("online")
   }
 
   private onOffline = () => {
@@ -124,11 +130,10 @@ export class EventManager {
 
   private onWindowFocus = () => {
     // Foregrounding is a recovery opportunity, not a prerequisite for sync.
-    // Force a fresh socket because a mobile WebView can preserve a stale OPEN
-    // object after the OS suspended its underlying transport.
+    // Coalesce focus and visibility notifications because mobile WebViews often
+    // emit both during one resume transition.
     dump("Obsidian window focus; background sync remains enabled")
-    if (Platform.isMobile) this.plugin.websocket?.forceReconnect()
-    else this.plugin.websocket?.triggerReconnect()
+    this.scheduleResume("focus")
   }
 
   private onVisibilityChange = () => {
@@ -137,12 +142,33 @@ export class EventManager {
       // and mobile platforms may suspend the process independently of the plugin.
       dump("Obsidian backgrounded; keeping sync connection alive")
     } else {
-      // Foregrounding resets backoff and drains any durable changes queued while
-      // the process was offline or suspended.
-      if (Platform.isMobile) this.plugin.websocket?.forceReconnect()
-      else this.plugin.websocket?.triggerReconnect()
+      // Foregrounding drains any durable changes queued while the process was
+      // offline or suspended. Do not tear down a healthy sync session here.
+      this.scheduleResume("visibilitychange")
       void this.plugin.shareIndicatorManager?.syncWithServer()
     }
+  }
+
+  private scheduleResume = (source: string) => {
+    if (this.resumeTimer !== null) {
+      window.clearTimeout(this.resumeTimer)
+    }
+
+    this.resumeTimer = window.setTimeout(() => {
+      this.resumeTimer = null
+      const websocket = this.plugin.websocket
+      if (!websocket) return
+
+      // A healthy socket is already the silent background-sync path. Rebuilding
+      // it here would interrupt in-flight page ACKs and can strand a sync round.
+      if (websocket.isOpen) {
+        dump(`Resume event (${source}); sync connection is healthy, no reconnect needed`)
+        return
+      }
+
+      dump(`Resume event (${source}); reconnecting the disconnected sync connection`)
+      websocket.triggerReconnect()
+    }, EventManager.RESUME_DEBOUNCE_MS)
   }
 
   private isBrowserOffline(): boolean {

@@ -18,6 +18,8 @@ const transpiled = ts.transpileModule(source, {
 
 const listeners = new Map();
 const documentStub = { visibilityState: "hidden" };
+const timers = new Map();
+let nextTimerId = 0;
 const windowStub = {
   addEventListener(name, listener) {
     listeners.set(name, listener);
@@ -25,9 +27,21 @@ const windowStub = {
   removeEventListener(name, listener) {
     if (listeners.get(name) === listener) listeners.delete(name);
   },
-  setTimeout,
-  clearTimeout,
+  setTimeout(callback, delay) {
+    const id = ++nextTimerId;
+    timers.set(id, { callback, delay });
+    return id;
+  },
+  clearTimeout(id) {
+    timers.delete(id);
+  },
 };
+
+function flushTimers() {
+  const pending = [...timers.values()];
+  timers.clear();
+  for (const timer of pending) timer.callback();
+}
 
 const module = { exports: {} };
 vm.runInNewContext(
@@ -98,7 +112,7 @@ vm.runInNewContext(
 
 const { EventManager } = module.exports;
 let unregisterCount = 0;
-let forceReconnectCount = 0;
+let reconnectCount = 0;
 let shareRefreshCount = 0;
 let unload;
 
@@ -118,14 +132,13 @@ const plugin = {
     configSyncEnabled: false,
   },
   websocket: {
+    isOpen: true,
+    ws: { readyState: 1 },
     unRegister: () => {
       unregisterCount += 1;
     },
     triggerReconnect: () => {
-      throw new Error("background recovery must use forceReconnect");
-    },
-    forceReconnect: () => {
-      forceReconnectCount += 1;
+      reconnectCount += 1;
     },
   },
   shareIndicatorManager: {
@@ -142,24 +155,37 @@ manager.registerEvents();
 assert.equal(listeners.has("blur"), false);
 listeners.get("visibilitychange")();
 assert.equal(unregisterCount, 0);
-assert.equal(forceReconnectCount, 0);
+assert.equal(reconnectCount, 0);
+assert.equal(timers.size, 0);
 
 // Contract: going offline does not unregister the socket or clear its retry lifecycle.
 listeners.get("offline")();
 assert.equal(unregisterCount, 0);
-assert.equal(forceReconnectCount, 0);
+assert.equal(reconnectCount, 0);
 
-// Contract: returning to the foreground retries the connection and refreshes state.
+// Contract: returning to the foreground refreshes state, but a healthy socket is
+// left alone so in-flight page ACKs are not interrupted.
 documentStub.visibilityState = "visible";
 listeners.get("visibilitychange")();
-assert.equal(forceReconnectCount, 1);
+assert.equal(reconnectCount, 0);
 assert.equal(shareRefreshCount, 1);
 
+// Contract: focus, visibility, and online events in one resume transition are
+// debounced into one recovery decision.
 listeners.get("focus")();
-assert.equal(forceReconnectCount, 2);
-
 listeners.get("online")();
-assert.equal(forceReconnectCount, 3);
+assert.equal(timers.size, 1);
+flushTimers();
+assert.equal(reconnectCount, 0);
+
+// Contract: once the connection is actually down, the same event burst causes
+// exactly one ordinary reconnect and never a forced socket replacement.
+plugin.websocket.isOpen = false;
+listeners.get("focus")();
+listeners.get("visibilitychange")();
+listeners.get("online")();
+flushTimers();
+assert.equal(reconnectCount, 1);
 
 unload();
 assert.equal(listeners.size, 0);

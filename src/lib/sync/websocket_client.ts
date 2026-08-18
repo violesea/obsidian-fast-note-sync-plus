@@ -398,10 +398,38 @@ export class WebSocketClient {
   }
 
   public triggerReconnect() {
+    if (!this.isRegister) {
+      dump("Trigger reconnect skipped because WebSocket registration is disabled");
+      return;
+    }
+
+    const currentWs = this.ws;
+    if (currentWs && currentWs.readyState === WebSocket.CONNECTING) {
+      dump("Trigger reconnect skipped because WebSocket is still connecting");
+      return;
+    }
+
+    if (currentWs && currentWs.readyState === WebSocket.OPEN && this.isOpen) {
+      dump("Trigger reconnect skipped because WebSocket is already healthy");
+      return;
+    }
+
     dump("Triggering manual reconnect due to network change");
     this.timeConnect = 0;
     this.hasNotifiedReconnectFailure = false;
     window.clearTimeout(this.checkReConnectTimeout);
+
+    // An error can leave the browser WebSocket object in OPEN while the
+    // transport is unusable. The normal register() guard would mistake that
+    // object for a healthy connection, so discard it before registering again.
+    if (currentWs && (currentWs.readyState === WebSocket.OPEN || currentWs.readyState === WebSocket.CLOSING)) {
+      this.isOpen = false;
+      this.isAuth = false;
+      this.useProtobuf = false;
+      this.closeCurrentWebSocket();
+      this.notifyStatusChange(false);
+    }
+
     void this.register();
   }
 

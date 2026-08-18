@@ -104,23 +104,34 @@ const firstSocket = FakeWebSocket.instances[0];
 firstSocket.open();
 assert.equal(client.isOpen, true);
 
-// Contract: ordinary reconnect may keep a healthy socket, but mobile recovery
-// must replace an OPEN object whose transport may have been suspended.
+// Contract: ordinary reconnect keeps a healthy socket.
 client.triggerReconnect();
 assert.equal(FakeWebSocket.instances.length, 1);
 
-client.forceReconnect();
+// Contract: if the client has already marked an OPEN object unusable, ordinary
+// recovery replaces that stale object instead of getting stuck on register's
+// OPEN guard.
+client.isOpen = false;
+client.triggerReconnect();
 assert.equal(FakeWebSocket.instances.length, 2);
-assert.equal(firstSocket.closeCalls.length, 1);
-assert.notEqual(client.ws, firstSocket);
+const recoveredSocket = FakeWebSocket.instances[1];
+recoveredSocket.open();
+await new Promise((resolve) => setTimeout(resolve, 0));
+
+// Contract: explicit force reconnect still replaces an OPEN socket when a
+// caller deliberately requests a hard reset.
+client.forceReconnect();
+assert.equal(FakeWebSocket.instances.length, 3);
+assert.equal(recoveredSocket.closeCalls.length, 1);
+assert.notEqual(client.ws, recoveredSocket);
 
 // Contract: two focus/visibility notifications in one turn still converge to
 // a live socket instead of leaving the second forced reconnect without a socket.
 client.forceReconnect();
 client.forceReconnect();
 await new Promise((resolve) => setTimeout(resolve, 0));
-assert.equal(FakeWebSocket.instances.length, 3);
-assert.equal(client.ws, FakeWebSocket.instances[2]);
+assert.equal(FakeWebSocket.instances.length, 4);
+assert.equal(client.ws, FakeWebSocket.instances[3]);
 
 // Contract: an explicit unregister followed immediately by register does not
 // get stuck waiting on the invalidated health probe.
@@ -137,7 +148,7 @@ probeClient.unRegister();
 const secondRegister = probeClient.register();
 releaseProbe(true);
 await Promise.all([firstRegister, secondRegister]);
-assert.equal(FakeWebSocket.instances.length, 4);
-assert.equal(probeClient.ws, FakeWebSocket.instances[3]);
+assert.equal(FakeWebSocket.instances.length, 5);
+assert.equal(probeClient.ws, FakeWebSocket.instances[4]);
 
 console.log("websocket-reconnect.test.mjs: all scenarios passed");
