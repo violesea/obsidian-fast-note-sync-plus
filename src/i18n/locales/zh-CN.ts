@@ -93,11 +93,6 @@ export default {
   "setting.sync.manual_sync_desc": "开启后，插件将不会在启动或文件修改时自动触发同步，仅可通过菜单手动触发。\n(<b>请谨慎开启</b>,该功能会严重影响使用体验)",
   "setting.sync.readonly_sync": "只读同步模式",
   "setting.sync.readonly_sync_desc": "开启后，本设备仅接收服务端更新，不上传任何本地修改。<b>优先级高于手动同步模式。</b>",
-  "setting.sync.auto_pause_minimized": "最小化自动暂停同步",
-  "setting.sync.auto_pause_minimized_desc": "开启后，当 Obsidian 窗口最小化时，将自动暂停本地文件变更引发的自动同步，默认关闭。",
-  "setting.sync.mobile_blur_pause": "手机端失焦延迟暂停同步",
-  "setting.sync.mobile_blur_pause_desc": "开启后，手机端 Obsidian 失焦（如切换 App）时将等待 30 秒再暂停同步，避免频繁开关连接。关闭后将不再因失焦而自动暂停。",
-
   "setting.sync.exclude": "同步排除 (笔记/附件/配置)",
   "setting.sync.exclude_placeholder": "路径或正则，每行一个",
   "setting.sync.exclude_desc": "符合规则的笔记、附件、目录或 **${configDir}** 配置文件将不会参与同步。\n\n**规则说明：**\n- 支持 `路径前缀`（如文件夹路径）或 `正则表达式`。\n- 每一行代表一条独立规则。\n- 点击右侧的 **Aa** 按钮切换大小写敏感（开启时严格匹配大小写）。\n\n**示例：**\n\n| 规则 | 匹配结果 |\n| --- | --- |\n| `Folder1/abc.md` | 精确匹配该文件 |\n| `Folder1` | 匹配 Folder1 目录及其所有内容 |\n| `${configDir}/plugins/` | 排除特定插件的配置目录 |\n| `.*\\.tmp$` | 正则匹配所有以 .tmp 结尾的文件 |",

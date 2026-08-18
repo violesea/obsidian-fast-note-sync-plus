@@ -93,11 +93,6 @@ export default {
   "setting.sync.manual_sync_desc": "활성화하면 플러그인이 시작되거나 파일이 수정될 때 자동으로 동기화를 트리거하지 않으며, 메뉴를 통해 수동으로만 동기화를 실행할 수 있습니다.\n(<b>신중하게 활성화하세요</b>, 이 기능은 사용 경험에 심각한 영향을 미칩니다)",
   "setting.sync.readonly_sync": "읽기 전용 동기화 모드",
   "setting.sync.readonly_sync_desc": "활성화하면 이 장치는 서버 업데이트만 수신하고 로컬 수정을 업로드하지 않습니다. <b>수동 동기화 모드보다 우선순위가 높습니다.</b>",
-  "setting.sync.auto_pause_minimized": "최소화 시 자동 동기화 일시중지",
-  "setting.sync.auto_pause_minimized_desc": "활성화하면 Obsidian 창이 최소화될 때 로컬 파일 변경으로 인한 자동 동기화가 자동으로 일시중지됩니다. 기본값은 비활성화입니다.",
-  "setting.sync.mobile_blur_pause": "모바일 포커스 손실 시 동기화 일시 중지 지연",
-  "setting.sync.mobile_blur_pause_desc": "활성화하면 모바일 Obsidian에서 포커스가 손실될 때(예: 다른 앱 전환) 동기화 일시 중지를 위해 30 초를 대기합니다. 이를 통해 연결을 빈번하게 끊고 재연결하는 것을 방지할 수 있습니다. 비활성화하면 포커스 손실 시 자동으로 동기화가 일시 중지되지 않습니다.",
-
   "setting.sync.exclude": "동기화 제외 (노트/첨부파일/설정)",
   "setting.sync.exclude_placeholder": "경로 또는 정규식, 한 줄에 하나",
   "setting.sync.exclude_desc": "규칙에 해당하는 노트, 첨부 파일, 디렉토리 또는 **${configDir}** 설정 파일은 동기화에서 제외됩니다.\n\n**규칙 설명:**\n- `경로 접두사`(예: 폴더 경로) 또는 `정규 표현식`을 지원합니다.\n- 각 줄은 하나의 독립적인 규칙을 나타냅니다.\n- 오른쪽의 **Aa** 버튼을 클릭하여 대소문자 구분 설정을 전환합니다(활성화 시 대소문자를 엄격히 일치시킴).\n\n**예시:**\n\n| 규칙 | 일치 결과 |\n| --- | --- |\n| `Folder1/abc.md` | 해당 파일을 정확히 일치시킴 |\n| `Folder1` | Folder1 디렉토리 및 모든 하위 항목 일치 |\n| `${configDir}/plugins/` | 특정 플러그인의 설정 디렉토리 제외 |\n| `.*\\.tmp$` | .tmp로 끝나는 모든 파일 정규 표현식 일치 |",

@@ -70,8 +70,6 @@ export interface PluginSettings {
   configSyncOtherDirs: string
   /** 网络请求库类型 */
   networkLibrary: "fetch" | "requestUrl"
-  /** 最小化自动暂停同步 */
-  autoPauseMinimized: boolean
   /** 分享中的笔记路径缓存（vault-relative 格式）
    * Cache of actively shared note paths (vault-relative format) */
   sharedPaths: string[]
@@ -100,8 +98,6 @@ export interface PluginSettings {
   wsPreProbeEnabled: boolean
   /** 移动端消息通知距顶距离（px）/ Mobile toast top offset (px) */
   mobileToastTop: number
-  /** 手机端失焦延迟暂停同步 / Mobile blur pause delay */
-  mobileBlurPauseEnabled: boolean
   /** 是否启用 128MB 二进制文件同步限制 / Enable 128MB binary sync limit */
   binarySyncLimitEnabled: boolean
   /** 是否启用 Protobuf 协议进行消息同步 */
@@ -156,7 +152,6 @@ export const DEFAULT_SETTINGS: PluginSettings = {
   showVersionInfo: false,
   configSyncOtherDirs: "",
   networkLibrary: "requestUrl",
-  autoPauseMinimized: false,
   sharedPaths: [],
   showShareIcon: true,
   updateSource: "github",
@@ -171,7 +166,6 @@ export const DEFAULT_SETTINGS: PluginSettings = {
   wsPreProbeEnabled: true,
   // 手机 110，平板 126，与 CSS 硬编码值一致 / Phone 110, tablet 126, matches CSS defaults
   mobileToastTop: Platform.isTablet ? 126 : 110,
-  mobileBlurPauseEnabled: true,
   binarySyncLimitEnabled: true,
   protobufEnabled: true,
   noteSyncLimit: 20,
@@ -1724,26 +1718,6 @@ export class SettingTab extends PluginSettingTab {
     )
     this.setDescWithBreaks(set.lastElementChild as HTMLElement, $("setting.sync.readonly_sync_desc"))
 
-    new Setting(set).setName($("setting.sync.auto_pause_minimized")).setClass("fns-setting-item-checkbox").addToggle((toggle) =>
-      toggle.setValue(this.plugin.settings.autoPauseMinimized).onChange(async (value) => {
-        if (value != this.plugin.settings.autoPauseMinimized) {
-          this.plugin.settings.autoPauseMinimized = value
-          await this.plugin.saveAndReloadServices()
-        }
-      }),
-    )
-    this.setDescWithBreaks(set.lastElementChild as HTMLElement, $("setting.sync.auto_pause_minimized_desc"))
-
-    new Setting(set).setName($("setting.sync.mobile_blur_pause")).setClass("fns-setting-item-checkbox").addToggle((toggle) =>
-      toggle.setValue(this.plugin.settings.mobileBlurPauseEnabled).onChange(async (value) => {
-        if (value != this.plugin.settings.mobileBlurPauseEnabled) {
-          this.plugin.settings.mobileBlurPauseEnabled = value
-          await this.plugin.saveAndReloadServices()
-        }
-      }),
-    )
-    this.setDescWithBreaks(set.lastElementChild as HTMLElement, $("setting.sync.mobile_blur_pause_desc"))
-
     this.addRuleSetting(
       set,
       $("setting.sync.exclude"),
@@ -2095,5 +2069,4 @@ export class VaultNameModal extends Modal {
     this.contentEl.empty();
   }
 }
-
 

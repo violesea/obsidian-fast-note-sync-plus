@@ -664,6 +664,16 @@ export default class FastSync extends Plugin {
 
     let hasMigration = false
 
+    // Remove legacy pause switches. Background sync is now always enabled;
+    // retaining old values would make an upgraded mobile client pause again.
+    const settingsWithLegacyFields = this.settings as PluginSettings & Record<string, unknown>
+    for (const key of ["autoPauseMinimized", "mobileBlurPauseEnabled"]) {
+      if (Object.prototype.hasOwnProperty.call(settingsWithLegacyFields, key)) {
+        delete settingsWithLegacyFields[key]
+        hasMigration = true
+      }
+    }
+
     // 注意加载顺序：先 vault，再 api/token。getMetadata 的历史键迁移会用到 this.settings.vault
     // （远端库名）来回溯旧键，因此必须先把 vault 装载好，否则 token 的迁移兜底拿不到远端库名。
 

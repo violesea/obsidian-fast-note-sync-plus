@@ -93,11 +93,6 @@ export default {
   "setting.sync.manual_sync_desc": "When enabled, the plugin will not automatically trigger sync on startup or file modification; sync can only be triggered manually via the menu.\n(<b>Enable with caution</b>, this feature will significantly impact the user experience)",
   "setting.sync.readonly_sync": "Read-only Sync Mode",
   "setting.sync.readonly_sync_desc": "When enabled, this device will only receive updates from the server and will not upload any local changes. <b>Priority is higher than Manual Sync Mode.</b>",
-  "setting.sync.auto_pause_minimized": "Auto Pause Sync When Minimized",
-  "setting.sync.auto_pause_minimized_desc": "When enabled, automatic sync triggered by local file changes will be paused when the Obsidian window is minimized. Disabled by default.",
-  "setting.sync.mobile_blur_pause": "Delay Sync Pause on Mobile Focus Loss",
-  "setting.sync.mobile_blur_pause_desc": "When enabled, Obsidian on mobile will wait 30 seconds before pausing sync after losing focus (e.g., switching apps), to avoid frequent connection toggling. When disabled, sync will not automatically pause due to focus loss.",
-
   "setting.sync.exclude": "Sync Exclusion (Notes/Attachments/Config)",
   "setting.sync.exclude_placeholder": "Path or regex, one per line",
   "setting.sync.exclude_desc": "Notes, attachments, directories, or **${configDir}** configuration files matching the rules will not be synced.\n\n**Rule Description:**\n- Supports `path prefixes` (e.g., folder paths) or `regular expressions`.\n- Each line represents an independent rule.\n- Click the **Aa** button on the right to toggle case sensitivity (strictly matches case when enabled).\n\n**Examples:**\n\n| Rule | Match Result |\n| --- | --- |\n| `Folder1/abc.md` | Matches this file exactly |\n| `Folder1` | Matches the Folder1 directory and all its contents |\n| `${configDir}/plugins/` | Excludes the configuration directory for specific plugins |\n| `.*\\.tmp$` | Regex match for all files ending with .tmp |",

@@ -1,4 +1,4 @@
-import { TAbstractFile, Platform, TFile, TFolder, Menu, MenuItem, normalizePath } from "obsidian";
+import { TAbstractFile, TFile, TFolder, Menu, MenuItem, normalizePath } from "obsidian";
 
 import { noteModify, noteDelete, noteRename, noteDeleteByPath } from "../sync/operator_note";
 import { fileModify, fileDelete, fileRename, fileDeleteByPath } from "../sync/operator_file";
@@ -15,7 +15,6 @@ export class EventManager {
   private rawEventTimers: Map<string, number> = new Map()
   //保存待处理的重命名文件的路径，用于跳过同时触发的 modify 事件
   private pendingRenamePaths: Set<string> = new Set()
-  private blurTimer: number | null = null
 
   constructor(plugin: FastSync) {
     this.plugin = plugin
@@ -43,7 +42,6 @@ export class EventManager {
 
     // --- Window Events ---
     window.addEventListener("focus", this.onWindowFocus)
-    window.addEventListener("blur", this.onWindowBlur)
     window.addEventListener("visibilitychange", this.onVisibilityChange)
     window.addEventListener("online", this.onOnline)
     window.addEventListener("offline", this.onOffline)
@@ -53,7 +51,6 @@ export class EventManager {
       dump("EventManager: cleaning up")
       this.stop() // 清除所有待处理任务定时器 (Clear all pending task timers)
       window.removeEventListener("focus", this.onWindowFocus)
-      window.removeEventListener("blur", this.onWindowBlur)
       window.removeEventListener("visibilitychange", this.onVisibilityChange)
       window.removeEventListener("online", this.onOnline)
       window.removeEventListener("offline", this.onOffline)
@@ -68,10 +65,6 @@ export class EventManager {
     this.rawEventTimers.forEach((timer) => window.clearTimeout(timer))
     this.rawEventTimers.clear()
     this.pendingRenamePaths.clear()
-    if (this.blurTimer) {
-      window.clearTimeout(this.blurTimer)
-      this.blurTimer = null
-    }
   }
 
   private recordOfflineModify(file: TAbstractFile): boolean {
@@ -132,47 +125,21 @@ export class EventManager {
   }
 
   private onWindowFocus = () => {
-    if (Platform.isMobile) {
-      dump("Obsidian Mobile Focus")
-      if (this.blurTimer) {
-        window.clearTimeout(this.blurTimer)
-        this.blurTimer = null
-        dump("Obsidian Mobile Focus (Timer cancelled)")
-      }
-      dump("Obsidian Mobile Plugin Focus")
-      // 回到前台立即重置退避计数器并重连
-      // Reset backoff counter and reconnect immediately when returning to foreground
-      this.plugin.websocket?.triggerReconnect()
-    }
-  }
-
-  private onWindowBlur = () => {
-    dump("Obsidian Mobile Blur")
-    if (Platform.isMobile) {
-      if (this.plugin.settings.mobileBlurPauseEnabled) {
-        dump("Obsidian Mobile Plugin Blur (Waiting 30s)")
-        if (this.blurTimer) window.clearTimeout(this.blurTimer)
-        this.blurTimer = window.setTimeout(() => {
-          dump("Obsidian Mobile Blur (Executing)")
-          this.plugin.websocket?.unRegister()
-          this.blurTimer = null
-        }, 30000)
-      }
-    }
+    // Foregrounding is a recovery opportunity, not a prerequisite for sync.
+    // Reconnect only when needed; WebSocketClient ignores an already-open socket.
+    dump("Obsidian window focus; background sync remains enabled")
+    this.plugin.websocket?.triggerReconnect()
   }
 
   private onVisibilityChange = () => {
     if (activeDocument.visibilityState === "hidden") {
-      if (this.plugin.settings.autoPauseMinimized) {
-        dump("Obsidian 已最小化，自动暂停同步")
-        this.plugin.websocket?.unRegister()
-      }
+      // Do not unregister here. Desktop WebViews can remain alive while minimized,
+      // and mobile platforms may suspend the process independently of the plugin.
+      dump("Obsidian backgrounded; keeping sync connection alive")
     } else {
-      // 恢复可见时立即重置退避计数器并重连
-      // Reset backoff counter and reconnect immediately when becoming visible again
+      // Foregrounding resets backoff and drains any durable changes queued while
+      // the process was offline or suspended.
       this.plugin.websocket?.triggerReconnect()
-      // 恢复前台时刷新分享状态（覆盖短暂后台期间其他设备变更分享的场景）
-      // Refresh share state on foreground resume (covers share changes by other devices during brief background)
       void this.plugin.shareIndicatorManager?.syncWithServer()
     }
   }
