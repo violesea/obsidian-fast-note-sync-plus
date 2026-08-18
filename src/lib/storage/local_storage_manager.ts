@@ -158,6 +158,7 @@ export class LocalStorageManager {
         this.setMetadata('lastConfigSyncTime', 0);
         this.setMetadata('lastFolderSyncTime', 0);
         this.setMetadata('isInitSync', false);
+        this.plugin.incrementalScanManager?.requestFullReconcile();
         // 同步清除持久化的冲突路径，避免重启后旧冲突记录在全新同步后误触发冲突列表弹窗
         // Also clear persisted conflicted paths so stale conflicts don't re-surface after a fresh sync
         this.setConflictedPaths(new Set());
@@ -219,15 +220,6 @@ export class LocalStorageManager {
      * 检查变更并触发同步
      */
     private async checkChanges() {
-        // 如果未连接或未初始化，跳过检查
-        if (!this.plugin.websocket || !this.plugin.websocket.isConnected()) {
-            // dump("[LocalStorageManager] Skip check: WebSocket not ready or not connected.");
-            return;
-        }
-        if (this.plugin.isSyncing) {
-            // dump("[LocalStorageManager] Skip check: Syncing in progress.");
-            return;
-        }
         if (!this.plugin.isFirstSync) {
             // dump("[LocalStorageManager] Skip check: First sync not completed.");
             return;
@@ -236,6 +228,10 @@ export class LocalStorageManager {
             // dump("[LocalStorageManager] Skip check: Config sync disabled.");
             return;
         }
+
+        const canSendNow = this.plugin.websocket?.isConnected() === true
+            && this.plugin.websocket.isAuth
+            && !this.plugin.isSyncing;
 
         const keys = this.getKeys();
         for (const key of keys) {
@@ -254,8 +250,13 @@ export class LocalStorageManager {
                 this.saveState();
 
                 const path = this.keyToPath(key);
-                dump(`[LocalStorageManager] Triggering configModify for path: ${path}`);
-                void configModify(path, this.plugin, false, val);
+                if (canSendNow) {
+                    dump(`[LocalStorageManager] Triggering configModify for path: ${path}`);
+                    void configModify(path, this.plugin, false, val);
+                } else {
+                    this.plugin.incrementalScanManager?.markModified("config", path);
+                    dump(`[LocalStorageManager] Queued offline config change for path: ${path}`);
+                }
             }
         }
     }

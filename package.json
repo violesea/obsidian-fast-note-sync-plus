@@ -13,6 +13,7 @@
     "fix": "eslint --fix src",
     "build": "tsc -noEmit -skipLibCheck && node esbuild.config.mjs production",
     "test:auth": "node tests/websocket-auth-error.test.mjs",
+    "test:incremental": "node tests/incremental-scan-manager.test.mjs",
     "test:mirror": "node tests/file-mirror-restore.test.mjs",
     "test:vault-name": "node tests/vault-name-setting.test.mjs",
     "ver": "node ./scripts/update-version.js",

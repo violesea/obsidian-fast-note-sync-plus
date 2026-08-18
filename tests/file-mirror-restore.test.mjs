@@ -137,9 +137,11 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
   assert.equal(ls.has("fns-fileHashMap"), true, "localStorage 应有稳定 key 数据");
   assert.equal(filesA.has(MIRROR_PATH), true, "镜像文件应已写入");
+  assert.equal(filesA.has(".obsidian/plugins/fast-note-sync/syncHashMap.json"), true, "同步基准镜像应已写入");
   const mirrored = JSON.parse(filesA.get(MIRROR_PATH));
   assert.equal(mirrored["notes/a.md"].hash, "hash-a");
   assert.equal(mirrored["img/b.png"].hash, "hash-b");
+  assert.deepEqual(JSON.parse(filesA.get(".obsidian/plugins/fast-note-sync/syncHashMap.json"))["notes/a.md"], "hash-a");
 
   // === 场景 B：模拟移动端 localStorage 被系统清除 → 新实例应从镜像恢复，不重建 ===
   ls.clear();

@@ -13,6 +13,8 @@ import type FastSync from "../../main";
 import { $ } from "../../i18n/lang";
 import { SyncType } from "./sync_progress_tracker";
 import { ConfirmModal } from "../../views/confirm-modal";
+import { incrementalEntryKey, mergeDirtyEntries } from "./incremental_scan_manager";
+import type { DirtyEntry, DirtySnapshot } from "./incremental_scan_manager";
 
 // C9: 离线超墓碑期保护 — 默认与服务端 soft-delete-retention-time 默认值对应（90 天），
 // 先硬编码常量；服务端墓碑物理清除窗口过后，长期离线设备重连若检测到"本地有服务端无"的
@@ -45,9 +47,269 @@ function confirmOfflineTombstoneUpload(plugin: FastSync, uploadCount: number): P
   });
 }
 
+interface IncrementalScanBuckets {
+  notes: SnapFile[];
+  files: SnapFile[];
+  configs: SnapFile[];
+  folders: SnapFolder[];
+  delNotes: PathHashFile[];
+  delFiles: PathHashFile[];
+  delConfigs: PathHashFile[];
+  delFolders: PathHashFile[];
+  missingNotes: PathHashFile[];
+  missingFiles: PathHashFile[];
+  missingConfigs: PathHashFile[];
+  missingFolders: PathHashFile[];
+}
+
+const collectIncrementalEntries = (plugin: FastSync, snapshot: DirtySnapshot): DirtyEntry[] => {
+  const supplementalEntries: DirtyEntry[] = [];
+
+  for (const path of plugin.pendingNoteModifies.keys()) {
+    supplementalEntries.push({ kind: "note", operation: "modify", path, version: 0 });
+  }
+  for (const path of plugin.pendingUploadHashes.keys()) {
+    supplementalEntries.push({ kind: "file", operation: "modify", path, version: 0 });
+  }
+  for (const path of plugin.pendingConfigModifies.keys()) {
+    supplementalEntries.push({ kind: "config", operation: "modify", path, version: 0 });
+  }
+  for (const path of plugin.pendingNoteDeleteAcks) {
+    supplementalEntries.push({ kind: "note", operation: "delete", path, version: 0 });
+  }
+  for (const path of plugin.pendingFileDeleteAcks) {
+    supplementalEntries.push({ kind: "file", operation: "delete", path, version: 0 });
+  }
+  for (const path of plugin.pendingConfigDeleteAcks) {
+    supplementalEntries.push({ kind: "config", operation: "delete", path, version: 0 });
+  }
+  for (const pending of plugin.pendingNoteRenames.values()) {
+    supplementalEntries.push({ kind: "note", operation: "delete", path: pending.oldPath, version: 0 });
+    supplementalEntries.push({ kind: "note", operation: "modify", path: pending.newPath, version: 0 });
+  }
+  for (const pending of plugin.pendingFileRenames) {
+    supplementalEntries.push({ kind: "file", operation: "delete", path: pending.oldPath, version: 0 });
+    supplementalEntries.push({ kind: "file", operation: "modify", path: pending.newPath, version: 0 });
+  }
+  return mergeDirtyEntries(snapshot.entries, supplementalEntries);
+};
+
+const addDeletedPath = (plugin: FastSync, entry: DirtyEntry, buckets: IncrementalScanBuckets): void => {
+  const item = { path: entry.path, pathHash: hashContent(entry.path) };
+  const target = plugin.settings.offlineDeleteSyncEnabled ? "delete" : "missing";
+  if (entry.kind === "note") {
+    if (plugin.fileHashManager.getPathHash(entry.path) !== null) {
+      (target === "delete" ? buckets.delNotes : buckets.missingNotes).push(item);
+    }
+  } else if (entry.kind === "file") {
+    if (plugin.fileHashManager.getPathHash(entry.path) !== null) {
+      (target === "delete" ? buckets.delFiles : buckets.missingFiles).push(item);
+    }
+  } else if (entry.kind === "folder") {
+    if (plugin.folderSnapshotManager.getMtime(entry.path) !== null) {
+      (target === "delete" ? buckets.delFolders : buckets.missingFolders).push(item);
+    }
+  } else if (plugin.configHashManager?.isReady() && plugin.configHashManager.getPathHash(entry.path) !== null) {
+    (target === "delete" ? buckets.delConfigs : buckets.missingConfigs).push(item);
+  }
+};
+
+const scanIncrementalVaultEntries = async (
+  plugin: FastSync,
+  entries: DirtyEntry[],
+  buckets: IncrementalScanBuckets,
+): Promise<Set<string>> => {
+  const processed = new Set<string>();
+  for (const entry of entries) {
+    const key = incrementalEntryKey(entry.kind, entry.path);
+    if (entry.kind === "config") continue;
+
+    const excluded = entry.kind === "folder"
+      ? isFolderSyncPathExcluded(entry.path, plugin)
+      : isPathExcluded(entry.path, plugin);
+    if (excluded) {
+      processed.add(key);
+      continue;
+    }
+
+    if (entry.operation === "delete") {
+      addDeletedPath(plugin, entry, buckets);
+      processed.add(key);
+      continue;
+    }
+
+    const abstractFile = plugin.app.vault.getAbstractFileByPath(normalizePath(entry.path));
+    if (!abstractFile) {
+      addDeletedPath(plugin, { ...entry, operation: "delete" }, buckets);
+      processed.add(key);
+      continue;
+    }
+
+    if (abstractFile instanceof TFolder) {
+      if (abstractFile.path !== "/" && !isFolderSyncPathExcluded(abstractFile.path, plugin)) {
+        buckets.folders.push({ path: abstractFile.path, pathHash: hashContent(abstractFile.path) });
+      }
+      processed.add(key);
+      continue;
+    }
+    if (!(abstractFile instanceof TFile)) {
+      processed.add(key);
+      continue;
+    }
+
+    const file = abstractFile;
+    if (file.extension === "md") {
+      const noteLimit = (plugin.settings.noteSyncLimit ?? 20) * 1024 * 1024;
+      if (file.stat.size > noteLimit) {
+        processed.add(key);
+        continue;
+      }
+
+      // A queued modify event is the source of truth that the file changed. Do not
+      // reuse a cache entry when mtime/size happen to have the same filesystem
+      // precision; that would turn a real edit into a silent no-op.
+      let contentHash = entry.operation === "modify"
+        ? null
+        : plugin.fileHashManager.getValidHash(file.path, file.stat.mtime, file.stat.size);
+      if (contentHash === null) {
+        try {
+          contentHash = await Promise.race([
+            hashContentAsync(await plugin.app.vault.read(file)),
+            new Promise<never>((_, reject) => window.setTimeout(() => reject(new Error("Hash timeout")), 15000)),
+          ]);
+          plugin.scannedNoteHashes.set(file.path, { hash: contentHash, mtime: file.stat.mtime, size: file.stat.size });
+        } catch {
+          continue;
+        }
+      }
+      const baseHash = plugin.fileHashManager.getPathHash(file.path);
+      buckets.notes.push({
+        path: file.path,
+        pathHash: hashContent(file.path),
+        contentHash,
+        mtime: file.stat.mtime,
+        ctime: file.stat.ctime,
+        size: file.stat.size,
+        ...(baseHash !== null ? { baseHash } : { baseHashMissing: true }),
+      });
+      processed.add(key);
+      continue;
+    }
+
+    const attachmentLimit = (plugin.settings.attachmentSyncLimit ?? 50) * 1024 * 1024;
+    if (isLargeBinarySyncRisk(file.stat.size, plugin) || file.stat.size > attachmentLimit) {
+      processed.add(key);
+      continue;
+    }
+    const skipSync = plugin.settings.cloudPreviewEnabled
+      && (!plugin.settings.cloudPreviewTypeRestricted || FileCloudPreview.isRestrictedType("." + file.extension));
+    if (skipSync) {
+      processed.add(key);
+      continue;
+    }
+
+    let contentHash = entry.operation === "modify"
+      ? null
+      : plugin.fileHashManager.getValidHash(file.path, file.stat.mtime, file.stat.size);
+    if (contentHash === null) {
+      try {
+        contentHash = await Promise.race([
+          hashFileAsync(plugin.app, file.path),
+          new Promise<never>((_, reject) => window.setTimeout(() => reject(new Error("Hash timeout")), 15000)),
+        ]);
+        plugin.scannedFileHashes.set(file.path, { hash: contentHash, mtime: file.stat.mtime, size: file.stat.size });
+      } catch {
+        continue;
+      }
+    }
+    const baseHash = plugin.fileHashManager.getPathHash(file.path);
+    buckets.files.push({
+      path: file.path,
+      pathHash: hashContent(file.path),
+      contentHash,
+      mtime: file.stat.mtime,
+      ctime: file.stat.ctime,
+      size: file.stat.size,
+      ...(baseHash !== null ? { baseHash } : { baseHashMissing: true }),
+    });
+    processed.add(key);
+  }
+  return processed;
+};
+
+const scanIncrementalConfigEntries = async (
+  plugin: FastSync,
+  entries: DirtyEntry[],
+  buckets: IncrementalScanBuckets,
+): Promise<Set<string>> => {
+  const processed = new Set<string>();
+  if (!plugin.settings.configSyncEnabled || !plugin.configHashManager?.isReady()) return processed;
+
+  const storageConfigs = await plugin.localStorageManager.getStorageConfigs();
+  const storageByPath = new Map(storageConfigs.map((item) => [item.path, item]));
+
+  for (const entry of entries) {
+    if (entry.kind !== "config") continue;
+    const key = incrementalEntryKey(entry.kind, entry.path);
+    if (configIsPathExcluded(entry.path, plugin)) {
+      processed.add(key);
+      continue;
+    }
+    if (entry.operation === "delete") {
+      addDeletedPath(plugin, entry, buckets);
+      processed.add(key);
+      continue;
+    }
+
+    const virtual = storageByPath.get(entry.path);
+    if (virtual) {
+      buckets.configs.push(virtual);
+      processed.add(key);
+      continue;
+    }
+
+    const path = normalizePath(entry.path);
+    let stat: { mtime: number; ctime?: number; size: number } | null = null;
+    try {
+      stat = await plugin.app.vault.adapter.stat(path);
+    } catch {
+      stat = null;
+    }
+    if (!stat || isLargeBinarySyncRisk(stat.size, plugin)) {
+      if (!stat) addDeletedPath(plugin, { ...entry, operation: "delete" }, buckets);
+      processed.add(key);
+      continue;
+    }
+
+    let contentHash = entry.operation === "modify"
+      ? null
+      : plugin.configHashManager.getValidHash(entry.path, stat.mtime, stat.size);
+    if (contentHash === null) {
+      try {
+        contentHash = await hashFileAsync(plugin.app, path);
+        plugin.scannedConfigHashes.set(entry.path, { hash: contentHash, mtime: stat.mtime, size: stat.size });
+      } catch {
+        continue;
+      }
+    }
+    buckets.configs.push({
+      path: entry.path,
+      pathHash: hashContent(entry.path),
+      contentHash,
+      mtime: stat.mtime,
+      ctime: stat.ctime ?? stat.mtime,
+      size: stat.size,
+    });
+    processed.add(key);
+  }
+  return processed;
+};
+
 
 export const startupSync = (plugin: FastSync): void => {
-  void handleSync(plugin, plugin.localStorageManager.getMetadata("isInitSync") as boolean);
+  const localStorageInitialSync = plugin.localStorageManager.getMetadata("isInitSync") as boolean;
+  const useIncremental = plugin.incrementalScanManager?.canUseIncrementalSync(localStorageInitialSync) === true;
+  void handleSync(plugin, useIncremental);
 };
 export const startupFullSync = async (plugin: FastSync) => {
   void handleSync(plugin, false);
@@ -68,6 +330,7 @@ export const rebuildAllHashes = async (plugin: FastSync) => {
 export const clearAllHashes = async (plugin: FastSync) => {
   plugin.fileHashManager.clearAll();
   plugin.configHashManager.clearAll();
+  plugin.incrementalScanManager?.requestFullReconcile();
 };
 
 
@@ -102,6 +365,7 @@ export function checkSyncCompletion(plugin: FastSync, intervalId?: number, syncS
       }
     }
     dump(`Sync completion timeout after ${SYNC_TIMEOUT_MS}ms. Tasks: note=${JSON.stringify(plugin.noteSyncTasks)}, file=${JSON.stringify(plugin.fileSyncTasks)}, folder=${JSON.stringify(plugin.folderSyncTasks)}, config=${JSON.stringify(plugin.configSyncTasks)}`)
+    plugin.incrementalScanManager?.abortSync();
     plugin.syncState.activeSyncContext = null; // 同步超时，清空活跃的上下文 / Sync timeout, reset the active context
     plugin.syncTypeCompleteCount = 0;
     plugin.resetSyncTasks();
@@ -211,6 +475,7 @@ export function checkSyncCompletion(plugin: FastSync, intervalId?: number, syncS
     const offlineGuardSkippedThisRound = plugin.syncState.offlineGuardSkippedThisRound;
 
     plugin.syncState.activeSyncContext = null; // 同步完成，清空活跃的上下文 / Sync completed, reset the active context
+    plugin.incrementalScanManager?.completeSync();
     plugin.syncTypeCompleteCount = 0;
     plugin.resetSyncTasks();
     plugin.syncPageStateMap.clear(); // 同步完成，清空残留的页状态 / Sync completed, clear page state map
@@ -587,7 +852,14 @@ export const handleSync = async function (plugin: FastSync, isLoadLastTime: bool
   // 提到 try 外部，使 catch/finally 也能引用本次会话的 context 做归属判断
   // Hoisted outside try so catch/finally can reference this session's context for ownership checks
   let context = "";
+  let fastIncremental = false;
   try {
+    // The event-only path is safe only when a durable local baseline exists.
+    // If it does not, fail closed to the original full reconciliation.
+    fastIncremental = isLoadLastTime
+      && plugin.incrementalScanManager?.canUseIncrementalSync(plugin.localStorageManager.getMetadata("isInitSync")) === true;
+    isLoadLastTime = fastIncremental;
+
     context = generateUUID();
     plugin.syncState.activeSyncContext = context; // 记录活跃的同步上下文 / Record the active sync context
     dump(`Sync context generated: ${context}`);
@@ -609,10 +881,19 @@ export const handleSync = async function (plugin: FastSync, isLoadLastTime: bool
     plugin.syncTypeCompleteCount = 0;
     plugin.resetSyncTasks();
 
+    // Capture durable dirty paths before transient ACK/rename state is reset
+    // below. A full auto run establishes a new baseline; a manual partial run
+    // leaves entries for the types it did not reconcile.
+    const dirtySnapshot = plugin.incrementalScanManager?.beginSync(!fastIncremental && syncMode === "auto") ?? null;
+    const incrementalEntries = fastIncremental && dirtySnapshot
+      ? collectIncrementalEntries(plugin, dirtySnapshot)
+      : [];
+
     const shouldSyncNotes = syncMode === "auto" || syncMode === "note";
     const shouldSyncConfigs = syncMode === "auto" || syncMode === "config";
 
     const activeTypes: SyncType[] = [];
+    let scannedVaultEntryCount = 0;
     if (plugin.settings.syncEnabled && shouldSyncNotes) {
       activeTypes.push('note', 'folder');
       if (!plugin.settings.cloudPreviewEnabled || plugin.settings.cloudPreviewTypeRestricted) {
@@ -672,6 +953,7 @@ export const handleSync = async function (plugin: FastSync, isLoadLastTime: bool
     plugin.expectedSyncCount = expectedCount;
     if (expectedCount === 0) {
       plugin.updateStatusBar("");
+      plugin.incrementalScanManager?.abortSync();
       plugin.syncState.activeSyncContext = null; // 无同步任务，清空上下文 / No tasks, reset the context
       return;
     }
@@ -697,6 +979,20 @@ export const handleSync = async function (plugin: FastSync, isLoadLastTime: bool
     const notes: SnapFile[] = [], files: SnapFile[] = [], configs: SnapFile[] = [], folders: SnapFolder[] = [];
     const delNotes: PathHashFile[] = [], delFiles: PathHashFile[] = [], delConfigs: PathHashFile[] = [], delFolders: PathHashFile[] = [];
     const missingNotes: PathHashFile[] = [], missingFiles: PathHashFile[] = [], missingConfigs: PathHashFile[] = [], missingFolders: PathHashFile[] = [];
+    const scanBuckets: IncrementalScanBuckets = {
+      notes,
+      files,
+      configs,
+      folders,
+      delNotes,
+      delFiles,
+      delConfigs,
+      delFolders,
+      missingNotes,
+      missingFiles,
+      missingConfigs,
+      missingFolders,
+    };
 
     // 预先标记未参与本次同步的模块为已结束，避免 checkSyncCompletion 永远等待它们
     // Pre-mark modules not participating in this sync as ended to prevent checkSyncCompletion from waiting forever
@@ -712,9 +1008,15 @@ export const handleSync = async function (plugin: FastSync, isLoadLastTime: bool
     }
 
     if (plugin.settings.syncEnabled && shouldSyncNotes) {
+      if (fastIncremental) {
+        const processed = await scanIncrementalVaultEntries(plugin, incrementalEntries, scanBuckets);
+        plugin.incrementalScanManager?.markProcessed(processed);
+        dump(`[IncrementalScan] event paths=${incrementalEntries.filter((entry) => entry.kind !== "config").length}, notes=${notes.length}, files=${files.length}, folders=${folders.length}`);
+      } else {
       const list = plugin.app.vault.getAllLoadedFiles();
       let processedCount = 0;
       const totalFiles = list.length;
+      scannedVaultEntryCount = totalFiles;
       // 简单预估配置数量，用于合并进度条
       const estimatedConfigCount = plugin.settings.configSyncEnabled ? 100 : 0;
       const totalToProcess = totalFiles + estimatedConfigCount;
@@ -747,6 +1049,7 @@ export const handleSync = async function (plugin: FastSync, isLoadLastTime: bool
         if (++processedCount % 20 === 0) {
           await yieldToMain();
           if (isPluginUnloading) {
+            plugin.incrementalScanManager?.abortSync();
             plugin.syncState.activeSyncContext = null;
             return;
           }
@@ -966,20 +1269,29 @@ export const handleSync = async function (plugin: FastSync, isLoadLastTime: bool
         }
       }
     }
+      }
 
     const configDirs = [plugin.app.vault.configDir, ...getConfigSyncCustomDirs(plugin)]
-    const configPaths = plugin.settings.configSyncEnabled && shouldSyncConfigs ? await configAllPaths(configDirs, plugin) : [];
+    const configPaths = plugin.settings.configSyncEnabled && shouldSyncConfigs && !fastIncremental
+      ? await configAllPaths(configDirs, plugin)
+      : [];
+    if (fastIncremental && shouldSyncConfigs) {
+      const processed = await scanIncrementalConfigEntries(plugin, incrementalEntries, scanBuckets);
+      plugin.incrementalScanManager?.markProcessed(processed);
+      dump(`[IncrementalScan] config paths=${incrementalEntries.filter((entry) => entry.kind === "config").length}, configs=${configs.length}`);
+    }
 
     let configCount = 0;
     const totalConfigs = configPaths.length;
     // 获取已处理的基础文件数，用于连续进度条
-    const baseProcessedCount = plugin.settings.syncEnabled ? plugin.app.vault.getAllLoadedFiles().length : 0;
+    const baseProcessedCount = plugin.settings.syncEnabled && !fastIncremental ? scannedVaultEntryCount : 0;
     const overallTotal = baseProcessedCount + totalConfigs;
 
     for (const path of configPaths) {
       if (++configCount % 20 === 0) { // 已将 50 优化为 20
         await sleep(0);
         if (isPluginUnloading) {
+          plugin.incrementalScanManager?.abortSync();
           plugin.syncState.activeSyncContext = null; // 插件卸载中，清空上下文 / Plugin unloading, reset the context
           return;
         }
@@ -1154,6 +1466,7 @@ export const handleSync = async function (plugin: FastSync, isLoadLastTime: bool
     plugin.syncState.progressCheckIntervalId = progressCheckInterval;
   } catch (error) {
     dump("Sync failed with error: " + (error instanceof Error ? error.message : String(error)));
+    plugin.incrementalScanManager?.abortSync();
     // 归属判断：只有当前活跃上下文仍是本次会话时才清空/重置，防止旧会话的迟到异常
     // （例如断线重连后旧会话 BatchAck 15s 超时才抛出）把已经在跑的新会话状态清掉
     // Ownership guard: only clear/reset when the active context still belongs to this
@@ -1182,6 +1495,7 @@ export const handleSync = async function (plugin: FastSync, isLoadLastTime: bool
  * Cancel the current sync and reset all runtime states.
  */
 export function cancelSync(plugin: FastSync): void {
+  plugin.incrementalScanManager?.abortSync();
   if (plugin.syncState.progressCheckIntervalId !== null) {
     window.clearInterval(plugin.syncState.progressCheckIntervalId);
     plugin.syncState.progressCheckIntervalId = null;

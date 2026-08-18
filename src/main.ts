@@ -27,6 +27,7 @@ import { cleanupConfigReloadTimer } from "./lib/sync/operator_config";
 import { HttpApiService } from "./lib/api/http_api_service";
 import { SyncState } from "./lib/sync/sync_state";
 import { RuntimeConfig } from "./lib/sync/runtime_config";
+import { IncrementalScanManager } from "./lib/sync/incremental_scan_manager";
 import { $ } from "./i18n/lang";
 import { SsoImportModal } from "./views/sso-import-modal";
 import { StatusBarManager } from "./lib/ui/status_bar_manager";
@@ -63,6 +64,7 @@ export default class FastSync extends Plugin {
   fileHashManager: FileHashManager                // 文件哈希管理器
   configHashManager: ConfigHashManager            // 配置哈希管理器
   localStorageManager: LocalStorageManager        // 本地存储管理器
+  incrementalScanManager: IncrementalScanManager  // 断线增量扫描状态
   fileCloudPreview: FileCloudPreview              // 云端文件预览管理器
   folderSnapshotManager: FolderSnapshotManager    // 文件夹快照管理器
   statusBarManager: StatusBarManager              // 状态栏管理器
@@ -386,6 +388,7 @@ export default class FastSync extends Plugin {
 
     this.setupProgressTracker();
     this.localStorageManager = new LocalStorageManager(this)
+    this.incrementalScanManager = new IncrementalScanManager(this)
     this.api = new HttpApiService(this)
     this.websocket = new WebSocketManager(this)
 
@@ -400,6 +403,9 @@ export default class FastSync extends Plugin {
     this.addSettingTab(this.settingTab)
 
     // 启动监听 (必须在依赖组件实例化后)
+    // Initialize the durable dirty-path queue before localStorage watch callbacks
+    // can observe an offline configuration change.
+    await this.incrementalScanManager.initialize()
     this.localStorageManager.startWatch()
 
     // 初始化锁管理器 (必须在事件管理器和操作模块之前)
@@ -551,14 +557,11 @@ export default class FastSync extends Plugin {
       }
       await Promise.all(initPromises)
 
-      // 崩溃恢复：从 localStorage 恢复持久化的 pending Map，过滤本地已不存在的路径
-      // Crash recovery: restore persisted pending Maps, filtering out paths that no longer exist locally
-      const allFiles = this.app.vault.getAllLoadedFiles()
-      const existingPaths = new Set(allFiles.map(f => f.path))
-
+      // 崩溃恢复：按路径检查持久化 pending Map，避免启动时再次枚举整个 Vault
+      // Crash recovery: validate persisted pending Maps by path instead of enumerating the whole Vault
       const restoredNoteModifies = this.localStorageManager.loadPending('pendingNoteModifies')
       for (const [path] of restoredNoteModifies) {
-        if (!existingPaths.has(path)) restoredNoteModifies.delete(path)
+        if (!this.app.vault.getAbstractFileByPath(path)) restoredNoteModifies.delete(path)
       }
       if (restoredNoteModifies.size > 0) {
         this.pendingNoteModifies = restoredNoteModifies
@@ -569,7 +572,7 @@ export default class FastSync extends Plugin {
 
       const restoredUploadHashes = this.localStorageManager.loadPending('pendingUploadHashes')
       for (const [path] of restoredUploadHashes) {
-        if (!existingPaths.has(path)) restoredUploadHashes.delete(path)
+        if (!this.app.vault.getAbstractFileByPath(path)) restoredUploadHashes.delete(path)
       }
       if (restoredUploadHashes.size > 0) {
         this.pendingUploadHashes = restoredUploadHashes
@@ -641,6 +644,7 @@ export default class FastSync extends Plugin {
     cancelSync(this)
     abortAllFileOperations()
     this.localStorageManager?.stopWatch()
+    this.incrementalScanManager?.flush()
     this.shareIndicatorManager?.unload()
     this.menuManager?.unload()
     // 清理配置重载模块级计时器，避免插件卸载后仍触发回调

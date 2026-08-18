@@ -4,7 +4,7 @@ import { noteModify, noteDelete, noteRename, noteDeleteByPath } from "../sync/op
 import { fileModify, fileDelete, fileRename, fileDeleteByPath } from "../sync/operator_file";
 import { folderModify, folderDelete, folderRename } from "../sync/operator_folder";
 import { NoteHistoryModal } from "../../views/note-history/history-modal";
-import { dump, isPathInConfigSyncDirs } from "./helpers";
+import { dump, isPathInConfigSyncDirs, isPathExcluded, configIsPathExcluded } from "./helpers";
 import { ShareModal } from "../../views/share-modal";
 import type FastSync from "../../main";
 import { $ } from "../../i18n/lang";
@@ -74,6 +74,49 @@ export class EventManager {
     }
   }
 
+  private recordOfflineModify(file: TAbstractFile): boolean {
+    if (this.plugin.websocket?.isAuth) return false
+    if (file.path === "/" || isPathExcluded(file.path, this.plugin)) return true
+
+    if (file instanceof TFolder) {
+      this.plugin.incrementalScanManager?.markModified("folder", file.path)
+    } else if (file instanceof TFile) {
+      this.plugin.incrementalScanManager?.markModified(file.path.endsWith(".md") ? "note" : "file", file.path)
+    }
+    dump(`Offline vault change queued: ${file.path}`)
+    return true
+  }
+
+  private recordOfflineDelete(file: TAbstractFile): boolean {
+    if (this.plugin.websocket?.isAuth) return false
+    if (file.path === "/" || isPathExcluded(file.path, this.plugin)) return true
+
+    if (file instanceof TFolder) {
+      this.plugin.incrementalScanManager?.markDeleted("folder", file.path)
+    } else if (file instanceof TFile) {
+      this.plugin.incrementalScanManager?.markDeleted(file.path.endsWith(".md") ? "note" : "file", file.path)
+    }
+    dump(`Offline vault deletion queued: ${file.path}`)
+    return true
+  }
+
+  private recordOfflineRename(file: TAbstractFile, oldPath: string): boolean {
+    if (this.plugin.websocket?.isAuth) return false
+
+    const oldExcluded = isPathExcluded(oldPath, this.plugin)
+    const newExcluded = isPathExcluded(file.path, this.plugin)
+    if (!oldExcluded) {
+      const oldKind = file instanceof TFolder ? "folder" : oldPath.endsWith(".md") ? "note" : "file"
+      this.plugin.incrementalScanManager?.markDeleted(oldKind, oldPath)
+    }
+    if (!newExcluded) {
+      const newKind = file instanceof TFolder ? "folder" : file.path.endsWith(".md") ? "note" : "file"
+      this.plugin.incrementalScanManager?.markModified(newKind, file.path)
+    }
+    dump(`Offline vault rename queued: ${oldPath} -> ${file.path}`)
+    return true
+  }
+
   private onOnline = () => {
     dump(`Network restored (Event).`)
     if (this.plugin.websocket) {
@@ -135,10 +178,6 @@ export class EventManager {
   }
 
   private watchModify = (file: TAbstractFile, ctx?: unknown) => {
-    // 检查 WebSocket 认证状态
-    if (!this.plugin.websocket || !this.plugin.websocket.isAuth) {
-      return
-    }
     if (this.plugin.settings.manualSyncEnabled || this.plugin.settings.readonlySyncEnabled) return
 
     // 重命名会同时触发 rename 和 modify 事件，但只需要发送 rename 消息即可完成处理，因此跳过 modify 事件
@@ -146,6 +185,8 @@ export class EventManager {
       dump(`Modify skipped due to pending rename: ${file.path}`)
       return
     }
+
+    if (this.recordOfflineModify(file)) return
 
     this.runWithDelay(file.path, () => {
       if (file instanceof TFile) {
@@ -161,11 +202,9 @@ export class EventManager {
   }
 
   private watchDelete = (file: TAbstractFile, ctx?: unknown) => {
-    // 检查 WebSocket 认证状态
-    if (!this.plugin.websocket || !this.plugin.websocket.isAuth) {
-      return
-    }
     if (this.plugin.settings.manualSyncEnabled || this.plugin.settings.readonlySyncEnabled) return
+
+    if (this.recordOfflineDelete(file)) return
 
     this.runWithDelay(file.path, () => {
       if (file instanceof TFile) {
@@ -181,11 +220,9 @@ export class EventManager {
   }
 
   private watchRename = (file: TAbstractFile, oldFile: string, ctx?: unknown) => {
-    // 检查 WebSocket 认证状态
-    if (!this.plugin.websocket || !this.plugin.websocket.isAuth) {
-      return
-    }
     if (this.plugin.settings.manualSyncEnabled || this.plugin.settings.readonlySyncEnabled) return
+
+    if (this.recordOfflineRename(file, oldFile)) return
 
     // 清除旧路径上可能存在的 modify/delete 定时器
     // 因为旧路径已经被重命名，这些操作已无意义
@@ -255,13 +292,16 @@ export class EventManager {
   private watchRaw = (path: string, ctx?: unknown) => {
     if (!path) return
 
-    // 检查 WebSocket 认证状态
-    if (!this.plugin.websocket || !this.plugin.websocket.isAuth) {
-      return
-    }
     if (this.plugin.settings.manualSyncEnabled || this.plugin.settings.readonlySyncEnabled) return
     // 路径安全性校验
     if (!isPathInConfigSyncDirs(path, this.plugin)) return
+
+    if (!this.plugin.settings.configSyncEnabled || configIsPathExcluded(path, this.plugin)) return
+    if (!this.plugin.websocket?.isAuth) {
+      this.plugin.incrementalScanManager?.markModified("config", normalizePath(path))
+      dump(`Offline config change queued: ${path}`)
+      return
+    }
 
     this.runWithDelay(
       path,

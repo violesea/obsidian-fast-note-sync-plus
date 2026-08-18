@@ -5,7 +5,7 @@ import vm from "node:vm";
 import ts from "typescript";
 
 const root = path.resolve(import.meta.dirname, "..");
-const sourcePath = path.join(root, "src", "lib", "websocket.ts");
+const sourcePath = path.join(root, "src", "lib", "sync", "websocket_manager.ts");
 const source = fs.readFileSync(sourcePath, "utf8");
 
 const transpiled = ts.transpileModule(source, {
@@ -21,32 +21,45 @@ const module = { exports: {} };
 const requireStub = (id) => {
   switch (id) {
     case "obsidian":
-      return { moment: Object.assign(() => ({ format: () => "" }), { locale: () => "zh-cn" }), Platform: {} };
-    case "./helps":
+      return {
+        moment: Object.assign(() => ({ format: () => "" }), { locale: () => "zh-cn" }),
+        Platform: {},
+        normalizePath: (value) => value,
+      };
+    case "../utils/helpers":
       return {
         dump: () => undefined,
-        isWsUrl: () => true,
         addRandomParam: (value) => value,
-        isPathExcluded: () => false,
-        isVersionNew: () => false,
         showSyncNotice: () => undefined,
+        safeStringify: (value) => String(value),
+        getPluginDir: () => ".obsidian/plugins/fast-note-sync",
+        hashContent: () => "hash",
       };
-    case "./file_operator":
+    case "../../pb/protobuf_mapper":
+      return { enSendDTOToProtobuf: () => new Uint8Array(), deReceivePacket: () => ({}) };
+    case "./operator_file":
       return {
         handleFileChunkDownload: () => undefined,
         BINARY_PREFIX_FILE_SYNC: "fs",
         clearUploadQueue: () => undefined,
+        receiveFileUploadSessionNotFound: () => undefined,
       };
     case "./operator":
       return {
         receiveOperators: {},
         startupSync: () => undefined,
         startupFullSync: () => undefined,
-        checkSyncCompletion: () => undefined,
+        settleAllBatchSendSessionsOnClose: () => undefined,
       };
+    case "./websocket_action":
+      return new Proxy({}, { get: (_target, property) => String(property) });
     case "./sync_log_manager":
       return { SyncLogManager: { getInstance: () => ({ logReceivedMessage: () => undefined, logSentMessage: () => undefined }) } };
-    case "../i18n/lang":
+    case "./websocket_client":
+      return { WebSocketClient: class {} };
+    case "../utils/types":
+      return { CLIENT_TYPE: "test" };
+    case "../../i18n/lang":
       return { $: (key) => key };
     default:
       throw new Error(`Unexpected require: ${id}`);
@@ -58,6 +71,7 @@ vm.runInNewContext(transpiled, {
   module,
   exports: module.exports,
   console,
+  WebSocket,
   TextDecoder,
   setTimeout,
   clearTimeout,

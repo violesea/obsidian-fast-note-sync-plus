@@ -81,7 +81,10 @@ export class FileHashManager {
       const mirrored = await this.mirror.read();
       if (mirrored && this.parseAndLoad(mirrored)) {
         dump("FileHashManager: 从文件镜像恢复本地哈希缓存成功");
-        this.saveToStorage();
+        // Do not write the still-unloaded sync baseline here. Writing an empty
+        // syncHashMap would make the subsequent localStorage lookup succeed and
+        // skip the sync-baseline mirror restore below.
+        this.saveHashMapToStorage();
         hasRestoredMap = true;
       }
     }
@@ -374,7 +377,7 @@ export class FileHashManager {
       }
 
       this.hashMap = migratedMap;
-      if (needsSave) this.saveToStorage();
+      if (needsSave) this.saveHashMapToStorage();
 
       return true;
     } catch (error) {
@@ -387,6 +390,13 @@ export class FileHashManager {
    * 保存哈希映射到 localStorage，同时镜像写入文件 (兜底移动端 localStorage 被清除)
    */
   private saveToStorage(): void {
+    this.saveHashMapToStorage();
+
+    // 同步保存基准哈希表
+    this.saveSyncToStorage();
+  }
+
+  private saveHashMapToStorage(): void {
     let data: string;
     try {
       const obj = Object.fromEntries(this.hashMap);
@@ -406,9 +416,6 @@ export class FileHashManager {
 
     // 即使 localStorage 写入失败 (如配额)，镜像写入也照常进行
     this.mirror.scheduleWrite(data);
-
-    // 同步保存基准哈希表
-    this.saveSyncToStorage();
   }
 
   private saveSyncToStorage(): void {
