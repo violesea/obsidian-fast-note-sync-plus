@@ -1,7 +1,7 @@
 import { moment, Platform, normalizePath } from "obsidian";
 
 import { handleFileChunkDownload, BINARY_PREFIX_FILE_SYNC, clearUploadQueue, receiveFileUploadSessionNotFound } from "./operator_file";
-import { dump, addRandomParam, showSyncNotice, safeStringify, getPluginDir, hashContent } from "../utils/helpers";
+import { dump, dumpError, addRandomParam, showSyncNotice, safeStringify, getPluginDir, hashContent } from "../utils/helpers";
 import { enSendDTOToProtobuf, deReceivePacket } from "../../pb/protobuf_mapper";
 import { receiveOperators, handleSync, cancelSync, settleAllBatchSendSessionsOnClose } from "./operator";
 import { SyncLogManager } from "./sync_log_manager";
@@ -187,6 +187,10 @@ export class WebSocketManager {
         if (this.plugin.syncState.activeSyncContext) {
           const previousPhase = this.plugin.syncState.syncPhase;
           this.plugin.syncState.syncPhase = "waiting-connection";
+          // Page ACKs and page metadata belong to the old physical socket.
+          // Keep the prepared scan snapshot, but never flush those ACKs into a
+          // replacement socket before it has created fresh server-side pages.
+          this.plugin.clearSyncContext(this.plugin.syncState.activeSyncContext);
           dump(`[SyncSession] transport closed while ${previousPhase}; waiting for authenticated reconnect`);
         } else if (this.plugin.isSyncing) {
           // No logical context means the close happened before a round was
@@ -213,7 +217,7 @@ export class WebSocketManager {
 
     // 绑定大流量下载 binary handler
     this.client.registerBinaryHandler(BINARY_PREFIX_FILE_SYNC, (data) => {
-      void handleFileChunkDownload(data, this.plugin);
+      return handleFileChunkDownload(data, this.plugin);
     });
 
     this.connectionSupervisor = new ConnectionSupervisor({
@@ -563,7 +567,13 @@ export class WebSocketManager {
           if (pageIndex !== undefined) merged.pageIndex = pageIndex;
           payload = merged;
         }
-        void handler(payload, this.plugin);
+        // Receive handlers are mostly async. Do not leave a rejected handler
+        // Promise unhandled inside Obsidian's mobile WebView.
+        void Promise.resolve()
+          .then(() => handler(payload, this.plugin))
+          .catch((error) => {
+            dumpError(`Failed to handle WebSocket message ${msgAction}:`, error);
+          });
         this.client.notifyActivity();
       }
     }

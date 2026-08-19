@@ -13,7 +13,12 @@ let currentDownloadBufferBytes = 0
 const MAX_DOWNLOAD_BUFFER_BYTES = 20 * 1024 * 1024
 
 // 上传中的文件追踪，用于删除时取消上传
-const activeUploadsMap = new Map<string, { cancelled: boolean }>()
+// Active uploads are also tagged with a transport generation. A reconnect must
+// invalidate every task that was admitted by the old socket, including tasks
+// released from ConcurrencyLimiter.clear().
+type ActiveUpload = { cancelled: boolean; queueGeneration: number }
+const activeUploadsMap = new Map<string, ActiveUpload>()
+let uploadQueueGeneration = 0
 
 // 全局中止信号，用于插件卸载时
 export let isPluginUnloading = false;
@@ -176,6 +181,15 @@ export const clearAllTempChunks = async (plugin: FastSync) => {
 }
 
 export const clearUploadQueue = () => {
+  uploadQueueGeneration++
+  let cancelledCount = 0
+  for (const upload of activeUploadsMap.values()) {
+    if (!upload.cancelled) cancelledCount++
+    upload.cancelled = true
+  }
+  if (cancelledCount > 0) {
+    dump(`Upload queue cancelled for transport generation ${uploadQueueGeneration}: ${cancelledCount} task(s)`)
+  }
 }
 
 /**
@@ -194,6 +208,9 @@ export const abortAllFileOperations = () => {
  */
 export const resetFileOperations = () => {
   isPluginUnloading = false;
+  // A plugin reload must not allow a Promise from the previous instance to
+  // resume against the new WebSocket and vault state.
+  uploadQueueGeneration++;
 }
 
 export const BINARY_PREFIX_FILE_SYNC = "00"
@@ -492,8 +509,20 @@ export const receiveFileUpload = async function (data: FileUploadMessage, plugin
 
   const runUpload = async () => {
     // 标记该路径进入活跃上传状态
-    activeUploadsMap.set(data.path, { cancelled: false });
+    const uploadState: ActiveUpload = { cancelled: false, queueGeneration: uploadQueueGeneration }
+    activeUploadsMap.set(data.path, uploadState);
     await plugin.concurrencyLimiter.waitForSlot(data.path, false, 10) // 优先级设为 10，优先处理上传
+
+    // clearUploadQueue() releases queued limiter promises so they cannot hang
+    // forever. They must stop here before reading the file or writing a chunk
+    // to a replacement socket.
+    if (isPluginUnloading || uploadState.cancelled || uploadState.queueGeneration !== uploadQueueGeneration) {
+      dump(`Upload dropped after transport reset: ${data.path}`)
+      plugin.concurrencyLimiter.releaseSlot(data.path)
+      activeUploadsMap.delete(data.path)
+      sessionIdToPathMap.delete(data.sessionId)
+      return
+    }
 
     // 断点续传 checkpoint key，提升到 try 外以便 catch 块中也能清除
     // Resume checkpoint key hoisted outside try so the catch block can also remove it

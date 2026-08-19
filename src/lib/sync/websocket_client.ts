@@ -73,7 +73,7 @@ export class WebSocketClient {
   
   private statusListeners: Set<(status: boolean) => void> = new Set();
   private activityListeners: Set<() => void> = new Set();
-  private binaryHandlers = new Map<string, (data: ArrayBuffer | Blob) => void>();
+  private binaryHandlers = new Map<string, (data: ArrayBuffer | Blob) => void | Promise<void>>();
 
   constructor(plugin: AppStoragePlugin, options: WebSocketClientOptions) {
     this.plugin = plugin;
@@ -110,7 +110,7 @@ export class WebSocketClient {
     this.count = storedCount ? parseInt(storedCount) : 0;
   }
 
-  public registerBinaryHandler(prefix: string, handler: (data: ArrayBuffer | Blob) => void) {
+  public registerBinaryHandler(prefix: string, handler: (data: ArrayBuffer | Blob) => void | Promise<void>) {
     if (prefix.length !== 2) {
       dumpError("Binary handler prefix must be exactly 2 characters");
       return;
@@ -313,7 +313,9 @@ export class WebSocketClient {
             } else {
               buf = event.data as ArrayBuffer;
             }
-            if (buf.byteLength < 2) return;
+            // A late Blob conversion from a socket that has already been
+            // replaced must not feed stale chunks into the new sync session.
+            if (this.ws !== ws || buf.byteLength < 2) return;
 
             const prefixBytes = new Uint8Array(buf.slice(0, 2));
             const prefixStr = new TextDecoder().decode(prefixBytes);
@@ -321,7 +323,7 @@ export class WebSocketClient {
             const handler = this.binaryHandlers.get(prefixStr);
             if (handler) {
               const rest = buf.slice(2);
-              handler(rest);
+              await handler(rest);
               this.notifyActivity();
             } else if (prefixStr === "pb") {
               try {
@@ -345,7 +347,9 @@ export class WebSocketClient {
             } else {
               dump("No handler for binary prefix:", prefixStr);
             }
-          })();
+          })().catch((err) => {
+            dumpError("Failed to process incoming binary message:", err);
+          });
 
           return;
         }
@@ -569,12 +573,12 @@ export class WebSocketClient {
     });
   }
 
-  private async waitForBufferDrain(maxBufferSize = 5 * 1024 * 1024): Promise<void> {
-    if (!this.ws || this.ws.readyState !== WebSocket.OPEN) {
+  private async waitForBufferDrain(ws: WebSocket, maxBufferSize = 5 * 1024 * 1024): Promise<void> {
+    if (ws.readyState !== WebSocket.OPEN) {
       return;
     }
 
-    while (this.ws.bufferedAmount > maxBufferSize) {
+    while (ws.readyState === WebSocket.OPEN && ws.bufferedAmount > maxBufferSize) {
       await new Promise(resolve => window.setTimeout(resolve, 50));
     }
   }
@@ -584,7 +588,14 @@ export class WebSocketClient {
       return "cancelled";
     }
 
-    await this.waitForBufferDrain();
+    const ws = this.ws;
+    if (!ws || ws.readyState !== WebSocket.OPEN) {
+      return "closed";
+    }
+    await this.waitForBufferDrain(ws);
+    if (this.ws !== ws || ws.readyState !== WebSocket.OPEN) {
+      return "closed";
+    }
 
     const sent = this.Send(action, data, () => {
       after?.();
@@ -655,11 +666,16 @@ export class WebSocketClient {
       return 'cancelled';
     }
 
-    await this.waitForBufferDrain();
+    const ws = this.ws;
+    if (!ws || ws.readyState !== WebSocket.OPEN) {
+      return "closed";
+    }
+
+    await this.waitForBufferDrain(ws);
 
     // 等待缓冲区排空期间连接可能已断开，发送前再次确认，避免对已关闭的 socket 调用 send()
     // Connection may have dropped while waiting for the buffer to drain; re-check before sending
-    if (!this.ws || this.ws.readyState !== WebSocket.OPEN) {
+    if (this.ws !== ws || ws.readyState !== WebSocket.OPEN) {
       return 'closed';
     }
 
@@ -677,7 +693,12 @@ export class WebSocketClient {
       dataToSend.set(dataView, prefixBytes.length);
     }
 
-    this.ws.send(dataToSend);
+    try {
+      ws.send(dataToSend);
+    } catch (err) {
+      dumpError("Failed to send WebSocket binary message:", err);
+      return 'closed';
+    }
     after?.();
     this.notifyActivity();
     return 'sent';

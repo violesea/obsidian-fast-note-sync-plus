@@ -41,7 +41,9 @@ class FakeWebSocket {
     this.readyState = FakeWebSocket.CLOSED;
   }
 
-  send() {}
+  send() {
+    if (this.sendShouldThrow) throw new Error("simulated socket send failure");
+  }
 }
 
 const module = { exports: {} };
@@ -105,6 +107,23 @@ firstSocket.open();
 assert.equal(client.isOpen, true);
 client.isAuth = true;
 client.markAuthenticated();
+
+// Contract: an iOS WebView send failure is converted into a closed transport
+// result instead of rejecting the upload task from inside the socket callback.
+firstSocket.sendShouldThrow = true;
+assert.equal(await client.SendBinary(new Uint8Array([1, 2, 3]), "fs"), "closed");
+firstSocket.sendShouldThrow = false;
+
+// Contract: an asynchronous binary handler rejection is contained by the
+// transport boundary and never becomes an unhandled Promise rejection.
+client.registerBinaryHandler("fs", () => Promise.reject(new Error("simulated handler failure")));
+const unhandledRejections = [];
+const onUnhandledRejection = (reason) => unhandledRejections.push(reason);
+process.on("unhandledRejection", onUnhandledRejection);
+firstSocket.onmessage({ data: new Uint8Array([102, 115, 1]).buffer });
+await new Promise((resolve) => setTimeout(resolve, 0));
+process.off("unhandledRejection", onUnhandledRejection);
+assert.equal(unhandledRejections.length, 0);
 
 // Contract: ordinary reconnect keeps a healthy socket.
 client.triggerReconnect();
