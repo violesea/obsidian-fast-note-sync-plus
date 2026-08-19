@@ -47,8 +47,7 @@ const requireStub = (id) => {
     case "./operator":
       return {
         receiveOperators: {},
-        startupSync: () => undefined,
-        startupFullSync: () => undefined,
+        handleSync: () => undefined,
         settleAllBatchSendSessionsOnClose: () => undefined,
       };
     case "./websocket_action":
@@ -57,6 +56,14 @@ const requireStub = (id) => {
       return { SyncLogManager: { getInstance: () => ({ logReceivedMessage: () => undefined, logSentMessage: () => undefined }) } };
     case "./websocket_client":
       return { WebSocketClient: class {} };
+    case "./resume_recovery":
+      return { ResumeRecoveryCoordinator: class {} };
+    case "./auth_sync_coordinator":
+      return { AuthSyncCoordinator: class {} };
+    case "./connection_supervisor":
+      return { ConnectionSupervisor: class {} };
+    case "./sync_trigger_policy":
+      return { decideSyncAfterAuthentication: () => ({ kind: "none", reason: "manual-mode" }) };
     case "../utils/types":
       return { CLIENT_TYPE: "test" };
     case "../../i18n/lang":

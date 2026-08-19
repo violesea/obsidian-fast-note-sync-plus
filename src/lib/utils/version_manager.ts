@@ -295,17 +295,17 @@ export class VersionManager {
         onProgress($("ui.version.upgrading"));
 
         // 1. 断开 WebSocket
-        plugin.websocket.unRegister();
+        await plugin.websocket.requestUnregister();
 
         // 2. 发起升级请求
         const success = await plugin.api.adminUpgrade("latest");
         if (signal?.aborted) {
-            void plugin.websocket.register(); // 尝试恢复连接
+            void plugin.websocket.requestRegister(); // 尝试恢复连接
             throw new Error("Upgrade aborted.");
         }
 
         if (!success) {
-            void plugin.websocket.register(); // 尝试恢复连接
+            void plugin.websocket.requestRegister(); // 尝试恢复连接
             throw new Error($("ui.version.upgrade_fail"));
         }
 
@@ -328,7 +328,7 @@ export class VersionManager {
             const timeoutId = window.setTimeout(() => {
                 if (pollStopped) return;
                 stopPolling();
-                void plugin.websocket.register();
+                void plugin.websocket.requestRegister();
                 reject(new Error("Upgrade timeout or failed to detect server restart."));
             }, 120000);
 
@@ -338,7 +338,7 @@ export class VersionManager {
                     if (pollStopped) return;
                     stopPolling();
                     window.clearTimeout(timeoutId);
-                    void plugin.websocket.register();
+                    void plugin.websocket.requestRegister();
                     reject(new Error("Upgrade aborted."));
                 });
             }
@@ -355,7 +355,7 @@ export class VersionManager {
                                 stopPolling();
                                 window.clearTimeout(timeoutId);
                                 // 4. 重连并完成
-                                void plugin.websocket.register();
+                                void plugin.websocket.requestRegister();
                                 showSyncNotice($("ui.version.upgrade_success"));
                                 resolve();
                             } else {

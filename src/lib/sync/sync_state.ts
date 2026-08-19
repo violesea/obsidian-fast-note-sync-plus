@@ -1,4 +1,5 @@
 import type { FileDownloadSession } from "../utils/types";
+import type { SyncRequestMode } from "./sync_trigger_policy";
 
 /**
  * Stats for a single sync type (notes / files / configs / folders).
@@ -12,6 +13,12 @@ export interface SyncTaskStats {
   completed: number;    // 已处理数量（含成功与失败，驱动完成判定/翻页 ACK，语义不变） / Processed count (success + failure; drives completion detection / page ACK, semantics unchanged)
   failed: number;       // 其中处理失败的数量，仅用于统计展示，不参与完成判定 / Subset that failed; stats-only, does not affect completion detection
 }
+
+/**
+ * Lifecycle of one logical sync round.  The transport may reconnect while the
+ * round remains in any non-idle phase; a reconnect is not a new round.
+ */
+export type SyncLifecyclePhase = "idle" | "scanning" | "waiting-connection" | "sending" | "monitoring";
 
 /**
  * Centralised container for all runtime sync-session state.
@@ -72,6 +79,8 @@ export class SyncState {
   // ─── Sync-session control flags ──────────────────────────────────────────────
   /** 是否正在执行同步流程 / Whether sync process is running */
   isSyncing = false;
+  /** 当前逻辑同步阶段；连接状态变化不应重置该阶段 / Logical sync phase */
+  syncPhase: SyncLifecyclePhase = "idle";
   /** 是否正在发起同步请求 / Whether sync request is being initiated */
   isSyncRequesting = false;
   /** 是否为首次同步 / Whether this is the first sync */
@@ -82,9 +91,13 @@ export class SyncState {
   currentSyncType: "full" | "incremental" = "incremental";
   /** 当前活跃的同步上下文 UUID / Current active sync context UUID */
   activeSyncContext: string | null = null;
+  /** 连接恢复后唤醒已准备快照的回调，不得创建新的扫描会话 */
+  resumePendingSync?: () => void;
   /** 用户通过 ribbon 手动触发的待执行同步类型（断开时暂存，重连成功后执行）
    *  Pending sync type triggered manually via ribbon (stored when disconnected, executed after reconnect) */
   pendingSyncType: 'incremental' | 'full' | null = null;
+  /** Scope of an explicit request that must survive a settings-triggered reconnect. */
+  pendingSyncMode: SyncRequestMode = "auto";
   /**
    * C9: 本轮同步中是否有类型被离线超墓碑期保护拦截（用户点击「取消」）。
    * checkSyncCompletion 需据此判断本轮是否可信地"完成"，避免无条件刷新 lastSyncSuccessTime
@@ -222,6 +235,24 @@ export class SyncState {
   // ─── Helpers ─────────────────────────────────────────────────────────────────
 
   /**
+   * Atomically claim ownership of a logical sync round before the caller awaits
+   * any filesystem or transport operation.
+   */
+  tryBeginSync(context: string): boolean {
+    if (!context || this.isSyncing || this.activeSyncContext !== null) return false;
+    this.isSyncing = true;
+    this.activeSyncContext = context;
+    return true;
+  }
+
+  /** Clear hashes that belong only to the current logical session. */
+  clearScannedHashCaches(): void {
+    this.scannedNoteHashes.clear();
+    this.scannedFileHashes.clear();
+    this.scannedConfigHashes.clear();
+  }
+
+  /**
    * 重置所有任务统计与本轮会话状态
    * Reset all per-session task statistics and sync-end flags
    */
@@ -235,14 +266,14 @@ export class SyncState {
     this.configSyncTasks = { needUpload: 0, needModify: 0, needSyncMtime: 0, needDelete: 0, completed: 0, failed: 0 };
     this.folderSyncTasks = { needUpload: 0, needModify: 0, needSyncMtime: 0, needDelete: 0, completed: 0, failed: 0 };
     this.lastStatusBarPercentage = 0;
+    this.syncPhase = "idle";
     this.noteSyncEnd = false;
     this.fileSyncEnd = false;
     this.configSyncEnd = false;
     this.folderSyncEnd = false;
     this.offlineGuardSkippedThisRound = false;
-    this.scannedNoteHashes.clear();
-    this.scannedFileHashes.clear();
-    this.scannedConfigHashes.clear();
+    // Keep scan results across a transport interruption.  They carry mtime and
+    // size validation and are removed per key only after being committed.
   }
 
   /**

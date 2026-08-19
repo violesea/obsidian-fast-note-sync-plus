@@ -478,7 +478,7 @@ export class MenuManager {
           .setTitle($("ui.menu.disable_sync"))
           .onClick(async () => {
             cancelSync(this.plugin);
-            void this.plugin.websocket.unRegister(true);
+            void this.plugin.websocket.requestUnregister(true);
             showSyncNotice($("ui.menu.disable_sync_desc"));
           });
         (item as unknown as MenuItemWithDom).dom.setAttribute("aria-label", $("ui.menu.disable_sync_desc"));
@@ -489,7 +489,7 @@ export class MenuManager {
           .setIcon("play")
           .setTitle($("ui.menu.enable_sync"))
           .onClick(async () => {
-            void this.plugin.websocket.register();
+            void this.plugin.websocket.requestRegister();
             showSyncNotice($("ui.menu.enable_sync_desc"));
           });
         (item as unknown as MenuItemWithDom).dom.setAttribute("aria-label", $("ui.menu.enable_sync_desc"));
@@ -822,5 +822,4 @@ export class MenuManager {
     }
   }
 }
-
 

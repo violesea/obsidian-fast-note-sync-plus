@@ -797,7 +797,7 @@ export const configReload = async function (path: string, plugin: FastSync, even
             if (id === selfId) {
                 if (hasMainJsUpdate || hasManifestUpdate) {
                     dump(`[FastNoteSync] Detected critical update for self, triggering reload.`);
-                    plugin.websocket.unRegister();
+                    void plugin.websocket.requestUnregister();
                     // Fall through to reload logic
                 } else {
                     continue;

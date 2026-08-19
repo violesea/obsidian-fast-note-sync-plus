@@ -5,6 +5,7 @@ const safeMoment = moment as unknown as (inp?: unknown) => { format(format: stri
 
 // WebSocket 连接常量
 const RECONNECT_BASE_DELAY = 1000; // 重连基础延迟 (毫秒)
+const AUTH_TIMEOUT_MS = 10000;
 const NON_RECONNECT_REASONS = new Set([
   "AuthorizationFaild",
   "ClientClose",
@@ -34,6 +35,7 @@ function getWsCountStorageKey(plugin: AppStoragePlugin): string {
 export interface WebSocketClientOptions {
   getWsUrl: (count: number) => string;
   preConnectProbe?: () => Promise<boolean>;
+  onBackoffReconnect?: () => void;
   
   onOpen?: (client: WebSocketClient) => void;
   onClose?: (client: WebSocketClient, code: number, reason: string) => void;
@@ -43,6 +45,9 @@ export interface WebSocketClientOptions {
   serializeMessage?: (action: string, payload: unknown) => Uint8Array;
   deserializeMessage?: (data: Uint8Array) => { action: string; [key: string]: unknown };
 }
+
+/** Result of attempting to write a text/protobuf message to the socket. */
+export type TextSendResult = "sent" | "cancelled" | "closed";
 
 export class WebSocketClient {
   public ws: WebSocket;
@@ -58,8 +63,12 @@ export class WebSocketClient {
   // 是否已经在本轮重连失败序列中提示过用户（首次达到原上限第 16 次时提示一次，重连成功后重置）
   private hasNotifiedReconnectFailure = false;
   public count = 0;
+  /** Monotonic identifier for the current physical WebSocket connection. */
+  public connectionId = 0;
   private registerPromise: Promise<void> | null = null;
   private connectionGeneration = 0;
+  private forceReconnectInFlight = false;
+  private authTimeout: number | null = null;
   public isRegister = true;
   
   private statusListeners: Set<(status: boolean) => void> = new Set();
@@ -137,6 +146,19 @@ export class WebSocketClient {
     return this.isOpen;
   }
 
+  /**
+   * Check both the physical connection generation and its authenticated state.
+   * A stale StartHandle callback must not use the shared client flags alone:
+   * those flags may already describe a newer socket.
+   */
+  public isCurrentConnection(connectionId: number): boolean {
+    return connectionId > 0
+      && this.connectionId === connectionId
+      && this.isOpen
+      && this.isAuth
+      && this.ws?.readyState === WebSocket.OPEN;
+  }
+
   public async register(force = false) {
     const generation = this.connectionGeneration;
 
@@ -174,6 +196,7 @@ export class WebSocketClient {
 
   private async _doRegister(generation: number) {
     if (this.ws) {
+      this.clearAuthTimeout();
       const previousWs = this.ws;
       this.cleanupWebSocket(previousWs);
       if (this.ws === previousWs) {
@@ -203,6 +226,7 @@ export class WebSocketClient {
 
     const wsUrl = this.options.getWsUrl(this.count);
     if (isWsUrl(wsUrl)) {
+      this.connectionId++;
       const ws = new WebSocket(wsUrl);
       this.ws = ws;
       ws.binaryType = "arraybuffer";
@@ -232,10 +256,27 @@ export class WebSocketClient {
           url: wsUrl
         });
         this.options.onOpen?.(this);
+        this.authTimeout = window.setTimeout(() => {
+          if (this.ws !== ws || !this.isOpen || this.isAuth) return;
+
+          dump(`WebSocket authorization timed out after ${AUTH_TIMEOUT_MS}ms`);
+          this.forceReconnectInFlight = false;
+          this.isOpen = false;
+          this.isAuth = false;
+          this.useProtobuf = false;
+          this.notifyTransportReplacement(ws);
+          this.closeCurrentWebSocket();
+          this.notifyStatusChange(false);
+          if (this.isRegister) this.checkReconnect();
+        }, AUTH_TIMEOUT_MS);
       };
 
       ws.onclose = (e: CloseEvent) => {
         if (this.ws !== ws) return;
+        this.clearAuthTimeout();
+        // A replacement attempt that reaches a terminal close before auth is
+        // no longer in flight. The normal backoff loop may now own recovery.
+        this.forceReconnectInFlight = false;
         this.isAuth = false;
         this.useProtobuf = false;
         this.isOpen = false;
@@ -348,14 +389,35 @@ export class WebSocketClient {
     const ws = this.ws;
     if (!ws) return;
 
+    this.clearAuthTimeout();
+
     this.cleanupWebSocket(ws);
     if (this.ws === ws) {
       this.ws = null as unknown as WebSocket;
     }
   }
 
+  private clearAuthTimeout(): void {
+    if (this.authTimeout !== null) {
+      window.clearTimeout(this.authTimeout);
+      this.authTimeout = null;
+    }
+  }
+
+  /**
+   * Notify the owner before deliberately replacing a socket. cleanupWebSocket
+   * detaches onclose first, so without this explicit lifecycle signal a
+   * prepared logical sync would remain in `monitoring` and never resume.
+   */
+  private notifyTransportReplacement(ws: WebSocket): void {
+    if (this.ws !== ws) return;
+    this.options.onClose?.(this, 1000, "Cleanup");
+  }
+
   public unRegister(setUnregistered = false) {
     this.connectionGeneration++;
+    this.forceReconnectInFlight = false;
+    this.clearAuthTimeout();
     window.clearTimeout(this.checkReConnectTimeout);
     this.timeConnect = 0;
     this.hasNotifiedReconnectFailure = false;
@@ -370,6 +432,24 @@ export class WebSocketClient {
 
     this.notifyStatusChange(false);
     dump("Service unregister");
+  }
+
+  /**
+   * Complete the replacement guard after the new physical socket has been
+   * authenticated. Creating a WebSocket is not enough: iOS may open a socket
+   * that is still waiting for auth while another lifecycle callback arrives.
+   */
+  public completeForcedReconnect(): void {
+    this.clearAuthTimeout();
+    if (this.forceReconnectInFlight) {
+      dump("Forced WebSocket reconnect authenticated");
+      this.forceReconnectInFlight = false;
+    }
+  }
+
+  /** Mark the current physical connection authenticated and release guards. */
+  public markAuthenticated(): void {
+    this.completeForcedReconnect();
   }
 
   public checkReconnect() {
@@ -392,7 +472,11 @@ export class WebSocketClient {
       dump(`Service waiting reconnect: ${this.timeConnect}, delay: ${delay}ms`);
 
       this.checkReConnectTimeout = window.setTimeout(() => {
-        void this.register();
+        if (this.options.onBackoffReconnect) {
+          this.options.onBackoffReconnect();
+        } else {
+          void this.register();
+        }
       }, delay);
     }
   }
@@ -426,6 +510,7 @@ export class WebSocketClient {
       this.isOpen = false;
       this.isAuth = false;
       this.useProtobuf = false;
+      this.notifyTransportReplacement(currentWs);
       this.closeCurrentWebSocket();
       this.notifyStatusChange(false);
     }
@@ -444,7 +529,21 @@ export class WebSocketClient {
       return;
     }
 
+    // Focus/visibility events can arrive in a burst, and iOS may deliver a
+    // second one while the probe for the first replacement is still pending.
+    // One logical recovery must produce one socket replacement.
+    if (this.forceReconnectInFlight) {
+      dump("Force reconnect skipped because a replacement is already in flight");
+      return;
+    }
+
+    const currentWs = this.ws;
+    if (currentWs && currentWs.readyState === WebSocket.CONNECTING) {
+      dump("Force reconnect skipped because the replacement socket is still connecting");
+      return;
+    }
     dump("Forcing WebSocket reconnect after foreground/network transition");
+    this.forceReconnectInFlight = true;
     this.connectionGeneration++;
     window.clearTimeout(this.checkReConnectTimeout);
     this.timeConnect = 0;
@@ -452,9 +551,22 @@ export class WebSocketClient {
     this.isOpen = false;
     this.isAuth = false;
     this.useProtobuf = false;
+    if (currentWs) {
+      this.notifyTransportReplacement(currentWs);
+    }
     this.closeCurrentWebSocket();
     this.notifyStatusChange(false);
-    void this.register(true);
+    const replacementGeneration = this.connectionGeneration;
+    void this.register(true).then(() => {
+      // register() resolves as soon as the physical socket is created. Keep
+      // the guard until auth succeeds; release it here only when no socket was
+      // created or the attempt was invalidated.
+      if (this.connectionGeneration !== replacementGeneration || !this.ws || this.ws.readyState === WebSocket.CLOSED) {
+        this.forceReconnectInFlight = false;
+      }
+    }, () => {
+      this.forceReconnectInFlight = false;
+    });
   }
 
   private async waitForBufferDrain(maxBufferSize = 5 * 1024 * 1024): Promise<void> {
@@ -467,27 +579,28 @@ export class WebSocketClient {
     }
   }
 
-  public async SendMessage(action: string, data: unknown, before?: () => boolean, after?: () => void) {
+  public async SendMessage(action: string, data: unknown, before?: () => boolean, after?: () => void): Promise<TextSendResult> {
     if (before && before()) {
-      return true; // Cancelled
+      return "cancelled";
     }
 
     await this.waitForBufferDrain();
 
-    this.Send(action, data, () => {
+    const sent = this.Send(action, data, () => {
       after?.();
       this.notifyActivity();
     });
+    return sent ? "sent" : "closed";
   }
 
-  public Send(action: string, data: unknown, after?: () => void) {
+  public Send(action: string, data: unknown, after?: () => void): boolean {
     if (!this.ws || this.ws.readyState !== WebSocket.OPEN) {
       dump(`Service not connected, message dropped (will rely on next sync cycle): ${action}`);
-      return;
+      return false;
     }
 
-    if (this.useProtobuf && this.options.serializeMessage) {
-      try {
+    try {
+      if (this.useProtobuf && this.options.serializeMessage) {
         let payloadObj: unknown = data;
         if (typeof data === "string") {
           try {
@@ -502,15 +615,16 @@ export class WebSocketClient {
         bytesWithPrefix.set(prefixBytes);
         bytesWithPrefix.set(bytes, prefixBytes.length);
         this.ws.send(bytesWithPrefix);
-      } catch (err) {
-        dumpError(`Failed to serialize Protobuf message for action: ${action}`, err);
-        // Fallback to text JSON
+      } else {
         this.sendTextFallback(action, data);
       }
-    } else {
-      this.sendTextFallback(action, data);
+    } catch (err) {
+      dumpError(`Failed to send WebSocket message for action: ${action}`, err);
+      return false;
     }
+
     after?.();
+    return true;
   }
 
   private sendTextFallback(action: string, data: unknown) {

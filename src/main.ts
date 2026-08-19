@@ -32,6 +32,8 @@ import { $ } from "./i18n/lang";
 import { SsoImportModal } from "./views/sso-import-modal";
 import { StatusBarManager } from "./lib/ui/status_bar_manager";
 import { SyncProgressTracker } from "./lib/sync/sync_progress_tracker";
+import { LifecycleGeneration } from "./lib/sync/lifecycle_generation";
+import { SyncPageAckOutbox, type SyncPageAckType } from "./lib/sync/sync_page_ack_outbox";
 
 
 
@@ -45,6 +47,15 @@ interface LegacySettings extends Partial<PluginSettings> {
   configExclude?: string;
   configExcludeWhitelist?: string;
   showSyncNotice?: boolean;
+}
+
+interface SyncPageState {
+  pageIndex: number;
+  pageSize: number;
+  totalCount: number;
+  isLast: boolean;
+  completedCount: number;
+  context: string;
 }
 
 
@@ -70,6 +81,7 @@ export default class FastSync extends Plugin {
   statusBarManager: StatusBarManager              // 状态栏管理器
   readonly progressTracker = new SyncProgressTracker() // 进度追踪器
   private menuManagerInitialized = false          // 防止 onLayoutReady 重复初始化 / Guard against duplicate onLayoutReady init
+  private readonly lifecycle = new LifecycleGeneration()
 
   // ─── Aggregated state objects (replaces 30+ scattered fields) ────────────────
   /** 同步会话运行时状态 / Sync-session runtime state */
@@ -79,14 +91,27 @@ export default class FastSync extends Plugin {
   /**
    * 追踪每个同步类型的当前下载分页状态
    */
-  readonly syncPageStateMap = new Map<string, {
-    pageIndex: number;
-    pageSize: number;
-    totalCount: number;
-    isLast: boolean;
-    completedCount: number;
-    context: string;
-  }>();
+  readonly syncPageStateMap = new Map<SyncPageAckType, Map<number, SyncPageState>>();
+  readonly syncPageAckOutbox = new SyncPageAckOutbox();
+
+  beginSyncContext(context: string): void {
+    this.syncPageAckOutbox.beginContext(context);
+    this.syncPageStateMap.clear();
+  }
+
+  clearSyncContext(context?: string): void {
+    this.syncPageAckOutbox.clearContext(context);
+    this.syncPageStateMap.clear();
+  }
+
+  registerSyncPageState(type: SyncPageAckType, state: SyncPageState): void {
+    let pages = this.syncPageStateMap.get(type);
+    if (!pages) {
+      pages = new Map<number, SyncPageState>();
+      this.syncPageStateMap.set(type, pages);
+    }
+    pages.set(state.pageIndex, state);
+  }
 
   setupProgressTracker() {
     this.progressTracker.onPageComplete = (type, pageIndex) => {
@@ -127,32 +152,32 @@ export default class FastSync extends Plugin {
   }
 
   sendSyncPageAck(type: "note" | "file" | "setting" | "folder", pageIndex: number) {
-    let action = "";
-    if (type === "note") action = "NoteSyncPageAck";
-    else if (type === "file") action = "FileSyncPageAck";
-    else if (type === "setting") action = "SettingSyncPageAck";
-    else if (type === "folder") action = "FolderSyncPageAck";
+    const pageState = pageIndex === -1 ? undefined : this.syncPageStateMap.get(type)?.get(pageIndex);
+    const context = pageState?.context || this.syncState.activeSyncContext || null;
+    this.syncPageAckOutbox.enqueue(type, pageIndex, context);
+    this.flushSyncPageAcks();
+  }
 
-    if (!action) return;
+  flushSyncPageAcks(): void {
+    const context = this.syncState.activeSyncContext;
+    if (!context || !this.websocket?.isReadyForSync()) return;
 
-    // 如果是首拉 ACK 信号 (pageIndex === -1)，强行忽略可能残留的 pageState，强制使用当前的 activeSyncContext
-    // If it's the initial ACK signal (pageIndex === -1), ignore any stale pageState and force activeSyncContext
-    const pageState = pageIndex === -1 ? undefined : this.syncPageStateMap.get(type);
-    const msgContext = pageState?.context || this.syncState.activeSyncContext || "";
-
-    dump(`[sendSyncPageAck] Sending ACK for type: ${type}, action: ${action}, pageIndex: ${pageIndex}, context: ${msgContext}`);
-
-    this.websocket.Send(action, {
-      context: msgContext,
-      vault: this.settings.vault,
-      pageIndex: pageIndex
+    this.syncPageAckOutbox.setActiveContext(context);
+    this.syncPageAckOutbox.flush(context, (ack) => {
+      const actionByType: Record<SyncPageAckType, string> = {
+        note: "NoteSyncPageAck",
+        file: "FileSyncPageAck",
+        setting: "SettingSyncPageAck",
+        folder: "FolderSyncPageAck",
+      };
+      const action = actionByType[ack.type];
+      dump(`[sendSyncPageAck] Sending ACK for type: ${ack.type}, action: ${action}, pageIndex: ${ack.pageIndex}, context: ${ack.context}`);
+      return this.websocket.Send(action, {
+        context: ack.context,
+        vault: this.settings.vault,
+        pageIndex: ack.pageIndex,
+      });
     });
-
-    // 只有当存在真正的 pageState 且非首拉时，才在发送后删除对应状态
-    // Only delete from the map if we used a real pageState and it's not the initial ACK
-    if (pageIndex !== -1) {
-      this.syncPageStateMap.delete(type);
-    }
   }
   /** 运行时 API 配置 / Runtime API configuration */
   readonly runtimeConfig = new RuntimeConfig()
@@ -356,6 +381,7 @@ export default class FastSync extends Plugin {
   }
 
   async onload() {
+    const lifecycleGeneration = this.lifecycle.begin();
     (window as Window & {
       FastSyncDebug?: {
         dumpError: typeof dumpError;
@@ -393,6 +419,7 @@ export default class FastSync extends Plugin {
     this.websocket = new WebSocketManager(this)
 
     await this.loadSettings()
+    if (!this.lifecycle.isCurrent(lifecycleGeneration)) return;
 
     // Initialize VersionManager after settings are loaded to avoid reading undefined 'settings.vault'
     // 在加载设置后初始化 VersionManager，避免在 settings 未加载时访问 settings.vault
@@ -406,6 +433,7 @@ export default class FastSync extends Plugin {
     // Initialize the durable dirty-path queue before localStorage watch callbacks
     // can observe an offline configuration change.
     await this.incrementalScanManager.initialize()
+    if (!this.lifecycle.isCurrent(lifecycleGeneration)) return;
     this.localStorageManager.startWatch()
 
     // 初始化锁管理器 (必须在事件管理器和操作模块之前)
@@ -419,6 +447,7 @@ export default class FastSync extends Plugin {
     const ssoAction = "fast-note-sync/sso";
     try {
       this.registerObsidianProtocolHandler(ssoAction, async (data: Record<string, string>) => {
+        if (!this.lifecycle.isCurrent(lifecycleGeneration)) return;
         if (data?.pushApi) {
           const getDomainOrHost = (urlStr: string): string => {
             if (!urlStr) return "";
@@ -456,6 +485,7 @@ export default class FastSync extends Plugin {
             },
             () => {
               void (async () => {
+                if (!this.lifecycle.isCurrent(lifecycleGeneration)) return;
                 this.settings.api = data.pushApi;
                 this.settings.apiToken = data.pushApiToken;
                 if (data?.pushVault) {
@@ -464,6 +494,7 @@ export default class FastSync extends Plugin {
                 this.wsSettingChange = true;
                 this.localStorageManager.clearSyncTime();
                 await this.saveSettings();
+                if (!this.lifecycle.isCurrent(lifecycleGeneration)) return;
                 showSyncNotice($("ui.status.config_imported"), 5000);
                 void this.reloadServices();
               })();
@@ -488,6 +519,7 @@ export default class FastSync extends Plugin {
 
     // 大部分初始化逻辑移动到 onLayoutReady 之后，避免阻塞 Obsidian 启动
     this.app.workspace.onLayoutReady(async () => {
+      if (!this.lifecycle.isCurrent(lifecycleGeneration)) return;
       // 防止重复初始化 (Prevent duplicate initialization)
       if (this.menuManagerInitialized) return;
       this.menuManagerInitialized = true
@@ -556,6 +588,7 @@ export default class FastSync extends Plugin {
         initPromises.push(this.configHashManager.initialize())
       }
       await Promise.all(initPromises)
+      if (!this.lifecycle.isCurrent(lifecycleGeneration)) return;
 
       // 崩溃恢复：按路径检查持久化 pending Map，避免启动时再次枚举整个 Vault
       // Crash recovery: validate persisted pending Maps by path instead of enumerating the whole Vault
@@ -621,7 +654,7 @@ export default class FastSync extends Plugin {
       }
 
       // 7. 刷新运行时设置 (包含网络探测，不阻塞主流程)
-      void this.reloadServices()
+      if (this.lifecycle.isCurrent(lifecycleGeneration)) void this.reloadServices()
 
       // 8. 监听外观变更 (Listen for CSS/Theme changes)
       this.registerEvent(
@@ -640,8 +673,10 @@ export default class FastSync extends Plugin {
   }
 
   onunload() {
+    this.lifecycle.invalidate()
     // 取消当前正在进行的同步，重置运行时状态
     cancelSync(this)
+    void this.websocket?.unRegister(true)
     abortAllFileOperations()
     this.localStorageManager?.stopWatch()
     this.incrementalScanManager?.flush()
@@ -653,8 +688,6 @@ export default class FastSync extends Plugin {
     this.fileHashManager?.flush()
     this.configHashManager?.flush()
     this.folderSnapshotManager?.flush()
-    // 取消注册文件事件
-    void this.reloadServices(false)
     this.updateStatusBar("")
   }
 
@@ -894,38 +927,55 @@ export default class FastSync extends Plugin {
   }
 
   async saveAndReloadServices(setItem: string = "") {
+    const lifecycleGeneration = this.lifecycle.current();
     await this.saveSettings()
-    this.reloadServices(true, setItem)
+    if (this.lifecycle.isCurrent(lifecycleGeneration)) this.reloadServices(true, setItem)
   }
 
   reloadServices(forceRegister: boolean = true, setItem: string = "") {
+    const lifecycleGeneration = this.lifecycle.current();
     if (setItem === "api" || !this.runApi) {
       this.runApi = this.settings.api;
       this.runWsApi = this.settings.api ? this.settings.api.replace(/^http/, "ws") : "";
     }
 
+    const explicitSyncMode: "note" | "config" | null =
+      setItem === "syncEnabled" && this.settings.syncEnabled
+        ? "note"
+        : setItem === "configSyncEnabled" && this.settings.configSyncEnabled
+          ? "config"
+          : null;
+
+    // A settings-triggered reconnect still owes one explicit full sync. Keep
+    // the request in SyncState so authentication can consume it after the new
+    // socket is ready; reconnects without this marker must stay incremental.
+    if (explicitSyncMode) {
+      this.syncState.pendingSyncType = "full";
+      this.syncState.pendingSyncMode = explicitSyncMode;
+    }
+
     if (forceRegister && this.settings.api && this.settings.apiToken) {
       const runRegister = () => {
-        if (this.wsSettingChange) {
-          this.websocket?.unRegister()
+        if (!this.lifecycle.isCurrent(lifecycleGeneration)) return;
+        const needsReconfigure = this.wsSettingChange;
+        if (needsReconfigure) {
           this.wsSettingChange = false
-        }
-
-        if (this.websocket?.isRegister) {
-          void this.websocket?.register()
+          void this.websocket?.requestReconfigure()
+        } else if (this.websocket?.isRegister) {
+          void this.websocket?.requestRegister()
         }
 
         if (this.syncTimer) {
           window.clearTimeout(this.syncTimer)
         }
-        // 用于首次同步测试
-        if (this.isFirstSync && this.websocket?.isAuth) {
+        // Settings changed while the existing socket stayed authenticated.
+        // Consume the explicit request here; a disconnected socket leaves it
+        // for StartHandle() to consume after authentication.
+        if (explicitSyncMode && this.websocket?.isAuth) {
+          this.syncState.pendingSyncType = null;
+          this.syncState.pendingSyncMode = "auto";
           this.syncTimer = window.setTimeout(() => {
-            if (setItem == "syncEnabled" && this.settings.syncEnabled) {
-              void handleSync(this, false, "note")
-            } else if (setItem == "configSyncEnabled" && this.settings.configSyncEnabled) {
-              void handleSync(this, false, "config")
-            }
+            void handleSync(this, false, explicitSyncMode)
             this.syncTimer = null
           }, 2000)
         }
@@ -935,7 +985,7 @@ export default class FastSync extends Plugin {
       if (needProbe) {
         // 1. 前置探测跳转，更新 runApi (后台异步执行)
         this.api?.probeApiRedirect().then(() => {
-          runRegister();
+          if (this.lifecycle.isCurrent(lifecycleGeneration)) runRegister();
         }).catch(e => {
           dumpError("Fast Note Sync: Background API probe failed", e)
         })
@@ -949,7 +999,7 @@ export default class FastSync extends Plugin {
       this.lastSyncPathRenamed = new Set()
       this.fileDownloadSessions = new Map()
     } else {
-      this.websocket?.unRegister()
+      void this.websocket?.unRegister(true)
       this.ignoredFiles = new Set()
       this.ignoredConfigFiles = new Set()
       this.lastSyncMtime.clear()

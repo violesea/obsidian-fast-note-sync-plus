@@ -1,4 +1,4 @@
-import { TAbstractFile, TFile, TFolder, Menu, MenuItem, Platform, normalizePath } from "obsidian";
+import { TAbstractFile, TFile, TFolder, Menu, MenuItem, normalizePath } from "obsidian";
 
 import { noteModify, noteDelete, noteRename, noteDeleteByPath } from "../sync/operator_note";
 import { fileModify, fileDelete, fileRename, fileDeleteByPath } from "../sync/operator_file";
@@ -126,6 +126,7 @@ export class EventManager {
     // Do not unregister here. The WebView may emit offline while the process
     // is still alive; closing the socket would also clear its retry schedule.
     // Local vault events are queued while navigator.onLine is false.
+    this.plugin.websocket?.noteNetworkLost()
   }
 
   private onWindowFocus = () => {
@@ -140,6 +141,7 @@ export class EventManager {
     if (activeDocument.visibilityState === "hidden") {
       // Do not unregister here. Desktop WebViews can remain alive while minimized,
       // and mobile platforms may suspend the process independently of the plugin.
+      this.plugin.websocket?.noteBackgrounded()
       dump("Obsidian backgrounded; keeping sync connection alive")
     } else {
       // Foregrounding drains any durable changes queued while the process was
@@ -159,26 +161,10 @@ export class EventManager {
       const websocket = this.plugin.websocket
       if (!websocket) return
 
-      // iOS may suspend the WebView while leaving its JavaScript WebSocket
-      // object in an OPEN state. A mobile resume must therefore rebuild the
-      // transport even when the cached client state still says "open".
-      // Desktop minimized windows can keep a healthy socket alive, so retain
-      // the non-destructive path there.
-      if (Platform.isMobile) {
-        dump(`Resume event (${source}); forcing a fresh mobile sync connection`)
-        websocket.forceReconnect()
-        return
-      }
-
-      // A healthy socket is already the silent background-sync path. Rebuilding
-      // it here would interrupt in-flight page ACKs and can strand a sync round.
-      if (websocket.isOpen) {
-        dump(`Resume event (${source}); sync connection is healthy, no reconnect needed`)
-        return
-      }
-
-      dump(`Resume event (${source}); reconnecting the disconnected sync connection`)
-      websocket.triggerReconnect()
+      // Recovery is delegated to the connection coordinator. It probes a
+      // mobile OPEN socket before replacing it, so a healthy resume does not
+      // create a new WebSocket or a new logical sync round.
+      void websocket.recoverAfterResume(source)
     }, EventManager.RESUME_DEBOUNCE_MS)
   }
 

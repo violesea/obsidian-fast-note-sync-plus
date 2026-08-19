@@ -115,6 +115,8 @@ const { EventManager } = module.exports;
 let unregisterCount = 0;
 let reconnectCount = 0;
 let forceReconnectCount = 0;
+let backgroundedCount = 0;
+let networkLostCount = 0;
 let shareRefreshCount = 0;
 let unload;
 
@@ -145,6 +147,19 @@ const plugin = {
     forceReconnect: () => {
       forceReconnectCount += 1;
     },
+    noteBackgrounded: () => {
+      backgroundedCount += 1;
+    },
+    noteNetworkLost: () => {
+      networkLostCount += 1;
+    },
+    recoverAfterResume: () => {
+      if (platformStub.isMobile) {
+        plugin.websocket.forceReconnect();
+      } else if (!plugin.websocket.isOpen) {
+        plugin.websocket.triggerReconnect();
+      }
+    },
   },
   shareIndicatorManager: {
     syncWithServer: async () => {
@@ -162,11 +177,13 @@ listeners.get("visibilitychange")();
 assert.equal(unregisterCount, 0);
 assert.equal(reconnectCount, 0);
 assert.equal(timers.size, 0);
+assert.equal(backgroundedCount, 1);
 
 // Contract: going offline does not unregister the socket or clear its retry lifecycle.
 listeners.get("offline")();
 assert.equal(unregisterCount, 0);
 assert.equal(reconnectCount, 0);
+assert.equal(networkLostCount, 1);
 
 // Contract: returning to the foreground refreshes state and forces a fresh
 // mobile socket because the WebView may retain a stale OPEN object.
@@ -187,6 +204,10 @@ assert.equal(forceReconnectCount, 1);
 // Contract: even when the client still reports OPEN, a mobile resume performs
 // exactly one forced replacement for the coalesced event burst.
 plugin.websocket.isOpen = false;
+documentStub.visibilityState = "hidden";
+listeners.get("visibilitychange")();
+assert.equal(backgroundedCount, 2);
+documentStub.visibilityState = "visible";
 listeners.get("focus")();
 listeners.get("visibilitychange")();
 listeners.get("online")();

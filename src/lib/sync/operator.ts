@@ -1,7 +1,7 @@
 import { TFolder, TFile, normalizePath } from "obsidian";
 
 import { receiveFileUpload, receiveFileSyncUpdate, receiveFileSyncDelete, receiveFileSyncMtime, receiveFileSyncChunkDownload, receiveFileSyncEnd, checkAndUploadAttachments, receiveFileSyncRename, receiveFileRenameAck, receiveFileUploadAck, receiveFileDeleteAck, isPluginUnloading } from "./operator_file";
-import { hashContent, hashContentAsync, dump, isPathExcluded, isFolderSyncPathExcluded, configIsPathExcluded, getConfigSyncCustomDirs, generateUUID, showSyncNotice, isLargeBinarySyncRisk, describeBinarySyncLimit, hashFileAsync, formatFileSize, yieldToMain, getPluginDir } from "../utils/helpers";
+import { hashContent, hashContentAsync, dump, isPathExcluded, isFolderSyncPathExcluded, configIsPathExcluded, getConfigSyncCustomDirs, generateUUID, showSyncNotice, isLargeBinarySyncRisk, describeBinarySyncLimit, hashFileAsync, formatFileSize, yieldToMain, getPluginDir, sleep } from "../utils/helpers";
 import { receiveConfigSyncModify, receiveConfigUpload, receiveConfigSyncMtime, receiveConfigSyncDelete, receiveConfigSyncEnd, configAllPaths, receiveConfigSyncClear, receiveConfigModifyAck, receiveConfigDeleteAck } from "./operator_config";
 import { receiveNoteSyncModify, receiveNoteUpload, receiveNoteSyncMtime, receiveNoteSyncDelete, receiveNoteSyncEnd, receiveNoteSyncRename, receiveNoteModifyAck, receiveNoteRenameAck, receiveNoteDeleteAck } from "./operator_note";
 import { SyncMode, SnapFile, SnapFolder, SyncEndData, PathHashFile, NoteSyncData, FileSyncData, ConfigSyncData, FolderSyncData } from "../utils/types";
@@ -333,6 +333,63 @@ export const clearAllHashes = async (plugin: FastSync) => {
   plugin.incrementalScanManager?.requestFullReconcile();
 };
 
+type ScannedHashMap = Map<string, { hash: string; mtime: number; size: number }>;
+
+/** Commit only the entries that this call observed, leaving concurrent work intact. */
+function commitScannedHashes(scanned: ScannedHashMap, commit: (entries: ScannedHashMap) => void): void {
+  if (scanned.size === 0) return;
+  const committed = new Map(scanned);
+  commit(committed);
+  for (const path of committed.keys()) scanned.delete(path);
+}
+
+class SyncTransportError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "SyncTransportError";
+  }
+}
+
+function isSyncConnectionReady(plugin: FastSync): boolean {
+  return plugin.websocket?.isReadyForSync() === true;
+}
+
+/**
+ * Wait for the current logical sync context to regain an authenticated socket.
+ * This is deliberately independent from WebSocketClient's reconnect backoff:
+ * the transport owns reconnecting, while the sync round owns its prepared data.
+ */
+async function waitForSyncConnection(plugin: FastSync, context: string): Promise<boolean> {
+  let logged = false;
+  while (plugin.syncState.activeSyncContext === context) {
+    if (isSyncConnectionReady(plugin)) return true;
+    plugin.syncState.syncPhase = "waiting-connection";
+    if (!logged) {
+      dump(`[SyncSession] waiting for authenticated connection, context=${context}`);
+      logged = true;
+    }
+    await sleep(250);
+  }
+  return false;
+}
+
+async function sendSyncMessage(
+  plugin: FastSync,
+  action: string,
+  payload: Record<string, unknown>,
+  context: string | undefined,
+  after?: () => void,
+): Promise<void> {
+  const activeContext = context || plugin.syncState.activeSyncContext;
+  if (!activeContext || !await waitForSyncConnection(plugin, activeContext)) {
+    throw new SyncTransportError(`Cannot send ${action}: sync context is no longer active`);
+  }
+  const result = await plugin.websocket.SendMessage(action, payload, undefined, after);
+  if (result !== "sent") {
+    throw new SyncTransportError(`Cannot send ${action}: transport ${result}`);
+  }
+}
+
 
 
 /**
@@ -366,10 +423,14 @@ export function checkSyncCompletion(plugin: FastSync, intervalId?: number, syncS
     }
     dump(`Sync completion timeout after ${SYNC_TIMEOUT_MS}ms. Tasks: note=${JSON.stringify(plugin.noteSyncTasks)}, file=${JSON.stringify(plugin.fileSyncTasks)}, folder=${JSON.stringify(plugin.folderSyncTasks)}, config=${JSON.stringify(plugin.configSyncTasks)}`)
     plugin.incrementalScanManager?.abortSync();
+    plugin.syncState.clearScannedHashCaches();
     plugin.syncState.activeSyncContext = null; // 同步超时，清空活跃的上下文 / Sync timeout, reset the active context
+    plugin.syncState.resumePendingSync = undefined;
+    plugin.syncState.syncPhase = "idle";
+    plugin.isSyncing = false;
     plugin.syncTypeCompleteCount = 0;
     plugin.resetSyncTasks();
-    plugin.syncPageStateMap.clear(); // 清空残留的页状态 / Clear stale page state map
+    plugin.clearSyncContext();
     plugin.totalFilesToDownload = 0;
     plugin.downloadedFilesCount = 0;
     plugin.totalChunksToDownload = 0;
@@ -475,10 +536,13 @@ export function checkSyncCompletion(plugin: FastSync, intervalId?: number, syncS
     const offlineGuardSkippedThisRound = plugin.syncState.offlineGuardSkippedThisRound;
 
     plugin.syncState.activeSyncContext = null; // 同步完成，清空活跃的上下文 / Sync completed, reset the active context
+    plugin.syncState.resumePendingSync = undefined;
+    plugin.syncState.syncPhase = "idle";
+    plugin.isSyncing = false;
     plugin.incrementalScanManager?.completeSync();
     plugin.syncTypeCompleteCount = 0;
     plugin.resetSyncTasks();
-    plugin.syncPageStateMap.clear(); // 同步完成，清空残留的页状态 / Sync completed, clear page state map
+    plugin.clearSyncContext();
     plugin.totalFilesToDownload = 0;
     plugin.downloadedFilesCount = 0;
     plugin.totalChunksToDownload = 0;
@@ -616,7 +680,7 @@ async function handleSyncPage(data: unknown, plugin: FastSync, type: "note" | "f
   plugin.progressTracker.recordPageProgress(type, pageMsg.pageIndex, pageMsg.totalCount, pageMsg.isLast);
 
   // 登记当前下载分页状态 (Register page metadata)
-  plugin.syncPageStateMap.set(type, {
+  plugin.registerSyncPageState(type, {
     pageIndex: pageMsg.pageIndex,
     pageSize: pageMsg.pageSize,
     totalCount: pageMsg.totalCount,
@@ -719,10 +783,7 @@ async function receiveSyncEndWrapper(data: unknown, plugin: FastSync, type: "not
     plugin.pendingNoteModifies.clear()
     plugin.localStorageManager.clearPending('pendingNoteModifies')
     // 同步结束，提交扫描阶段计算出的哈希 (Commit hashes calculated during scan)
-    if (plugin.scannedNoteHashes.size > 0) {
-      plugin.fileHashManager.bulkSetFromScanned(plugin.scannedNoteHashes);
-      plugin.scannedNoteHashes.clear();
-    }
+    commitScannedHashes(plugin.scannedNoteHashes, (entries) => plugin.fileHashManager.bulkSetFromScanned(entries));
     // 同步结束，强制落盘本轮防抖累积的哈希写入
     plugin.fileHashManager.flush();
   } else if (type === "file") {
@@ -733,10 +794,7 @@ async function receiveSyncEndWrapper(data: unknown, plugin: FastSync, type: "not
     plugin.pendingUploadHashes.clear()
     plugin.localStorageManager.clearPending('pendingUploadHashes')
     // 同步结束，提交扫描阶段计算出的哈希 (Commit hashes calculated during scan)
-    if (plugin.scannedFileHashes.size > 0) {
-      plugin.fileHashManager.bulkSetFromScanned(plugin.scannedFileHashes);
-      plugin.scannedFileHashes.clear();
-    }
+    commitScannedHashes(plugin.scannedFileHashes, (entries) => plugin.fileHashManager.bulkSetFromScanned(entries));
     // 同步结束，强制落盘本轮防抖累积的哈希写入
     plugin.fileHashManager.flush();
   } else if (type === "folder") {
@@ -762,10 +820,7 @@ async function receiveSyncEndWrapper(data: unknown, plugin: FastSync, type: "not
     plugin.pendingConfigModifies.clear()
     plugin.localStorageManager.clearPending('pendingConfigModifies')
     // 同步结束，提交扫描阶段计算出的哈希 (Commit hashes calculated during scan)
-    if (plugin.scannedConfigHashes.size > 0) {
-      plugin.configHashManager.bulkSetFromScanned(plugin.scannedConfigHashes);
-      plugin.scannedConfigHashes.clear();
-    }
+    commitScannedHashes(plugin.scannedConfigHashes, (entries) => plugin.configHashManager.bulkSetFromScanned(entries));
     // 同步结束，强制落盘本轮防抖累积的哈希写入
     plugin.configHashManager.flush();
   }
@@ -821,11 +876,19 @@ async function receiveSyncEndWrapper(data: unknown, plugin: FastSync, type: "not
  * 启动全量/增量同步
  */
 export const handleSync = async function (plugin: FastSync, isLoadLastTime: boolean = true, syncMode: SyncMode = "auto") {
-  if (plugin.isSyncing) {
+  // Claim the logical round before the first await. Mobile reconnects can
+  // arrive while the conflict-directory cleanup is still in flight; a late
+  // transport callback must see this context and cannot clear ownership.
+  const context = generateUUID();
+  if (!plugin.syncState.tryBeginSync(context)) {
     dump("Sync already in progress, skipping");
     return;
   }
-  plugin.isSyncing = true;
+  plugin.beginSyncContext(context);
+  dump(`Sync context generated: ${context}`);
+  // These caches belong to this logical round. They must survive a transport
+  // retry, but never leak into a later round after cancellation or failure.
+  plugin.syncState.clearScannedHashCaches();
 
   // 同步开始前，全局清空上一轮残留的 conflict-notes 物理冲突临时目录中的文件（位于插件目录下，避免 Windows 锁定目录报错）
   // Before sync: clear any leftover conflict-notes backup files from the previous round
@@ -849,9 +912,6 @@ export const handleSync = async function (plugin: FastSync, isLoadLastTime: bool
   // 仅清空本轮捕获的局部新冲突集合，防止上一轮残留的冲突引起本轮再次多余弹出冲突列表。
   // 我们不再清空全局和持久化的 conflictedPaths 集合，这样在未解决冲突前，角标和状态栏均会一直保留它。
   plugin.syncState.newConflictedPathsThisRound.clear();
-  // 提到 try 外部，使 catch/finally 也能引用本次会话的 context 做归属判断
-  // Hoisted outside try so catch/finally can reference this session's context for ownership checks
-  let context = "";
   let fastIncremental = false;
   try {
     // The event-only path is safe only when a durable local baseline exists.
@@ -860,16 +920,16 @@ export const handleSync = async function (plugin: FastSync, isLoadLastTime: bool
       && plugin.incrementalScanManager?.canUseIncrementalSync(plugin.localStorageManager.getMetadata("isInitSync")) === true;
     isLoadLastTime = fastIncremental;
 
-    context = generateUUID();
-    plugin.syncState.activeSyncContext = context; // 记录活跃的同步上下文 / Record the active sync context
-    dump(`Sync context generated: ${context}`);
-    if (!plugin.menuManager.ribbonIconStatus) {
-      // WebSocket 处于断开/退避状态，立即触发重连，连接成功后自动执行同步
-      // WebSocket is disconnected/in backoff, trigger immediate reconnect and auto-sync on connect
-      plugin.syncState.pendingSyncType = isLoadLastTime ? 'incremental' : 'full';
-      plugin.websocket.triggerReconnect();
+    if (!isSyncConnectionReady(plugin)) {
+      // A disconnected transport must not cause a second startupSync.  Keep this
+      // context as the owner and wait; auth -> StartHandle will see the active
+      // context and only wake this round instead of launching another scan.
+      plugin.websocket.requestReconnect();
       showSyncNotice($("ui.menu.reconnecting"));
-      plugin.syncState.activeSyncContext = null; // 早期退出，清空上下文 / Early return, reset the context
+    }
+
+    if (!await waitForSyncConnection(plugin, context)) {
+      plugin.incrementalScanManager?.abortSync();
       return;
     }
 
@@ -880,6 +940,7 @@ export const handleSync = async function (plugin: FastSync, isLoadLastTime: bool
     plugin.currentSyncType = isLoadLastTime ? 'incremental' : 'full';
     plugin.syncTypeCompleteCount = 0;
     plugin.resetSyncTasks();
+    plugin.syncState.syncPhase = "scanning";
 
     // Capture durable dirty paths before transient ACK/rename state is reset
     // below. A full auto run establishes a new baseline; a manual partial run
@@ -955,6 +1016,9 @@ export const handleSync = async function (plugin: FastSync, isLoadLastTime: bool
       plugin.updateStatusBar("");
       plugin.incrementalScanManager?.abortSync();
       plugin.syncState.activeSyncContext = null; // 无同步任务，清空上下文 / No tasks, reset the context
+      plugin.syncState.resumePendingSync = undefined;
+      plugin.syncState.syncPhase = "idle";
+      plugin.clearSyncContext();
       return;
     }
 
@@ -1050,9 +1114,21 @@ export const handleSync = async function (plugin: FastSync, isLoadLastTime: bool
           await yieldToMain();
           if (isPluginUnloading) {
             plugin.incrementalScanManager?.abortSync();
+            plugin.syncState.clearScannedHashCaches();
             plugin.syncState.activeSyncContext = null;
+            plugin.syncState.resumePendingSync = undefined;
+            plugin.syncState.syncPhase = "idle";
             return;
           }
+          if (plugin.syncState.activeSyncContext !== context) {
+            dump(`[SyncContext] Scan (context=${context}) superseded, aborting vault scan.`);
+            return;
+          }
+          if (!await waitForSyncConnection(plugin, context)) {
+            plugin.incrementalScanManager?.abortSync();
+            return;
+          }
+          plugin.syncState.syncPhase = "scanning";
           const pct = Math.floor((processedCount / totalToProcess) * 100);
           plugin.progressTracker.recordHashProgress(pct);
           if (processedCount % 100 === 0) {
@@ -1195,14 +1271,8 @@ export const handleSync = async function (plugin: FastSync, isLoadLastTime: bool
       }
 
       // Persist any newly computed hashes (breaks the Catch-22)
-      if (plugin.scannedNoteHashes.size > 0) {
-        plugin.fileHashManager.bulkSetFromScanned(plugin.scannedNoteHashes);
-        plugin.scannedNoteHashes.clear();
-      }
-      if (plugin.scannedFileHashes.size > 0) {
-        plugin.fileHashManager.bulkSetFromScanned(plugin.scannedFileHashes);
-        plugin.scannedFileHashes.clear();
-      }
+      commitScannedHashes(plugin.scannedNoteHashes, (entries) => plugin.fileHashManager.bulkSetFromScanned(entries));
+      commitScannedHashes(plugin.scannedFileHashes, (entries) => plugin.fileHashManager.bulkSetFromScanned(entries));
       dump(`[ScanPerf] Scan done: ${hashComputeCount}/${MAX_HASH_PER_CYCLE} hashes computed, notes=${notes.length}, files=${files.length}, folders=${folders.length}`);
 
       // 检测被删除的文件 (对比哈希表和本地 Vault)
@@ -1292,9 +1362,19 @@ export const handleSync = async function (plugin: FastSync, isLoadLastTime: bool
         await sleep(0);
         if (isPluginUnloading) {
           plugin.incrementalScanManager?.abortSync();
+          plugin.syncState.clearScannedHashCaches();
           plugin.syncState.activeSyncContext = null; // 插件卸载中，清空上下文 / Plugin unloading, reset the context
           return;
         }
+        if (plugin.syncState.activeSyncContext !== context) {
+          dump(`[SyncContext] Scan (context=${context}) superseded, aborting config scan.`);
+          return;
+        }
+        if (!await waitForSyncConnection(plugin, context)) {
+          plugin.incrementalScanManager?.abortSync();
+          return;
+        }
+        plugin.syncState.syncPhase = "scanning";
         const pct = overallTotal > 0 ? Math.floor(((baseProcessedCount + configCount) / overallTotal) * 100) : 100;
         plugin.progressTracker.recordHashProgress(pct);
         SyncLogManager.getInstance().addOrUpdateLog({
@@ -1451,11 +1531,79 @@ export const handleSync = async function (plugin: FastSync, isLoadLastTime: bool
     // 设置发起请求状态位，防止 checkSyncCompletion 过早判定结束 (Set requesting flag to prevent premature completion detection)
     plugin.isSyncRequesting = true;
 
+    const resetTransportAttempt = () => {
+      plugin.resetSyncTasks();
+      plugin.syncPageStateMap.clear();
+      plugin.progressTracker.reset(activeTypes);
+      plugin.totalFilesToDownload = 0;
+      plugin.downloadedFilesCount = 0;
+      plugin.totalChunksToDownload = 0;
+      plugin.downloadedChunksCount = 0;
+      plugin.totalChunksToUpload = 0;
+      plugin.uploadedChunksCount = 0;
+    };
+
     try {
-      await handleRequestSend(plugin, syncMode, noteData, fileData, configData, folderData);
+      // The snapshot is immutable for this logical round.  If the transport
+      // drops while batches are being sent, wait for auth and retry these
+      // already prepared arrays; never call handleSync/startupSync again.
+      while (plugin.syncState.activeSyncContext === context) {
+        if (!await waitForSyncConnection(plugin, context)) return;
+        plugin.syncState.syncPhase = "sending";
+        try {
+          await handleRequestSend(plugin, syncMode, noteData, fileData, configData, folderData);
+          break;
+        } catch (error) {
+          if (!(error instanceof SyncTransportError)) throw error;
+          dump(`[SyncSession] send interrupted for context=${context}; preserving scan snapshot and waiting for reconnect`);
+          resetTransportAttempt();
+          plugin.syncState.syncPhase = "waiting-connection";
+        }
+      }
     } finally {
       plugin.isSyncRequesting = false;
     }
+
+    if (plugin.syncState.activeSyncContext !== context) return;
+    plugin.syncState.syncPhase = "monitoring";
+
+    // Once the initial request set is out, a later transport close can happen
+    // before SyncEnd arrives.  Keep the prepared snapshot reachable so the
+    // authenticated reconnect retries the send phase without scanning again.
+    let resumeInFlight = false;
+    const resumePreparedSync = () => {
+      if (resumeInFlight || plugin.syncState.activeSyncContext !== context || plugin.syncState.syncPhase !== "waiting-connection") {
+        return;
+      }
+      resumeInFlight = true;
+      plugin.isSyncRequesting = true;
+      void (async () => {
+        try {
+          if (!await waitForSyncConnection(plugin, context)) return;
+          resetTransportAttempt();
+          plugin.syncState.syncPhase = "sending";
+          await handleRequestSend(plugin, syncMode, noteData, fileData, configData, folderData);
+          plugin.syncState.syncPhase = "monitoring";
+        } catch (error) {
+          if (error instanceof SyncTransportError) {
+            plugin.syncState.syncPhase = "waiting-connection";
+            dump(`[SyncSession] prepared snapshot resend paused for context=${context}`);
+          } else if (plugin.syncState.activeSyncContext === context) {
+            plugin.incrementalScanManager?.abortSync();
+            plugin.syncState.activeSyncContext = null;
+            plugin.syncState.resumePendingSync = undefined;
+            plugin.syncState.syncPhase = "idle";
+            plugin.isSyncing = false;
+            plugin.clearSyncContext();
+            plugin.updateStatusBar($("ui.status.failed") || "Sync Failed");
+          }
+        } finally {
+          resumeInFlight = false;
+          plugin.isSyncRequesting = false;
+        }
+      })();
+    };
+    plugin.syncState.resumePendingSync = resumePreparedSync;
 
     // 启动进度检测循环,每 100ms 检测一次(更频繁以获得更平滑的进度更新)
     // 同时记录开始时间，用于超时保底
@@ -1466,14 +1614,18 @@ export const handleSync = async function (plugin: FastSync, isLoadLastTime: bool
     plugin.syncState.progressCheckIntervalId = progressCheckInterval;
   } catch (error) {
     dump("Sync failed with error: " + (error instanceof Error ? error.message : String(error)));
-    plugin.incrementalScanManager?.abortSync();
     // 归属判断：只有当前活跃上下文仍是本次会话时才清空/重置，防止旧会话的迟到异常
     // （例如断线重连后旧会话 BatchAck 15s 超时才抛出）把已经在跑的新会话状态清掉
     // Ownership guard: only clear/reset when the active context still belongs to this
     // invocation, so a late exception from a superseded (stale) sync session cannot
     // clobber a newer session that has already taken over.
     if (plugin.syncState.activeSyncContext === context) {
+      plugin.incrementalScanManager?.abortSync();
+      plugin.syncState.clearScannedHashCaches();
       plugin.syncState.activeSyncContext = null; // 同步失败，清空上下文 / Sync failed, reset the context
+      plugin.syncState.resumePendingSync = undefined;
+      plugin.syncState.syncPhase = "idle";
+      plugin.clearSyncContext();
       plugin.updateStatusBar($("ui.status.failed") || "Sync Failed");
       window.setTimeout(() => plugin.updateStatusBar(""), 10000);
     } else {
@@ -1484,7 +1636,7 @@ export const handleSync = async function (plugin: FastSync, isLoadLastTime: bool
     // 避免旧会话迟到的 finally 打断已经在跑的新会话
     // Same guard: only reset isSyncing when this invocation still owns the active
     // session (or no session is active), so a stale session cannot interrupt a running new one.
-    if (plugin.syncState.activeSyncContext === context || plugin.syncState.activeSyncContext === null) {
+    if (plugin.syncState.activeSyncContext === null) {
       plugin.isSyncing = false;
     }
   }
@@ -1496,15 +1648,18 @@ export const handleSync = async function (plugin: FastSync, isLoadLastTime: bool
  */
 export function cancelSync(plugin: FastSync): void {
   plugin.incrementalScanManager?.abortSync();
+  plugin.syncState.clearScannedHashCaches();
   if (plugin.syncState.progressCheckIntervalId !== null) {
     window.clearInterval(plugin.syncState.progressCheckIntervalId);
     plugin.syncState.progressCheckIntervalId = null;
   }
 
   plugin.syncState.activeSyncContext = null;
+  plugin.syncState.resumePendingSync = undefined;
+  plugin.syncState.syncPhase = "idle";
   plugin.syncTypeCompleteCount = 0;
   plugin.resetSyncTasks();
-  plugin.syncPageStateMap.clear();
+  plugin.clearSyncContext();
   plugin.totalFilesToDownload = 0;
   plugin.downloadedFilesCount = 0;
   plugin.totalChunksToDownload = 0;
@@ -1604,25 +1759,46 @@ async function sendSyncInBatchesLegacy<T1, T2, T3>(
       // 非最后批：发送并阻塞等待服务端 BatchAck，超时则抛出异常
       // Non-final batch: send and await server BatchAck; throw on timeout
       await new Promise<void>((resolve, reject) => {
+        let settled = false;
+        let timeoutId: number | null = null;
         const ackHandler = (data: unknown) => {
           const d = data as { context?: string; batchIndex?: number };
           if (d.context === context && d.batchIndex === batchIndex) {
-            plugin.websocket.off(batchAckEvent, ackHandler);
-            resolve();
+            finish(resolve);
           }
         };
-        plugin.websocket.on(batchAckEvent, ackHandler);
-        void plugin.websocket.SendMessage(action, payload);
-
-        window.setTimeout(() => {
+        const onTransportClose = () => {
+          finish(() => reject(new SyncTransportError(
+            `[BatchSync] ${action} batch ${batchIndex}/${totalBatches} interrupted by connection close`,
+          )));
+        };
+        const cleanup = () => {
           plugin.websocket.off(batchAckEvent, ackHandler);
-          reject(new Error(`[BatchSync] ${action} batch ${batchIndex}/${totalBatches} ack timeout (15s)`));
+          activeLegacyBatchWaiters.delete(onTransportClose);
+          if (timeoutId !== null) window.clearTimeout(timeoutId);
+        };
+        const finish = (complete: () => void) => {
+          if (settled) return;
+          settled = true;
+          cleanup();
+          complete();
+        };
+
+        activeLegacyBatchWaiters.add(onTransportClose);
+        plugin.websocket.on(batchAckEvent, ackHandler);
+        void sendSyncMessage(plugin, action, payload, context)
+          .catch((error) => finish(() => reject(
+            error instanceof Error ? error : new Error(String(error)),
+          )));
+
+        timeoutId = window.setTimeout(() => {
+          finish(() => reject(new Error(`[BatchSync] ${action} batch ${batchIndex}/${totalBatches} ack timeout (15s)`)));
         }, 15000);
       });
     } else {
       // 最后批：发送后调用回调，交由原有 SyncEnd 流程完成
       // Final batch: send then invoke callback; existing SyncEnd flow handles completion
-      void plugin.websocket.SendMessage(action, payload, undefined, () => {
+      await sendSyncMessage(plugin, action, payload, context, () => {
         onLastBatchAcked?.();
       });
     }
@@ -1701,7 +1877,7 @@ class BatchSendSession {
   private async sendBatch(idx: number, isRetry = false): Promise<void> {
     const payload = isRetry ? this.inFlight.get(idx)?.payload : this.buildPayloadForIndex(idx);
     if (!payload) return;
-    await this.plugin.websocket.SendMessage(this.action, payload);
+    await sendSyncMessage(this.plugin, this.action, payload, this.context);
     if (this.settled) return;
     // 重传 timer 从 SendMessage 实际写入 socket 后起算（而非发起时），避免 bufferedAmount 背压
     // 导致 drain 等待期间就被误判超时（设计稿 §3.5 异常路径表）
@@ -1756,16 +1932,18 @@ class BatchSendSession {
     this.resolveFn();
   }
 
-  /** 连接断开：清空全部 timer，会话直接终止（不再重传，交由重连后新 context 整轮重启） */
+  /** 连接断开：清空 timer，让外层复用已准备的快照等待重连后重试 */
   public settleFromClose(): void {
     if (this.settled) return;
     this.cleanup();
-    this.rejectFn(new Error(`[BatchSync] ${this.action} session aborted: connection closed`));
+    this.rejectFn(new SyncTransportError(`[BatchSync] ${this.action} session aborted: connection closed`));
   }
 }
 
 /** 当前存活的窗口发送会话，按 batchAckEvent（如 "NoteSyncBatchAck"）索引，供 SyncEnd/onClose 钩子定位 */
 const activeBatchSendSessions = new Map<string, BatchSendSession>();
+/** Legacy stop-and-wait ACK waiters that must be interrupted on transport close. */
+const activeLegacyBatchWaiters = new Set<() => void>();
 
 /**
  * SyncEnd 到达时隐式结束对应类型的在途批发送会话（设计稿 §3.2）。W==0/旧路径下没有会话注册，no-op。
@@ -1780,6 +1958,9 @@ function settleBatchSendSessionOnSyncEnd(batchAckEvent: string): void {
 export function settleAllBatchSendSessionsOnClose(): void {
   for (const session of Array.from(activeBatchSendSessions.values())) {
     session.settleFromClose();
+  }
+  for (const waiter of Array.from(activeLegacyBatchWaiters)) {
+    waiter();
   }
 }
 
@@ -1960,9 +2141,16 @@ export const handleRequestSend = async function (plugin: FastSync, syncMode: Syn
     ));
   }
 
-  // 任一类失败不阻断其他类；失败类由 300s 总兜底（checkSyncCompletion）复位
-  // A failure in any single type does not block the others; a failed type is reset by the 300s overall fallback (checkSyncCompletion)
-  await Promise.allSettled(jobs);
+  // Do not hide a transport failure behind allSettled.  The caller still owns
+  // the prepared snapshot and can wait for a new authenticated socket and
+  // retry it without re-running the vault scan.
+  const results = await Promise.allSettled(jobs);
+  const failures = results.filter((result): result is PromiseRejectedResult => result.status === "rejected");
+  if (failures.length > 0) {
+    const firstFailure = failures[0];
+    if (firstFailure.reason instanceof Error) throw firstFailure.reason;
+    throw new Error(String(firstFailure.reason));
+  }
 
   if (plugin.settings.syncEnabled && shouldSyncNotes) {
     // 将已删除路径加入 pending set，等待 SyncEnd 确认服务端已处理后再从 hashManager 移除

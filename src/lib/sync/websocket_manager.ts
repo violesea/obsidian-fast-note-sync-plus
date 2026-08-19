@@ -3,10 +3,13 @@ import { moment, Platform, normalizePath } from "obsidian";
 import { handleFileChunkDownload, BINARY_PREFIX_FILE_SYNC, clearUploadQueue, receiveFileUploadSessionNotFound } from "./operator_file";
 import { dump, addRandomParam, showSyncNotice, safeStringify, getPluginDir, hashContent } from "../utils/helpers";
 import { enSendDTOToProtobuf, deReceivePacket } from "../../pb/protobuf_mapper";
-import { receiveOperators, startupSync, startupFullSync, settleAllBatchSendSessionsOnClose } from "./operator";
+import { receiveOperators, handleSync, cancelSync, settleAllBatchSendSessionsOnClose } from "./operator";
 import { SyncLogManager } from "./sync_log_manager";
 import * as WSAction from "./websocket_action";
 import { WebSocketClient } from "./websocket_client";
+import { ResumeRecoveryCoordinator } from "./resume_recovery";
+import { AuthSyncCoordinator } from "./auth_sync_coordinator";
+import { ConnectionSupervisor } from "./connection_supervisor";
 import { CLIENT_TYPE } from "../utils/types";
 import type FastSync from "../../main";
 import { $ } from "../../i18n/lang";
@@ -78,12 +81,20 @@ export function formatAuthorizationError(data: StructuredMessageData): string {
 export class WebSocketManager {
   public client: WebSocketClient;
   private plugin: FastSync;
-  private currentStartHandleId = 0;
+  private readonly connectionSupervisor: ConnectionSupervisor;
+  private readonly resumeRecovery: ResumeRecoveryCoordinator;
+  private readonly authSyncCoordinator: AuthSyncCoordinator;
+  private pendingConnectionProbe: {
+    promise: Promise<boolean>;
+    resolve: (healthy: boolean) => void;
+    timeoutId: number;
+  } | null = null;
   // startupDelay 按设置文案（setting.sync.startup_delay_desc）本意是只延迟"首次"检查更新，
   // 用于错开 Obsidian 启动时其他插件并发加载造成的卡顿；不应在每次断线重连时都重复套用。
   // startupDelay is documented as delaying only the "first" update check, to avoid contending
   // with other plugins loading at Obsidian startup — it should not be re-applied on every reconnect.
   private hasAppliedStartupDelay = false;
+  private keepAliveTimer: number | null = null;
 
   // --- 轻量事件总线，用于分批发送时等待服务端 BatchAck ---
   // Lightweight event bus for awaiting server BatchAck during batch send
@@ -159,12 +170,27 @@ export class WebSocketManager {
         }
         return true;
       },
+      onBackoffReconnect: () => {
+        void this.connectionSupervisor?.requestRegister(true);
+      },
       onOpen: (client) => {
         client.Send(WSAction.ClientReceiveAuth, this.plugin.settings.apiToken);
         dump("Service authorization");
       },
       onClose: (client, code, reason) => {
-        if (this.plugin.isSyncing) {
+        this.finishConnectionProbe(false);
+        this.stopKeepAlive();
+        this.authSyncCoordinator.invalidate();
+        // A transport close does not end the logical sync round.  The scan may
+        // still be running, or a prepared snapshot may be waiting to send.  Keep
+        // its context alive so auth -> StartHandle cannot start a second scan.
+        if (this.plugin.syncState.activeSyncContext) {
+          const previousPhase = this.plugin.syncState.syncPhase;
+          this.plugin.syncState.syncPhase = "waiting-connection";
+          dump(`[SyncSession] transport closed while ${previousPhase}; waiting for authenticated reconnect`);
+        } else if (this.plugin.isSyncing) {
+          // No logical context means the close happened before a round was
+          // established.  Preserve the old cleanup for that narrow startup case.
           this.plugin.isSyncing = false;
           this.plugin.isSyncRequesting = false;
         }
@@ -188,6 +214,51 @@ export class WebSocketManager {
     // 绑定大流量下载 binary handler
     this.client.registerBinaryHandler(BINARY_PREFIX_FILE_SYNC, (data) => {
       void handleFileChunkDownload(data, this.plugin);
+    });
+
+    this.connectionSupervisor = new ConnectionSupervisor({
+      register: () => this.client.register(),
+      unRegister: (setUnregistered) => this.client.unRegister(setUnregistered),
+      triggerReconnect: () => this.client.triggerReconnect(),
+      forceReconnect: () => this.client.forceReconnect(),
+    });
+
+    this.resumeRecovery = new ResumeRecoveryCoordinator({
+      isMobile: Platform.isMobile,
+      isRegistered: () => this.client.isRegister,
+      isReady: () => this.isReadyForSync(),
+      isOpen: () => this.client.isOpen && this.client.ws?.readyState === WebSocket.OPEN,
+      probe: (timeoutMs) => this.probeConnection(timeoutMs),
+      triggerReconnect: () => this.requestReconnect(),
+      forceReconnect: () => this.requestForceReconnect(),
+      log: (message) => dump(`[ResumeRecovery] ${message}`),
+    });
+
+    this.authSyncCoordinator = new AuthSyncCoordinator({
+      isCurrentConnection: (connectionId) => this.client.isCurrentConnection(connectionId),
+      waitUntilReady: (isCurrent) => this.waitForStartReady(isCurrent),
+      hasActiveSync: () => this.plugin.syncState.activeSyncContext !== null,
+      canUseIncremental: () => this.plugin.incrementalScanManager?.canUseIncrementalSync(
+        this.plugin.localStorageManager.getMetadata("isInitSync"),
+      ) === true,
+      manualSyncEnabled: () => this.plugin.settings.manualSyncEnabled,
+      getPendingRequest: () => {
+        const type = this.plugin.syncState.pendingSyncType;
+        return type
+          ? { type, mode: this.plugin.syncState.pendingSyncMode }
+          : null;
+      },
+      consumePendingRequest: () => {
+        this.plugin.syncState.pendingSyncType = null;
+        this.plugin.syncState.pendingSyncMode = "auto";
+      },
+      resumeActiveSync: () => {
+        this.plugin.syncState.resumePendingSync?.();
+      },
+      startSync: (decision) => {
+        void handleSync(this.plugin, decision.isLoadLastTime, decision.syncMode);
+      },
+      log: (message) => dump(`[SyncSession] ${message}`),
     });
   }
 
@@ -226,20 +297,64 @@ export class WebSocketManager {
   public addActivityListener(listener: () => void) {
     this.client.addActivityListener(listener);
   }
-  public register() {
-    return this.client.register();
+  public requestRegister(): Promise<void> {
+    return this.connectionSupervisor.requestRegister();
   }
-  public unRegister(setUnregistered = false) {
-    this.client.unRegister(setUnregistered);
+  public register(): Promise<void> {
+    return this.requestRegister();
+  }
+  public unRegister(setUnregistered = false): Promise<void> {
+    this.finishConnectionProbe(false);
+    this.stopKeepAlive();
+    this.authSyncCoordinator.invalidate();
+    // An explicit unregister is a deliberate transport shutdown, not a
+    // recoverable mobile interruption. End the logical round first so the next
+    // authentication cannot resume a context tied to the old connection or
+    // suppress an explicit full-sync request queued by settings changes.
+    if (this.plugin.syncState.activeSyncContext || this.plugin.isSyncing) {
+      cancelSync(this.plugin);
+    }
+    return this.connectionSupervisor.requestUnregister(setUnregistered);
+  }
+  public requestUnregister(setUnregistered = false): Promise<void> {
+    return this.unRegister(setUnregistered);
+  }
+  public requestReconfigure(): Promise<void> {
+    this.finishConnectionProbe(false);
+    this.stopKeepAlive();
+    this.authSyncCoordinator.invalidate();
+    if (this.plugin.syncState.activeSyncContext || this.plugin.isSyncing) {
+      cancelSync(this.plugin);
+    }
+    return this.connectionSupervisor.requestReconfigure();
   }
   public isConnected(): boolean {
     return this.client.isConnected();
   }
-  public triggerReconnect() {
-    this.client.triggerReconnect();
+  /** True only when the socket is open and the current connection is authenticated. */
+  public isReadyForSync(): boolean {
+    return this.client.isOpen && this.client.isAuth && this.client.ws?.readyState === WebSocket.OPEN;
   }
-  public forceReconnect() {
-    this.client.forceReconnect();
+  public requestReconnect(): void {
+    this.connectionSupervisor.requestReconnect();
+  }
+  public triggerReconnect(): void {
+    this.requestReconnect();
+  }
+  public requestForceReconnect(): void {
+    this.connectionSupervisor.requestForceReconnect();
+  }
+  public forceReconnect(): void {
+    this.requestForceReconnect();
+  }
+  public noteBackgrounded(): void {
+    this.resumeRecovery.markBackgrounded();
+  }
+  public noteNetworkLost(): void {
+    this.resumeRecovery.markNetworkLost();
+  }
+  public recoverAfterResume(source: string): Promise<void> {
+    return this.resumeRecovery.recover(source);
   }
   public SendMessage(action: WSAction.WSSendAction, data: unknown, before?: () => boolean, after?: () => void, context?: string) {
     const injectedData = this.injectContext(data, context);
@@ -250,9 +365,9 @@ export class WebSocketManager {
       after?.();
     });
   }
-  public Send(action: WSAction.WSSendAction, data: unknown, after?: () => void, context?: string) {
+  public Send(action: WSAction.WSSendAction, data: unknown, after?: () => void, context?: string): boolean {
     const injectedData = this.injectContext(data, context);
-    this.client.Send(action, injectedData, () => {
+    return this.client.Send(action, injectedData, () => {
       // Record the send event in sync logs
       // 在同步日志中记录发送事件
       SyncLogManager.getInstance().logSentMessage(action, injectedData as object | string, this.plugin.currentSyncType);
@@ -266,7 +381,7 @@ export class WebSocketManager {
    * 仅对不已携带 context 字段的对象类型载荷进行注入，避免重复注入。
    */
   private injectContext(data: unknown, context?: string): unknown {
-    const ctx = context || this.plugin.syncState.activeSyncContext;
+    const ctx = context === undefined ? this.plugin.syncState.activeSyncContext : context;
     if (
       ctx &&
       data !== null &&
@@ -301,10 +416,15 @@ export class WebSocketManager {
 
     if (msgAction === WSAction.ClientReceiveAuth) {
       if (data.code <= 0 || data.code >= 300) {
+        this.client.completeForcedReconnect();
         showSyncNotice(formatAuthorizationError(data), 6000);
         return;
       } else {
         this.client.isAuth = true;
+        // The physical replacement guard ends at authentication, not at
+        // WebSocket creation. This keeps later lifecycle events from replacing
+        // a socket that is still completing its handshake.
+        this.client.markAuthenticated();
         const paths = (data.data?.["paths"] as string[]) || [];
         this.plugin.shareIndicatorManager?.updateSharedPaths(paths);
         if (data.data) {
@@ -354,16 +474,21 @@ export class WebSocketManager {
         dump("Service authorization success");
         this.client.notifyStatusChange(true);
 
+        const connectionId = this.client.connectionId;
+        this.startKeepAlive();
         this.sendClientInfo();
-        void this.StartHandle();
+        this.plugin.flushSyncPageAcks();
+        void this.StartHandle(connectionId);
       }
       return;
     }
 
     if (msgAction === WSAction.ClientReceiveInfo) {
       if (data.code <= 0 || data.code >= 300) {
+        this.finishConnectionProbe(false);
         return;
       } else {
+        this.finishConnectionProbe(true);
         if (data.data) {
           this.plugin.versionManager.updateFromClientInfo(data.data);
         }
@@ -444,9 +569,9 @@ export class WebSocketManager {
     }
   }
 
-  public sendClientInfo() {
+  public sendClientInfo(): boolean {
     if (!this.client.isAuth) {
-      return;
+      return false;
     }
 
     const clientName = this.plugin.getClientName();
@@ -458,7 +583,9 @@ export class WebSocketManager {
       this.client.useProtobuf = false;
     }
 
-    this.Send(WSAction.ClientReceiveInfo, {
+    // ClientInfo is a transport/control message. It must not inherit the
+    // active logical sync context from Send()'s default injection.
+    return this.Send(WSAction.ClientReceiveInfo, {
       name: clientName,
       version: this.plugin.manifest.version,
       type: CLIENT_TYPE,
@@ -471,85 +598,94 @@ export class WebSocketManager {
       isLinux: Platform.isLinux,
       offlineSyncStrategy: this.plugin.settings.offlineSyncStrategy,
       protobuf: isProtobufEnabled,
-    });
+    }, undefined, "");
   }
 
-  public async StartHandle() {
-    const handleId = ++this.currentStartHandleId;
-    dump(`Service start handle, id: ${handleId}`);
+  /**
+   * Verify an authenticated socket at the application layer. Browser
+   * WebSocket does not expose protocol ping/pong, and iOS can leave a stale
+   * OPEN object behind after suspending the native transport.
+   */
+  private probeConnection(timeoutMs: number): Promise<boolean> {
+    if (!this.isReadyForSync()) return Promise.resolve(false);
+    if (this.pendingConnectionProbe) return this.pendingConnectionProbe.promise;
 
-    // 验收断言（设计稿 §5.2 第 2 点）：协商写入必须先于 StartHandle 调用完成——
-    // 要么本连接已完成 pv2 协商（negotiated=true），要么服务端是不支持协商的 v1（协商字段维持默认值，
-    // 后续走 stop-and-wait）。这里只做非阻断式告警，禁止把 handleStructuredMessage 里的协商写入移到
-    // StartHandle() 调用之后。
-    // Acceptance assertion (design §5.2 point 2): negotiation write-back must complete before
-    // StartHandle is invoked — either this connection completed pv2 negotiation, or the server is a
-    // pre-negotiation v1 (fields stay at defaults, falls back to stop-and-wait). Non-blocking warn
-    // only; do not move the negotiation write in handleStructuredMessage to after this call.
-    if (!this.plugin.syncState.negotiated) {
-      dump(`[Negotiation] StartHandle entered without pv2 negotiation — treating server as v1 (stop-and-wait fallback)`);
+    let resolveProbe!: (healthy: boolean) => void;
+    const promise = new Promise<boolean>((resolve) => {
+      resolveProbe = resolve;
+    });
+    const timeoutId = window.setTimeout(() => this.finishConnectionProbe(false), timeoutMs);
+    this.pendingConnectionProbe = { promise, resolve: resolveProbe, timeoutId };
+
+    if (!this.sendClientInfo()) {
+      this.finishConnectionProbe(false);
     }
+    return promise;
+  }
 
+  private finishConnectionProbe(healthy: boolean): void {
+    const pending = this.pendingConnectionProbe;
+    if (!pending) return;
+    this.pendingConnectionProbe = null;
+    window.clearTimeout(pending.timeoutId);
+    pending.resolve(healthy);
+  }
+
+  public StartHandle(connectionId = this.client.connectionId): Promise<void> {
+    this.plugin.isFirstSync = true;
+    return this.authSyncCoordinator.dispatch(connectionId);
+  }
+
+  /**
+   * Wait for plugin-side startup prerequisites while retaining the physical
+   * connection guard. A stale auth callback must stop after every await.
+   */
+  private async waitForStartReady(isCurrent: () => boolean): Promise<boolean> {
     if (this.plugin.settings.startupDelay > 0 && !this.hasAppliedStartupDelay) {
       this.hasAppliedStartupDelay = true;
       dump(`Startup delay: ${this.plugin.settings.startupDelay}ms`);
       await new Promise((resolve) => window.setTimeout(resolve, this.plugin.settings.startupDelay));
+      if (!isCurrent()) return false;
     }
 
-    if (handleId !== this.currentStartHandleId) {
-      dump(`Service start handle cancelled, id: ${handleId}`);
-      return;
+    if (!this.plugin.syncState.negotiated) {
+      dump(`[Negotiation] Authenticated connection has no pv2 negotiation; using stop-and-wait fallback`);
     }
 
-    // 等待 fileHashManager 初始化完成
-    if (!this.plugin.fileHashManager || !this.plugin.fileHashManager.isReady()) {
-      dump(`Waiting for fileHashManager to be ready...`);
+    if (this.plugin.fileHashManager && this.plugin.fileHashManager.isReady()) {
+      return isCurrent();
+    }
 
-      // 最多等待 30 秒
-      const maxWaitTime = 30000;
-      const startTime = Date.now();
-
-      while (!this.plugin.fileHashManager || !this.plugin.fileHashManager.isReady()) {
-        if (Date.now() - startTime > maxWaitTime) {
-          dump(`FileHashManager initialization timeout after ${maxWaitTime}ms`);
-          showSyncNotice("文件哈希管理器初始化超时,同步可能不稳定");
-          break;
-        }
-        await new Promise((resolve) => window.setTimeout(resolve, 100));
+    dump("Waiting for fileHashManager to be ready...");
+    const maxWaitTime = 30000;
+    const startTime = Date.now();
+    while (!this.plugin.fileHashManager || !this.plugin.fileHashManager.isReady()) {
+      if (!isCurrent()) return false;
+      if (Date.now() - startTime > maxWaitTime) {
+        dump(`FileHashManager initialization timeout after ${maxWaitTime}ms`);
+        showSyncNotice("文件哈希管理器初始化超时,同步可能不稳定");
+        break;
       }
-
-      if (this.plugin.fileHashManager && this.plugin.fileHashManager.isReady()) {
-        dump("FileHashManager is ready, proceeding with sync");
-      }
+      await new Promise((resolve) => window.setTimeout(resolve, 100));
     }
 
-    this.plugin.isFirstSync = true;
+    return isCurrent();
+  }
 
-    // 检查是否有用户手动触发的待执行同步 / Check if user manually triggered a pending sync
-    const pendingType = this.plugin.syncState.pendingSyncType;
-    this.plugin.syncState.pendingSyncType = null;
+  private startKeepAlive(): void {
+    this.stopKeepAlive();
+    // The service read timeout is 60s. A 20s control message keeps a
+    // foreground mobile scan alive without starting a sync round.
+    this.keepAliveTimer = window.setInterval(() => {
+      if (!this.isReadyForSync() || this.pendingConnectionProbe) return;
+      this.sendClientInfo();
+    }, 20000);
+  }
 
-    if (this.plugin.settings.manualSyncEnabled) {
-      // 如果用户手动触发了同步，即使 manualSyncEnabled 也执行一次
-      // If user manually triggered sync, execute once even with manualSyncEnabled
-      if (pendingType) {
-        if (pendingType === 'full') {
-          void startupFullSync(this.plugin);
-        } else {
-          void startupSync(this.plugin);
-        }
-      } else {
-        dump("Full Manual Sync Mode enabled, skipping startup sync");
-      }
-      return;
-    }
-
-    // 有 pending 同步请求时，使用 pending 的类型；否则走默认增量同步
-    // If pending sync requested, use its type; otherwise default incremental
-    if (pendingType === 'full') {
-      void startupFullSync(this.plugin);
-    } else {
-      void startupSync(this.plugin);
+  private stopKeepAlive(): void {
+    if (this.keepAliveTimer !== null) {
+      window.clearInterval(this.keepAliveTimer);
+      this.keepAliveTimer = null;
     }
   }
 
