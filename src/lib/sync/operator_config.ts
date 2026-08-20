@@ -89,6 +89,8 @@ export const configModify = async function (path: string, plugin: FastSync, even
 
     if (savedHash === contentHash && (lastSyncMtime !== undefined && lastSyncMtime === mtime)) {
         plugin.removeIgnoredConfigFile(path)
+        plugin.incrementalScanManager?.markSent("config", path)
+        plugin.incrementalScanManager?.acknowledge("config", path)
         // 顺便更新一下 ConfigManager 的状态，防止下次误判
         if (plugin.configManager) {
             plugin.configManager.updateFileState(normalizePath(path), mtime)
@@ -112,6 +114,7 @@ export const configModify = async function (path: string, plugin: FastSync, even
     plugin.pendingConfigModifies.set(path, contentHash)
     plugin.localStorageManager.savePending('pendingConfigModifies', plugin.pendingConfigModifies)
     await plugin.concurrencyLimiter.waitForSlot(path)
+    plugin.incrementalScanManager?.markSent("config", path)
     void plugin.websocket.SendMessage("SettingModify", data)
 
     plugin.removeIgnoredConfigFile(path)
@@ -139,6 +142,7 @@ export const configDelete = async function (path: string, plugin: FastSync, even
     void plugin.websocket.SendMessage("SettingDelete", data, undefined, () => {
         // 消息真正写入 TCP 缓冲区后加入 pending set，等待 SettingDeleteAck 再删 hash
         // Add to pending set only after message is actually buffered; remove hash only on SettingDeleteAck
+        plugin.incrementalScanManager?.markSent("config", path)
         plugin.pendingConfigDeleteAcks.add(path)
     })
     plugin.removeIgnoredConfigFile(path)
@@ -203,7 +207,7 @@ export const receiveConfigSyncModify = async function (data: ReceiveMessage, plu
                     // mtime is newer than what we last synced; confirm with content hash whether
                     // local content actually diverged from the known baseline
                     const knownBaseHash = plugin.configHashManager.getPathHash(data.path)
-                    let localContentHash = plugin.configHashManager.getValidHash(data.path, existingStat.mtime, existingStat.size)
+                    let localContentHash = plugin.configHashManager.getValidHash(data.path, existingStat.mtime, existingStat.size, existingStat.ctime)
                     if (localContentHash === null) {
                         localContentHash = await hashFileAsync(plugin.app, filePath)
                     }
@@ -472,9 +476,12 @@ export const receiveConfigSyncClear = async function (data: unknown, plugin: Fas
  * Receive SettingModifyAck, move pending hash to formal configHashManager and update lastConfigSyncTime
  */
 export const receiveConfigModifyAck = async function (data: { lastTime?: number; path?: string }, plugin: FastSync) {
+    const journalResult = data.path
+        ? plugin.incrementalScanManager?.acknowledge("config", data.path)
+        : "untracked"
     if (data.path) {
         const contentHash = plugin.pendingConfigModifies.get(data.path)
-        if (contentHash !== undefined) {
+        if (contentHash !== undefined && journalResult !== "stale") {
             if (plugin.configHashManager && plugin.configHashManager.isReady()) {
                 const isVirtual = data.path.startsWith(plugin.localStorageManager.syncPathPrefix)
                 let mtime = 0, size = 0
@@ -512,7 +519,8 @@ export const receiveConfigModifyAck = async function (data: { lastTime?: number;
  */
 export const receiveConfigDeleteAck = function (data: { lastTime?: number; path?: string }, plugin: FastSync) {
     if (data.path && plugin.pendingConfigDeleteAcks.has(data.path)) {
-        if (plugin.configHashManager && plugin.configHashManager.isReady()) {
+        const journalResult = plugin.incrementalScanManager?.acknowledge("config", data.path)
+        if (journalResult !== "stale" && plugin.configHashManager && plugin.configHashManager.isReady()) {
             plugin.configHashManager.removeFileHash(data.path)
         }
         plugin.pendingConfigDeleteAcks.delete(data.path)

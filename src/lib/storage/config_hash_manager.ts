@@ -12,7 +12,15 @@ interface HashCache {
     hash: string;
     mtime: number;
     size: number;
+    /** Optional for backward compatibility with pre-2.4.6 cache entries. */
+    ctime?: number;
 }
+
+const matchesFingerprint = (cache: HashCache, mtime: number, size: number, ctime?: number): boolean => {
+    return cache.mtime === mtime
+        && cache.size === size
+        && (ctime === undefined || cache.ctime === undefined || cache.ctime === ctime);
+};
 
 /**
  * 配置哈希管理器
@@ -57,6 +65,14 @@ export class ConfigHashManager {
         }
         // 最后冲镜像：既包含 saveToStorage 刚安排的一份，也包含与 isDirty 无关的防抖中镜像写
         this.mirror.flush();
+    }
+
+    async flushAsync(): Promise<void> {
+        if (this.isDirty) {
+            this.isDirty = false;
+            this.saveToStorage();
+        }
+        await this.mirror.flushAsync();
     }
 
     /**
@@ -157,7 +173,12 @@ export class ConfigHashManager {
                             const stat = await this.plugin.app.vault.adapter.stat(filePath);
                             if (stat) {
                                 contentHash = await hashFileAsync(this.plugin.app, filePath);
-                                this.hashMap.set(path, { hash: contentHash, mtime: stat.mtime, size: stat.size });
+                                this.hashMap.set(path, {
+                                    hash: contentHash,
+                                    mtime: stat.mtime,
+                                    size: stat.size,
+                                    ...(typeof stat.ctime === "number" ? { ctime: stat.ctime } : {}),
+                                });
                             }
                         } catch (error) {
                             dumpError("读取配置文件出错:", error);
@@ -199,10 +220,10 @@ export class ConfigHashManager {
     /**
      * 获取有效的哈希值
      */
-    getValidHash(path: string, mtime: number, size: number): string | null {
+    getValidHash(path: string, mtime: number, size: number, ctime?: number): string | null {
         const cache = this.hashMap.get(path);
         // 如果 mtime 和 size 为 0，通常是虚拟路径或旧数据，强制重新校验
-        if (cache && cache.mtime === mtime && cache.size === size && mtime !== 0) {
+        if (cache && matchesFingerprint(cache, mtime, size, ctime) && mtime !== 0) {
             return cache.hash;
         }
         return null;
@@ -225,16 +246,26 @@ export class ConfigHashManager {
     /**
      * 添加或更新单个配置的哈希
      */
-    setFileHash(path: string, hash: string, mtime: number = 0, size: number = 0): void {
-        this.hashMap.set(path, { hash, mtime, size });
+    setFileHash(path: string, hash: string, mtime: number = 0, size: number = 0, ctime?: number): void {
+        this.hashMap.set(path, {
+            hash,
+            mtime,
+            size,
+            ...(typeof ctime === "number" && ctime > 0 ? { ctime } : {}),
+        });
         this.scheduleSave();
     }
 
-    async setFileHashes(entries: Iterable<[string, string]>, getStat?: (path: string) => Promise<{ mtime?: number; size?: number } | null | undefined> | { mtime?: number; size?: number } | null | undefined): Promise<void> {
+    async setFileHashes(entries: Iterable<[string, string]>, getStat?: (path: string) => Promise<{ mtime?: number; size?: number; ctime?: number } | null | undefined> | { mtime?: number; size?: number; ctime?: number } | null | undefined): Promise<void> {
         let changed = false;
         for (const [path, hash] of entries) {
             const stat = await getStat?.(path);
-            this.hashMap.set(path, { hash, mtime: stat?.mtime || 0, size: stat?.size || 0 });
+            this.hashMap.set(path, {
+                hash,
+                mtime: stat?.mtime || 0,
+                size: stat?.size || 0,
+                ...(typeof stat?.ctime === "number" && stat.ctime > 0 ? { ctime: stat.ctime } : {}),
+            });
             changed = true;
         }
         if (changed) this.saveToStorage();
@@ -243,13 +274,24 @@ export class ConfigHashManager {
     /**
      * 批量从扫描的哈希表中设置并持久化一次
      */
-    bulkSetFromScanned(scanned: Map<string, { hash: string; mtime: number; size: number }>): void {
+    bulkSetFromScanned(scanned: Map<string, { hash: string; mtime: number; size: number; ctime?: number }>): void {
         if (scanned.size === 0) return;
         let changed = false;
         for (const [path, cache] of scanned) {
             const existing = this.hashMap.get(path);
-            if (!existing || existing.mtime <= cache.mtime) {
-                this.hashMap.set(path, { hash: cache.hash, mtime: cache.mtime, size: cache.size });
+            if (!existing
+                || cache.mtime > existing.mtime
+                || (cache.mtime === existing.mtime && (
+                    cache.size !== existing.size
+                    || cache.hash !== existing.hash
+                    || (cache.ctime !== undefined && existing.ctime !== cache.ctime)
+                ))) {
+                this.hashMap.set(path, {
+                    hash: cache.hash,
+                    mtime: cache.mtime,
+                    size: cache.size,
+                    ...(typeof cache.ctime === "number" ? { ctime: cache.ctime } : {}),
+                });
                 changed = true;
             }
         }

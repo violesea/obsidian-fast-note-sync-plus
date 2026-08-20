@@ -88,9 +88,10 @@ const { FileHashManager } = loadModule("src/lib/storage/file_hash_manager.ts", f
 
 // --- 假 plugin：localStorage 用 Map，vault.adapter 用 Map（内存文件系统） ---
 function makeFakePlugin(localStorageMap, fileMap, { onGetFiles } = {}) {
-  return {
+  const plugin = {
     manifest: { id: "fast-note-sync", dir: ".obsidian/plugins/fast-note-sync" },
     settings: {},
+    __writeGate: null,
     app: {
       loadLocalStorage: (key) => (localStorageMap.has(key) ? localStorageMap.get(key) : null),
       saveLocalStorage: (key, value) => {
@@ -111,12 +112,14 @@ function makeFakePlugin(localStorageMap, fileMap, { onGetFiles } = {}) {
             return fileMap.get(p);
           },
           write: async (p, data) => {
+            if (plugin.__writeGate) await plugin.__writeGate;
             fileMap.set(p, data);
           },
         },
       },
     },
   };
+  return plugin;
 }
 
 const MIRROR_PATH = ".obsidian/plugins/fast-note-sync/fileHashMap.json";
@@ -132,8 +135,7 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
   mgr.setFileHash("notes/a.md", "hash-a", 111, 10);
   mgr.setFileHash("img/b.png", "hash-b", 222, 20);
-  mgr.flush();
-  await sleep(20); // 等 adapter.write 异步落盘
+  await mgr.flushAsync(); // 等待 adapter.write 真正完成，而不是只启动写入
 
   assert.equal(ls.has("fns-fileHashMap"), true, "localStorage 应有稳定 key 数据");
   assert.equal(filesA.has(MIRROR_PATH), true, "镜像文件应已写入");
@@ -154,6 +156,29 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
   assert.equal(mgr2.getPathHash("notes/a.md"), "hash-a", "应从镜像恢复哈希");
   assert.equal(mgr2.getValidHash("img/b.png", 222, 20), "hash-b", "mtime/size 应一并恢复");
   assert.equal(ls.has("fns-fileHashMap"), true, "恢复后应回写 localStorage");
+}
+
+// === 场景 E：flushAsync 必须等待已经在途的 adapter.write ===
+{
+  const ls = new Map();
+  const files = new Map();
+  const plugin = makeFakePlugin(ls, files);
+  const mgr = new FileHashManager(plugin);
+  await mgr.initialize();
+
+  let releaseWrite;
+  plugin.__writeGate = new Promise((resolve) => { releaseWrite = resolve; });
+  mgr.setFileHash("notes/wait.md", "hash-wait", 333, 30);
+  mgr.flush();
+
+  let finished = false;
+  const pendingFlush = mgr.flushAsync().then(() => { finished = true; });
+  await Promise.resolve();
+  assert.equal(finished, false, "flushAsync 不应在 adapter.write 完成前返回");
+
+  releaseWrite();
+  await pendingFlush;
+  assert.equal(files.has(MIRROR_PATH), true, "adapter.write 完成后镜像应已存在");
 }
 
 // === 场景 C：localStorage 与镜像均无 → 走重建路径（getFiles 被调用），不报错 ===

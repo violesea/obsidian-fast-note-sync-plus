@@ -37,6 +37,10 @@ class FakeMirror {
       this.pending = null;
     }
   }
+
+  async flushAsync() {
+    this.flush();
+  }
 }
 
 const module = { exports: {} };
@@ -150,6 +154,42 @@ function readState(localStorage) {
   ]);
 }
 
+// Contract: an ACK for an older sent version cannot consume a newer local edit.
+{
+  const localStorage = new Map();
+  const manager = new IncrementalScanManager(makePlugin(localStorage));
+  await manager.initialize();
+  manager.markModified("note", "versioned.md");
+  manager.markSent("note", "versioned.md");
+  manager.markModified("note", "versioned.md");
+  assert.equal(manager.acknowledge("note", "versioned.md"), "stale");
+  assert.equal(Object.values(readState(localStorage).entries).length, 1);
+
+  manager.markSent("note", "versioned.md");
+  assert.equal(manager.acknowledge("note", "versioned.md"), "acked");
+  assert.equal(Object.values(readState(localStorage).entries).length, 0);
+}
+
+// Contract: an interrupted full reconciliation must not fall back to an
+// event-only sync after restart, even if the previous round had succeeded.
+{
+  const localStorage = new Map();
+  const manager = new IncrementalScanManager(makePlugin(localStorage));
+  await manager.initialize();
+  manager.markInitialSyncComplete();
+  assert.equal(manager.canUseIncrementalSync(true), true);
+
+  manager.beginSync(true);
+  const interrupted = JSON.parse(localStorage.get("fns-incrementalScanState"));
+  assert.equal(interrupted.serverBaselineReady, false);
+  assert.equal(interrupted.completedInitialSync, false);
+
+  const reloaded = new IncrementalScanManager(makePlugin(localStorage));
+  await reloaded.initialize();
+  assert.equal(reloaded.canUseIncrementalSync(true), false);
+  assert.equal(reloaded.canUseMetadataReconciliation(), true);
+}
+
 // Contract: old vault-scoped storage and the file mirror both migrate to the stable key.
 {
   const migratedState = JSON.stringify({
@@ -162,7 +202,9 @@ function readState(localStorage) {
   const localStorage = new Map([["fns-TestVault-incrementalScanState", migratedState]]);
   const manager = new IncrementalScanManager(makePlugin(localStorage));
   await manager.initialize();
-  assert.equal(localStorage.get("fns-incrementalScanState"), migratedState);
+  const migrated = JSON.parse(localStorage.get("fns-incrementalScanState"));
+  assert.equal(migrated.completedInitialSync, true);
+  assert.equal(migrated.serverBaselineReady, true);
   assert.equal(manager.canUseIncrementalSync(false), true);
 
   const mirroredFiles = new Map([
@@ -171,7 +213,9 @@ function readState(localStorage) {
   const mirrorStorage = new Map();
   const mirrorManager = new IncrementalScanManager(makePlugin(mirrorStorage, mirroredFiles));
   await mirrorManager.initialize();
-  assert.equal(mirrorStorage.get("fns-incrementalScanState"), migratedState);
+  const mirrored = JSON.parse(mirrorStorage.get("fns-incrementalScanState"));
+  assert.equal(mirrored.completedInitialSync, true);
+  assert.equal(mirrored.serverBaselineReady, true);
   assert.equal(mirrorManager.canUseIncrementalSync(false), true);
 }
 

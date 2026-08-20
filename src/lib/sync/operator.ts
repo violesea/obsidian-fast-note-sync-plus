@@ -62,6 +62,14 @@ interface IncrementalScanBuckets {
   missingFolders: PathHashFile[];
 }
 
+interface ScanStats {
+  enumeratedEntries: number;
+  metadataChanged: number;
+  hashComputed: number;
+  cacheHits: number;
+  dirtyJournalEntries: number;
+}
+
 const collectIncrementalEntries = (plugin: FastSync, snapshot: DirtySnapshot): DirtyEntry[] => {
   const supplementalEntries: DirtyEntry[] = [];
 
@@ -94,6 +102,26 @@ const collectIncrementalEntries = (plugin: FastSync, snapshot: DirtySnapshot): D
   return mergeDirtyEntries(snapshot.entries, supplementalEntries);
 };
 
+const shouldSkipUnchangedLocalEntry = (
+  metadataReconciliation: boolean,
+  dirtyKeys: Set<string>,
+  kind: "note" | "file",
+  path: string,
+  cachedHash: string | null,
+  baseHash: string | null,
+  hasPendingUpload: boolean,
+): boolean => {
+  // Metadata reconciliation is the recovery path after an interrupted full
+  // round. It still enumerates the vault to catch missed create/delete events,
+  // but an unchanged local entry must not be sent back to the server.
+  return metadataReconciliation
+    && !dirtyKeys.has(incrementalEntryKey(kind, path))
+    && !hasPendingUpload
+    && cachedHash !== null
+    && baseHash !== null
+    && cachedHash === baseHash;
+};
+
 const addDeletedPath = (plugin: FastSync, entry: DirtyEntry, buckets: IncrementalScanBuckets): void => {
   const item = { path: entry.path, pathHash: hashContent(entry.path) };
   const target = plugin.settings.offlineDeleteSyncEnabled ? "delete" : "missing";
@@ -118,9 +146,11 @@ const scanIncrementalVaultEntries = async (
   plugin: FastSync,
   entries: DirtyEntry[],
   buckets: IncrementalScanBuckets,
+  stats: ScanStats,
 ): Promise<Set<string>> => {
   const processed = new Set<string>();
   for (const entry of entries) {
+    stats.enumeratedEntries++;
     const key = incrementalEntryKey(entry.kind, entry.path);
     if (entry.kind === "config") continue;
 
@@ -170,14 +200,22 @@ const scanIncrementalVaultEntries = async (
       // precision; that would turn a real edit into a silent no-op.
       let contentHash = entry.operation === "modify"
         ? null
-        : plugin.fileHashManager.getValidHash(file.path, file.stat.mtime, file.stat.size);
+        : plugin.fileHashManager.getValidHash(file.path, file.stat.mtime, file.stat.size, file.stat.ctime);
+      if (entry.operation === "modify") stats.metadataChanged++;
+      else if (contentHash !== null) stats.cacheHits++;
       if (contentHash === null) {
         try {
           contentHash = await Promise.race([
             hashContentAsync(await plugin.app.vault.read(file)),
             new Promise<never>((_, reject) => window.setTimeout(() => reject(new Error("Hash timeout")), 15000)),
           ]);
-          plugin.scannedNoteHashes.set(file.path, { hash: contentHash, mtime: file.stat.mtime, size: file.stat.size });
+          stats.hashComputed++;
+          plugin.scannedNoteHashes.set(file.path, {
+            hash: contentHash,
+            mtime: file.stat.mtime,
+            size: file.stat.size,
+            ctime: file.stat.ctime,
+          });
         } catch {
           continue;
         }
@@ -210,14 +248,22 @@ const scanIncrementalVaultEntries = async (
 
     let contentHash = entry.operation === "modify"
       ? null
-      : plugin.fileHashManager.getValidHash(file.path, file.stat.mtime, file.stat.size);
+      : plugin.fileHashManager.getValidHash(file.path, file.stat.mtime, file.stat.size, file.stat.ctime);
+    if (entry.operation === "modify") stats.metadataChanged++;
+    else if (contentHash !== null) stats.cacheHits++;
     if (contentHash === null) {
       try {
         contentHash = await Promise.race([
           hashFileAsync(plugin.app, file.path),
           new Promise<never>((_, reject) => window.setTimeout(() => reject(new Error("Hash timeout")), 15000)),
         ]);
-        plugin.scannedFileHashes.set(file.path, { hash: contentHash, mtime: file.stat.mtime, size: file.stat.size });
+        stats.hashComputed++;
+        plugin.scannedFileHashes.set(file.path, {
+          hash: contentHash,
+          mtime: file.stat.mtime,
+          size: file.stat.size,
+          ctime: file.stat.ctime,
+        });
       } catch {
         continue;
       }
@@ -241,6 +287,7 @@ const scanIncrementalConfigEntries = async (
   plugin: FastSync,
   entries: DirtyEntry[],
   buckets: IncrementalScanBuckets,
+  stats: ScanStats,
 ): Promise<Set<string>> => {
   const processed = new Set<string>();
   if (!plugin.settings.configSyncEnabled || !plugin.configHashManager?.isReady()) return processed;
@@ -249,6 +296,7 @@ const scanIncrementalConfigEntries = async (
   const storageByPath = new Map(storageConfigs.map((item) => [item.path, item]));
 
   for (const entry of entries) {
+    stats.enumeratedEntries++;
     if (entry.kind !== "config") continue;
     const key = incrementalEntryKey(entry.kind, entry.path);
     if (configIsPathExcluded(entry.path, plugin)) {
@@ -283,11 +331,16 @@ const scanIncrementalConfigEntries = async (
 
     let contentHash = entry.operation === "modify"
       ? null
-      : plugin.configHashManager.getValidHash(entry.path, stat.mtime, stat.size);
+      : plugin.configHashManager.getValidHash(entry.path, stat.mtime, stat.size, stat.ctime);
     if (contentHash === null) {
       try {
         contentHash = await hashFileAsync(plugin.app, path);
-        plugin.scannedConfigHashes.set(entry.path, { hash: contentHash, mtime: stat.mtime, size: stat.size });
+        plugin.scannedConfigHashes.set(entry.path, {
+          hash: contentHash,
+          mtime: stat.mtime,
+          size: stat.size,
+          ctime: stat.ctime,
+        });
       } catch {
         continue;
       }
@@ -309,7 +362,11 @@ const scanIncrementalConfigEntries = async (
 export const startupSync = (plugin: FastSync): void => {
   const localStorageInitialSync = plugin.localStorageManager.getMetadata("isInitSync") as boolean;
   const useIncremental = plugin.incrementalScanManager?.canUseIncrementalSync(localStorageInitialSync) === true;
-  void handleSync(plugin, useIncremental);
+  const useMetadataReconciliation = plugin.incrementalScanManager?.canUseMetadataReconciliation() === true;
+  // A restored local baseline can safely drive a cache-only reconciliation even
+  // when the server baseline was interrupted. Keep isLoadLastTime=true so the
+  // scan reuses metadata/hash caches instead of treating the vault as cold.
+  void handleSync(plugin, useIncremental || useMetadataReconciliation);
 };
 export const startupFullSync = async (plugin: FastSync) => {
   void handleSync(plugin, false);
@@ -325,15 +382,17 @@ export const resetSettingSyncTime = async (plugin: FastSync, silent = false) => 
 export const rebuildAllHashes = async (plugin: FastSync) => {
   await plugin.fileHashManager.rebuildHashMap();
   await plugin.configHashManager.rebuildHashMap();
+  plugin.incrementalScanManager?.markLocalBaselineReady();
 };
 
 export const clearAllHashes = async (plugin: FastSync) => {
   plugin.fileHashManager.clearAll();
   plugin.configHashManager.clearAll();
+  plugin.incrementalScanManager?.invalidateLocalBaseline();
   plugin.incrementalScanManager?.requestFullReconcile();
 };
 
-type ScannedHashMap = Map<string, { hash: string; mtime: number; size: number }>;
+type ScannedHashMap = Map<string, { hash: string; mtime: number; size: number; ctime?: number }>;
 
 /** Commit only the entries that this call observed, leaving concurrent work intact. */
 function commitScannedHashes(scanned: ScannedHashMap, commit: (entries: ScannedHashMap) => void): void {
@@ -913,12 +972,16 @@ export const handleSync = async function (plugin: FastSync, isLoadLastTime: bool
   // 我们不再清空全局和持久化的 conflictedPaths 集合，这样在未解决冲突前，角标和状态栏均会一直保留它。
   plugin.syncState.newConflictedPathsThisRound.clear();
   let fastIncremental = false;
+  let metadataReconciliation = false;
   try {
     // The event-only path is safe only when a durable local baseline exists.
     // If it does not, fail closed to the original full reconciliation.
     fastIncremental = isLoadLastTime
       && plugin.incrementalScanManager?.canUseIncrementalSync(plugin.localStorageManager.getMetadata("isInitSync")) === true;
-    isLoadLastTime = fastIncremental;
+    metadataReconciliation = !fastIncremental
+      && isLoadLastTime
+      && plugin.incrementalScanManager?.canUseMetadataReconciliation() === true;
+    isLoadLastTime = fastIncremental || metadataReconciliation;
 
     if (!isSyncConnectionReady(plugin)) {
       // A disconnected transport must not cause a second startupSync.  Keep this
@@ -937,7 +1000,7 @@ export const handleSync = async function (plugin: FastSync, isLoadLastTime: bool
       dump("Read-only mode: Proceeding with state gathering for remote-to-local sync.");
     }
 
-    plugin.currentSyncType = isLoadLastTime ? 'incremental' : 'full';
+    plugin.currentSyncType = fastIncremental ? 'incremental' : 'full';
     plugin.syncTypeCompleteCount = 0;
     plugin.resetSyncTasks();
     plugin.syncState.syncPhase = "scanning";
@@ -946,9 +1009,18 @@ export const handleSync = async function (plugin: FastSync, isLoadLastTime: bool
     // below. A full auto run establishes a new baseline; a manual partial run
     // leaves entries for the types it did not reconcile.
     const dirtySnapshot = plugin.incrementalScanManager?.beginSync(!fastIncremental && syncMode === "auto") ?? null;
+    const dirtyKeys = new Set((dirtySnapshot?.entries ?? []).map((entry) => incrementalEntryKey(entry.kind, entry.path)));
     const incrementalEntries = fastIncremental && dirtySnapshot
       ? collectIncrementalEntries(plugin, dirtySnapshot)
       : [];
+    const scanStats: ScanStats = {
+      enumeratedEntries: 0,
+      metadataChanged: 0,
+      hashComputed: 0,
+      cacheHits: 0,
+      dirtyJournalEntries: fastIncremental ? incrementalEntries.length : dirtySnapshot?.entries.length ?? 0,
+    };
+    const scanMode = fastIncremental ? "incremental" : metadataReconciliation ? "metadata-reconcile" : "full";
 
     const shouldSyncNotes = syncMode === "auto" || syncMode === "note";
     const shouldSyncConfigs = syncMode === "auto" || syncMode === "config";
@@ -1036,7 +1108,7 @@ export const handleSync = async function (plugin: FastSync, isLoadLastTime: bool
         action: `VaultScanning_${plugin.currentSyncType}`,
         status: 'pending',
         progress: 0,
-        message: plugin.currentSyncType === 'full' ? '正在进行全量哈希计算...' : '正在进行增量哈希计算...'
+        message: `syncMode=${scanMode} | ${scanMode === 'full' ? '正在进行全量哈希计算...' : scanMode === 'metadata-reconcile' ? '正在进行可恢复元数据对账...' : '正在进行增量哈希计算...'}`
       });
     }
 
@@ -1073,7 +1145,7 @@ export const handleSync = async function (plugin: FastSync, isLoadLastTime: bool
 
     if (plugin.settings.syncEnabled && shouldSyncNotes) {
       if (fastIncremental) {
-        const processed = await scanIncrementalVaultEntries(plugin, incrementalEntries, scanBuckets);
+        const processed = await scanIncrementalVaultEntries(plugin, incrementalEntries, scanBuckets, scanStats);
         plugin.incrementalScanManager?.markProcessed(processed);
         dump(`[IncrementalScan] event paths=${incrementalEntries.filter((entry) => entry.kind !== "config").length}, notes=${notes.length}, files=${files.length}, folders=${folders.length}`);
       } else {
@@ -1081,6 +1153,7 @@ export const handleSync = async function (plugin: FastSync, isLoadLastTime: bool
       let processedCount = 0;
       const totalFiles = list.length;
       scannedVaultEntryCount = totalFiles;
+      scanStats.enumeratedEntries += totalFiles;
       // 简单预估配置数量，用于合并进度条
       const estimatedConfigCount = plugin.settings.configSyncEnabled ? 100 : 0;
       const totalToProcess = totalFiles + estimatedConfigCount;
@@ -1109,6 +1182,15 @@ export const handleSync = async function (plugin: FastSync, isLoadLastTime: bool
         }
       };
 
+      const persistScanCheckpoint = async (): Promise<void> => {
+        if (hashInFlight.size > 0) {
+          await Promise.all(Array.from(hashInFlight));
+        }
+        commitScannedHashes(plugin.scannedNoteHashes, (entries) => plugin.fileHashManager.bulkSetFromScanned(entries));
+        commitScannedHashes(plugin.scannedFileHashes, (entries) => plugin.fileHashManager.bulkSetFromScanned(entries));
+        plugin.fileHashManager.flush();
+      };
+
       for (const file of list) {
         if (++processedCount % 20 === 0) {
           await yieldToMain();
@@ -1132,6 +1214,7 @@ export const handleSync = async function (plugin: FastSync, isLoadLastTime: bool
           const pct = Math.floor((processedCount / totalToProcess) * 100);
           plugin.progressTracker.recordHashProgress(pct);
           if (processedCount % 100 === 0) {
+            await persistScanCheckpoint();
             SyncLogManager.getInstance().addOrUpdateLog({
               id: hashingLogId,
               type: 'info',
@@ -1159,9 +1242,10 @@ export const handleSync = async function (plugin: FastSync, isLoadLastTime: bool
           if (file instanceof TFile) {
             if (isPathExcluded(file.path, plugin)) continue;
             if (file.extension === "md") {
-              if (isLoadLastTime
+              const baseHash = plugin.fileHashManager.getPathHash(file.path);
+              if (isLoadLastTime && !metadataReconciliation
                 && file.stat.mtime < Number(plugin.localStorageManager.getMetadata("lastNoteSyncTime"))
-                && plugin.fileHashManager.getPathHash(file.path) !== null
+                && baseHash !== null
                 && !plugin.pendingNoteModifies.has(file.path)
                 && !plugin.syncState.conflictedPaths.has(file.path)) continue;
 
@@ -1169,9 +1253,21 @@ export const handleSync = async function (plugin: FastSync, isLoadLastTime: bool
               const noteLimit = (plugin.settings.noteSyncLimit ?? 20) * 1024 * 1024;
               if (file.stat.size > noteLimit) continue;
 
-              const cachedNoteHash = plugin.fileHashManager.getValidHash(file.path, file.stat.mtime, file.stat.size);
+              const cachedNoteHash = plugin.fileHashManager.getValidHash(file.path, file.stat.mtime, file.stat.size, file.stat.ctime);
+              if (shouldSkipUnchangedLocalEntry(
+                metadataReconciliation,
+                dirtyKeys,
+                "note",
+                file.path,
+                cachedNoteHash,
+                baseHash,
+                plugin.pendingNoteModifies.has(file.path) || plugin.syncState.conflictedPaths.has(file.path),
+              )) {
+                scanStats.cacheHits++;
+                continue;
+              }
               if (cachedNoteHash !== null) {
-                const baseHash = plugin.fileHashManager.getPathHash(file.path);
+                scanStats.cacheHits++;
                 notes.push({
                   path: file.path,
                   pathHash: hashContent(file.path),
@@ -1184,6 +1280,8 @@ export const handleSync = async function (plugin: FastSync, isLoadLastTime: bool
               } else {
                 if (hashComputeCount >= MAX_HASH_PER_CYCLE) continue;
                 hashComputeCount++;
+                scanStats.metadataChanged++;
+                scanStats.hashComputed++;
                 const notePath = file.path, noteMtime = file.stat.mtime, noteCtime = file.stat.ctime, noteSize = file.stat.size;
                 await scheduleHashTask(async () => {
                   try {
@@ -1191,7 +1289,12 @@ export const handleSync = async function (plugin: FastSync, isLoadLastTime: bool
                       hashContentAsync(await plugin.app.vault.read(file)),
                       new Promise<never>((_, reject) => window.setTimeout(() => reject(new Error(`Hash timeout`)), 15000))
                     ]);
-                    plugin.scannedNoteHashes.set(notePath, { hash: contentHash, mtime: noteMtime, size: noteSize });
+                    plugin.scannedNoteHashes.set(notePath, {
+                      hash: contentHash,
+                      mtime: noteMtime,
+                      size: noteSize,
+                      ctime: noteCtime,
+                    });
                     const baseHash = plugin.fileHashManager.getPathHash(notePath);
                     notes.push({
                       path: notePath,
@@ -1214,14 +1317,27 @@ export const handleSync = async function (plugin: FastSync, isLoadLastTime: bool
               const skipSync = plugin.settings.cloudPreviewEnabled && (!plugin.settings.cloudPreviewTypeRestricted || FileCloudPreview.isRestrictedType("." + file.extension));
               if (skipSync) continue;
 
-              if (isLoadLastTime
+              const baseHash = plugin.fileHashManager.getPathHash(file.path);
+              if (isLoadLastTime && !metadataReconciliation
                 && file.stat.mtime < Number(plugin.localStorageManager.getMetadata("lastFileSyncTime"))
-                && plugin.fileHashManager.getPathHash(file.path) !== null
+                && baseHash !== null
                 && !plugin.pendingUploadHashes.has(file.path)) continue;
 
-              const cachedFileHash = plugin.fileHashManager.getValidHash(file.path, file.stat.mtime, file.stat.size);
+              const cachedFileHash = plugin.fileHashManager.getValidHash(file.path, file.stat.mtime, file.stat.size, file.stat.ctime);
+              if (shouldSkipUnchangedLocalEntry(
+                metadataReconciliation,
+                dirtyKeys,
+                "file",
+                file.path,
+                cachedFileHash,
+                baseHash,
+                plugin.pendingUploadHashes.has(file.path),
+              )) {
+                scanStats.cacheHits++;
+                continue;
+              }
               if (cachedFileHash !== null) {
-                const baseHash = plugin.fileHashManager.getPathHash(file.path);
+                scanStats.cacheHits++;
                 files.push({
                   path: file.path,
                   pathHash: hashContent(file.path),
@@ -1234,6 +1350,8 @@ export const handleSync = async function (plugin: FastSync, isLoadLastTime: bool
               } else {
                 if (hashComputeCount >= MAX_HASH_PER_CYCLE) continue;
                 hashComputeCount++;
+                scanStats.metadataChanged++;
+                scanStats.hashComputed++;
                 const attPath = file.path, attMtime = file.stat.mtime, attCtime = file.stat.ctime, attSize = file.stat.size;
                 await scheduleHashTask(async () => {
                   try {
@@ -1241,7 +1359,12 @@ export const handleSync = async function (plugin: FastSync, isLoadLastTime: bool
                       hashFileAsync(plugin.app, attPath),
                       new Promise<never>((_, reject) => window.setTimeout(() => reject(new Error(`Hash timeout`)), 15000))
                     ]);
-                    plugin.scannedFileHashes.set(attPath, { hash: contentHash, mtime: attMtime, size: attSize });
+                    plugin.scannedFileHashes.set(attPath, {
+                      hash: contentHash,
+                      mtime: attMtime,
+                      size: attSize,
+                      ctime: attCtime,
+                    });
                     const baseHash = plugin.fileHashManager.getPathHash(attPath);
                     files.push({
                       path: attPath,
@@ -1346,13 +1469,14 @@ export const handleSync = async function (plugin: FastSync, isLoadLastTime: bool
       ? await configAllPaths(configDirs, plugin)
       : [];
     if (fastIncremental && shouldSyncConfigs) {
-      const processed = await scanIncrementalConfigEntries(plugin, incrementalEntries, scanBuckets);
+      const processed = await scanIncrementalConfigEntries(plugin, incrementalEntries, scanBuckets, scanStats);
       plugin.incrementalScanManager?.markProcessed(processed);
       dump(`[IncrementalScan] config paths=${incrementalEntries.filter((entry) => entry.kind === "config").length}, configs=${configs.length}`);
     }
 
     let configCount = 0;
     const totalConfigs = configPaths.length;
+    scanStats.enumeratedEntries += totalConfigs;
     // 获取已处理的基础文件数，用于连续进度条
     const baseProcessedCount = plugin.settings.syncEnabled && !fastIncremental ? scannedVaultEntryCount : 0;
     const overallTotal = baseProcessedCount + totalConfigs;
@@ -1360,6 +1484,8 @@ export const handleSync = async function (plugin: FastSync, isLoadLastTime: bool
     for (const path of configPaths) {
       if (++configCount % 20 === 0) { // 已将 50 优化为 20
         await sleep(0);
+        commitScannedHashes(plugin.scannedConfigHashes, (entries) => plugin.configHashManager.bulkSetFromScanned(entries));
+        plugin.configHashManager.flush();
         if (isPluginUnloading) {
           plugin.incrementalScanManager?.abortSync();
           plugin.syncState.clearScannedHashCaches();
@@ -1396,10 +1522,6 @@ export const handleSync = async function (plugin: FastSync, isLoadLastTime: bool
           dump(`Skip scanning large config file (${describeBinarySyncLimit(plugin)} limit): ${path}`, stat.size);
           continue;
         }
-        if (isLoadLastTime
-          && stat.mtime < Number(plugin.localStorageManager.getMetadata("lastConfigSyncTime"))
-          && !plugin.pendingConfigModifies.has(path)) continue;
-
         // 处理大配置文件时更新消息
         if (stat.size > 2 * 1024 * 1024) {
           SyncLogManager.getInstance().addOrUpdateLog({
@@ -1411,18 +1533,36 @@ export const handleSync = async function (plugin: FastSync, isLoadLastTime: bool
         }
 
         // 尝试从缓存获取有效的哈希 (Try to get valid hash from cache)
-        let contentHash = plugin.configHashManager.getValidHash(path, stat.mtime, stat.size);
+        let contentHash = plugin.configHashManager.getValidHash(path, stat.mtime, stat.size, stat.ctime);
+        const configDirty = dirtyKeys.has(incrementalEntryKey("config", path)) || plugin.pendingConfigModifies.has(path);
+        const lastConfigSyncTime = Number(plugin.localStorageManager.getMetadata("lastConfigSyncTime"));
+        if (metadataReconciliation
+          && !configDirty
+          && lastConfigSyncTime > 0
+          && contentHash !== null
+          && stat.mtime <= lastConfigSyncTime) {
+          scanStats.cacheHits++;
+          continue;
+        }
         if (contentHash === null) {
+          scanStats.metadataChanged++;
+          scanStats.hashComputed++;
           try {
             contentHash = await hashFileAsync(plugin.app, path);
             // 暂存哈希，待同步结束时统一存入 (Temporarily store hash, commit on sync end)
-            plugin.scannedConfigHashes.set(path, { hash: contentHash, mtime: stat.mtime, size: stat.size });
+            plugin.scannedConfigHashes.set(path, {
+              hash: contentHash,
+              mtime: stat.mtime,
+              size: stat.size,
+              ctime: stat.ctime,
+            });
             // 注意：hashFileAsync 内部已经带了 [Calc] 类型的 dump
           } catch (e) {
             console.warn(`[FastNoteSync] 哈希配置失败，跳过: ${path}`, e);
             continue;
           }
         } else {
+          scanStats.cacheHits++;
           dump(`[HashConfig] [Cache] path=${path} size=${formatFileSize(stat.size)} hash=${contentHash}`)
         }
 
@@ -1513,13 +1653,25 @@ export const handleSync = async function (plugin: FastSync, isLoadLastTime: bool
 
     // --- 结束哈希扫描日志 ---
     if (plugin.settings.syncEnabled || plugin.settings.configSyncEnabled) {
+      const buildStats = plugin.fileHashManager.getBuildStats();
+      const telemetry = {
+        syncMode: scanMode,
+        enumeratedEntries: scanStats.enumeratedEntries,
+        metadataChanged: scanStats.metadataChanged,
+        hashComputed: scanStats.hashComputed,
+        cacheHits: scanStats.cacheHits,
+        dirtyJournalEntries: scanStats.dirtyJournalEntries,
+        pendingJournalEntries: plugin.incrementalScanManager?.getPendingCount() ?? 0,
+        baselineGeneration: buildStats.generation,
+      };
+      dump(`[SyncTelemetry] ${JSON.stringify(telemetry)}`);
       SyncLogManager.getInstance().addOrUpdateLog({
         id: hashingLogId,
         type: 'info',
         action: `VaultScanning_${plugin.currentSyncType}`,
         status: 'success',
         progress: 100,
-        message: `✅ ${plugin.currentSyncType === 'full' ? '全量' : '增量'}扫描完成 | 笔记: ${notes.length} | 附件: ${files.length} | 配置: ${configs.length} | 文件夹: ${folders.length}`
+        message: `✅ syncMode=${scanMode} | ${JSON.stringify(telemetry)} | 笔记: ${notes.length} | 附件: ${files.length} | 配置: ${configs.length} | 文件夹: ${folders.length}`
       });
     }
 

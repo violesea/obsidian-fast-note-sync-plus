@@ -3,12 +3,14 @@ import { LocalStateFileMirror, dump } from "../utils/helpers";
 
 export type DirtyKind = "note" | "file" | "folder" | "config";
 export type DirtyOperation = "modify" | "delete";
+export type DirtyAckResult = "acked" | "stale" | "untracked";
 
 export interface DirtyEntry {
   kind: DirtyKind;
   operation: DirtyOperation;
   path: string;
   version: number;
+  sentVersion?: number;
 }
 
 export interface DirtySnapshot {
@@ -35,6 +37,8 @@ interface PersistedState {
   schema: 1;
   nextVersion: number;
   completedInitialSync: boolean;
+  localBaselineReady: boolean;
+  serverBaselineReady: boolean;
   needsFullReconcile: boolean;
   entries: Record<string, DirtyEntry>;
 }
@@ -43,6 +47,8 @@ const EMPTY_STATE = (): PersistedState => ({
   schema: 1,
   nextVersion: 1,
   completedInitialSync: false,
+  localBaselineReady: false,
+  serverBaselineReady: false,
   needsFullReconcile: false,
   entries: {},
 });
@@ -101,7 +107,7 @@ export class IncrementalScanManager {
 
   canUseIncrementalSync(localStorageInitialSync: unknown): boolean {
     if (!this.initialized || this.state.needsFullReconcile) return false;
-    if (this.state.completedInitialSync) return true;
+    if (this.state.localBaselineReady && this.state.serverBaselineReady) return true;
     // A state-less installation of the fork must perform one calibration scan.
     // The official plugin's isInitSync flag proves that it completed a sync at
     // some point, but it cannot prove that offline edits were observed because
@@ -110,23 +116,56 @@ export class IncrementalScanManager {
     return false;
   }
 
+  /**
+   * A local hash/metadata index is enough to avoid recomputing content hashes,
+   * but it is not enough to skip the first server reconciliation. This state is
+   * intentionally separate from completedInitialSync.
+   */
+  canUseMetadataReconciliation(): boolean {
+    return this.initialized
+      && !this.state.needsFullReconcile
+      && this.state.localBaselineReady
+      && !this.state.serverBaselineReady;
+  }
+
+  markLocalBaselineReady(): void {
+    if (this.state.localBaselineReady) return;
+    this.state.localBaselineReady = true;
+    this.save();
+  }
+
+  invalidateLocalBaseline(): void {
+    this.state.localBaselineReady = false;
+    this.state.serverBaselineReady = false;
+    this.state.completedInitialSync = false;
+    this.save();
+  }
+
+  getPendingCount(): number {
+    return Object.keys(this.state.entries).length;
+  }
+
   markInitialSyncComplete(): void {
     this.state.completedInitialSync = true;
+    this.state.localBaselineReady = true;
+    this.state.serverBaselineReady = true;
     this.state.needsFullReconcile = false;
     this.save();
   }
 
   requestFullReconcile(): void {
     this.state.needsFullReconcile = true;
+    this.state.serverBaselineReady = false;
+    this.state.completedInitialSync = false;
     this.save();
   }
 
-  markModified(kind: DirtyKind, path: string): void {
-    this.upsert(kind, "modify", path);
+  markModified(kind: DirtyKind, path: string): number {
+    return this.upsert(kind, "modify", path);
   }
 
-  markDeleted(kind: DirtyKind, path: string): void {
-    this.upsert(kind, "delete", path);
+  markDeleted(kind: DirtyKind, path: string): number {
+    return this.upsert(kind, "delete", path);
   }
 
   markRenamed(kind: DirtyKind, oldPath: string, newPath: string): void {
@@ -134,7 +173,42 @@ export class IncrementalScanManager {
     this.markModified(kind, newPath);
   }
 
+  /** Mark the exact current journal version as sent on the wire. */
+  markSent(kind: DirtyKind, path: string): number | null {
+    const normalizedPath = path.replace(/\\/g, "/");
+    const entry = this.state.entries[this.key(kind, normalizedPath)];
+    if (!entry) return null;
+    entry.sentVersion = entry.version;
+    this.save();
+    return entry.version;
+  }
+
+  /**
+   * Remove a journal entry only when an ACK can be associated with the version
+   * that was sent. A newer local event intentionally survives an old ACK.
+   */
+  acknowledge(kind: DirtyKind, path: string, sentVersion?: number): DirtyAckResult {
+    const normalizedPath = path.replace(/\\/g, "/");
+    const key = this.key(kind, normalizedPath);
+    const entry = this.state.entries[key];
+    if (!entry) return "untracked";
+    const expectedVersion = sentVersion ?? entry.sentVersion;
+    if (expectedVersion === undefined || entry.version > expectedVersion) return "stale";
+    delete this.state.entries[key];
+    this.save();
+    return "acked";
+  }
+
   beginSync(fullReconcile = false): DirtySnapshot {
+    if (fullReconcile) {
+      // A process can disappear after the scan starts but before the server
+      // sends every SyncEnd. Do not let the previous successful server
+      // baseline survive that interruption and incorrectly authorize an
+      // event-only sync on the next launch.
+      this.state.serverBaselineReady = false;
+      this.state.completedInitialSync = false;
+      this.save();
+    }
     const entries = Object.values(this.state.entries).map((entry) => ({ ...entry }));
     this.activeSnapshot = { entries };
     this.activeProcessedKeys.clear();
@@ -158,6 +232,8 @@ export class IncrementalScanManager {
       );
       this.state.needsFullReconcile = false;
       this.state.completedInitialSync = true;
+      this.state.localBaselineReady = true;
+      this.state.serverBaselineReady = true;
     } else if (this.activeSnapshot) {
       const processed = new Set(processedKeys);
       for (const entry of this.activeSnapshot.entries) {
@@ -184,8 +260,12 @@ export class IncrementalScanManager {
     this.mirror.flush();
   }
 
-  private upsert(kind: DirtyKind, operation: DirtyOperation, path: string): void {
-    if (!path) return;
+  async flushAsync(): Promise<void> {
+    await this.mirror.flushAsync();
+  }
+
+  private upsert(kind: DirtyKind, operation: DirtyOperation, path: string): number {
+    if (!path) return 0;
     const normalizedPath = path.replace(/\\/g, "/");
     const version = this.state.nextVersion++;
     this.state.entries[this.key(kind, normalizedPath)] = {
@@ -195,6 +275,7 @@ export class IncrementalScanManager {
       version,
     };
     this.save();
+    return version;
   }
 
   private key(kind: DirtyKind, path: string): string {
@@ -221,6 +302,9 @@ export class IncrementalScanManager {
           operation: entry.operation,
           path: normalizedPath,
           version: entry.version,
+          ...(typeof entry.sentVersion === "number" && Number.isSafeInteger(entry.sentVersion) && entry.sentVersion >= 1
+            ? { sentVersion: entry.sentVersion }
+            : {}),
         };
       }
 
@@ -228,6 +312,8 @@ export class IncrementalScanManager {
         schema: 1,
         nextVersion: parsed.nextVersion as number,
         completedInitialSync: parsed.completedInitialSync === true,
+        localBaselineReady: parsed.localBaselineReady === true || parsed.completedInitialSync === true,
+        serverBaselineReady: parsed.serverBaselineReady === true || parsed.completedInitialSync === true,
         needsFullReconcile: parsed.needsFullReconcile === true,
         entries,
       };

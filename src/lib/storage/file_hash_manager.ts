@@ -9,7 +9,39 @@ interface HashCache {
   hash: string;
   mtime: number;
   size: number;
+  /** Optional for backward compatibility with pre-2.4.6 cache entries. */
+  ctime?: number;
 }
+
+interface HashBuildState {
+  schema: 1;
+  phase: "building" | "ready";
+  generation: number;
+  processedCount: number;
+  totalFiles: number;
+  hashComputed: number;
+  cacheHits: number;
+  updatedAt: number;
+}
+
+const EMPTY_BUILD_STATE = (): HashBuildState => ({
+  schema: 1,
+  phase: "building",
+  generation: 0,
+  processedCount: 0,
+  totalFiles: 0,
+  hashComputed: 0,
+  cacheHits: 0,
+  updatedAt: 0,
+});
+
+const matchesFingerprint = (cache: HashCache, mtime: number, size: number, ctime?: number): boolean => {
+  return cache.mtime === mtime
+    && cache.size === size
+    // Old/server-confirmed entries may not have ctime. Treat that field as
+    // unknown instead of forcing the same file to be rehashed on every event.
+    && (ctime === undefined || cache.ctime === undefined || cache.ctime === ctime);
+};
 
 /**
  * 文件哈希管理器
@@ -21,7 +53,9 @@ export class FileHashManager {
   private syncHashMap: Map<string, string> = new Map(); // path -> baseHash
   private storageKey: string;
   private syncStorageKey: string;
+  private buildStorageKey: string;
   private isInitialized: boolean = false;
+  private buildState: HashBuildState = EMPTY_BUILD_STATE();
   // 脏标记 + 防抖落盘：高频单条写入（下载/Ack 路径）不再逐条同步整表 JSON.stringify，
   // 避免高频写 localStorage 阻塞主线程导致界面白屏
   private isDirty: boolean = false;
@@ -29,6 +63,7 @@ export class FileHashManager {
   // 文件镜像：localStorage 被移动端系统清除后的兜底恢复
   private mirror: LocalStateFileMirror;
   private syncMirror: LocalStateFileMirror;
+  private buildMirror: LocalStateFileMirror;
 
   constructor(plugin: FastSync) {
     this.plugin = plugin;
@@ -36,9 +71,11 @@ export class FileHashManager {
     // (与 local_storage_manager.ts getInternalKey 的修复同理)，历史键迁移见 loadFromStorage
     this.storageKey = `fns-fileHashMap`;
     this.syncStorageKey = `fns-syncHashMap`;
+    this.buildStorageKey = `fns-fileHashBuildState`;
     this.debouncedFlush = debounce(() => this.flush(), 500);
     this.mirror = new LocalStateFileMirror(plugin, "fileHashMap.json");
     this.syncMirror = new LocalStateFileMirror(plugin, "syncHashMap.json");
+    this.buildMirror = new LocalStateFileMirror(plugin, "fileHashBuildState.json");
   }
 
   /**
@@ -60,6 +97,19 @@ export class FileHashManager {
     // 最后冲镜像：既包含 saveToStorage 刚安排的一份，也包含与 isDirty 无关的防抖中镜像写
     this.mirror.flush();
     this.syncMirror.flush();
+    this.buildMirror.flush();
+  }
+
+  async flushAsync(): Promise<void> {
+    if (this.isDirty) {
+      this.isDirty = false;
+      this.saveToStorage();
+    }
+    await Promise.all([
+      this.mirror.flushAsync(),
+      this.syncMirror.flushAsync(),
+      this.buildMirror.flushAsync(),
+    ]);
   }
 
   /**
@@ -69,6 +119,8 @@ export class FileHashManager {
    */
   async initialize(): Promise<void> {
     dump("FileHashManager: 开始初始化");
+
+    const hasBuildState = await this.loadBuildState();
 
     // 1. 尝试加载本地最新计算哈希缓存表 (hashMap)
     const loaded = this.loadFromStorage();
@@ -92,6 +144,24 @@ export class FileHashManager {
     if (!hasRestoredMap) {
       dump("FileHashManager: localStorage 与文件镜像均无本地缓存,开始构建哈希映射");
       await this.buildFileHashMap();
+    } else if (hasBuildState && this.buildState.phase === "building") {
+      // A process can disappear after a checkpoint but before the cold build
+      // reaches its ready marker. Re-enumerate metadata and reuse every valid
+      // cache entry instead of hashing the whole vault again.
+      dump(`FileHashManager: 恢复未完成的哈希构建 generation=${this.buildState.generation}`);
+      await this.buildFileHashMap();
+    } else if (!hasBuildState) {
+      // Older versions persisted only the map. Treat a successfully restored
+      // map as ready and create the new checkpoint metadata lazily.
+      this.buildState = {
+        ...this.buildState,
+        phase: "ready",
+        generation: 0,
+        processedCount: this.hashMap.size,
+        totalFiles: this.hashMap.size,
+        updatedAt: Date.now(),
+      };
+      this.saveBuildState();
     }
 
     // 2. 尝试加载云端确认同步基准表 (syncHashMap)
@@ -133,6 +203,53 @@ export class FileHashManager {
     }
   }
 
+  private async loadBuildState(): Promise<boolean> {
+    try {
+      const local = this.plugin.app.loadLocalStorage(this.buildStorageKey) as string | null;
+      if (local && this.parseBuildState(local)) return true;
+      const mirrored = await this.buildMirror.read();
+      if (mirrored && this.parseBuildState(mirrored)) {
+        this.saveBuildState();
+        return true;
+      }
+    } catch (error) {
+      dump("FileHashManager: 加载哈希构建状态失败", error);
+    }
+    return false;
+  }
+
+  private parseBuildState(raw: string): boolean {
+    try {
+      const parsed = JSON.parse(raw) as Partial<HashBuildState>;
+      if (parsed.schema !== 1 || (parsed.phase !== "building" && parsed.phase !== "ready")) return false;
+      if (!Number.isSafeInteger(parsed.generation) || (parsed.generation as number) < 0) return false;
+      this.buildState = {
+        schema: 1,
+        phase: parsed.phase,
+        generation: parsed.generation as number,
+        processedCount: Number.isSafeInteger(parsed.processedCount) ? parsed.processedCount as number : 0,
+        totalFiles: Number.isSafeInteger(parsed.totalFiles) ? parsed.totalFiles as number : 0,
+        hashComputed: Number.isSafeInteger(parsed.hashComputed) ? parsed.hashComputed as number : 0,
+        cacheHits: Number.isSafeInteger(parsed.cacheHits) ? parsed.cacheHits as number : 0,
+        updatedAt: typeof parsed.updatedAt === "number" ? parsed.updatedAt : 0,
+      };
+      return true;
+    } catch (error) {
+      dump("FileHashManager: 解析哈希构建状态失败", error);
+      return false;
+    }
+  }
+
+  private saveBuildState(): void {
+    const raw = JSON.stringify(this.buildState);
+    try {
+      this.plugin.app.saveLocalStorage(this.buildStorageKey, raw);
+    } catch (error) {
+      dump("FileHashManager: 保存哈希构建状态失败", error);
+    }
+    this.buildMirror.scheduleWrite(raw);
+  }
+
   private parseAndLoadSync(data: string): boolean {
     try {
       const parsed = JSON.parse(data) as Record<string, string>;
@@ -151,6 +268,17 @@ export class FileHashManager {
     return this.isInitialized;
   }
 
+  getBuildStats(): { phase: "building" | "ready"; generation: number; processedCount: number; totalFiles: number; hashComputed: number; cacheHits: number } {
+    return {
+      phase: this.buildState.phase,
+      generation: this.buildState.generation,
+      processedCount: this.buildState.processedCount,
+      totalFiles: this.buildState.totalFiles,
+      hashComputed: this.buildState.hashComputed,
+      cacheHits: this.buildState.cacheHits,
+    };
+  }
+
   private async buildFileHashMap(): Promise<void> {
     const notice = showSyncNotice("正在初始化文件哈希映射...", 0);
 
@@ -159,6 +287,24 @@ export class FileHashManager {
 
       const totalFiles = files.length;
       let processedFiles = 0;
+      let hashComputed = 0;
+      let cacheHits = 0;
+      const seenPaths = new Set<string>();
+      const generation = this.buildState.phase === "building"
+        ? this.buildState.generation
+        : this.buildState.generation + 1;
+
+      this.buildState = {
+        schema: 1,
+        phase: "building",
+        generation,
+        processedCount: 0,
+        totalFiles,
+        hashComputed: 0,
+        cacheHits: 0,
+        updatedAt: Date.now(),
+      };
+      this.saveBuildState();
 
       dump(`FileHashManager: 开始遍历 ${totalFiles} 个文件`);
 
@@ -175,21 +321,59 @@ export class FileHashManager {
         }
       };
 
+      let hashMapChangedSinceCheckpoint = false;
+      const saveCheckpoint = async (): Promise<void> => {
+        if (hashInFlight.size > 0) {
+          await Promise.all(Array.from(hashInFlight));
+        }
+        // The local hash cache is safe to checkpoint. The server baseline is
+        // deliberately not touched until an actual sync/ACK completes.
+        if (hashMapChangedSinceCheckpoint) {
+          this.saveHashMapToStorage();
+          hashMapChangedSinceCheckpoint = false;
+        }
+        this.buildState = {
+          ...this.buildState,
+          phase: "building",
+          processedCount: processedFiles,
+          totalFiles,
+          hashComputed,
+          cacheHits,
+          updatedAt: Date.now(),
+        };
+        this.saveBuildState();
+        // Do not leave the recovery point behind the normal mirror debounce:
+        // iOS may terminate the WebView immediately after yielding to the UI.
+        await Promise.all([this.mirror.flushAsync(), this.buildMirror.flushAsync()]);
+      };
+
       for (const file of files) {
         // 跳过已排除的文件
         if (isPathExcluded(file.path, this.plugin)) {
           processedFiles++;
+          if (processedFiles % 50 === 0) await saveCheckpoint();
           continue;
         }
 
         if (file.extension !== "md" && isLargeBinarySyncRisk(file.stat.size, this.plugin)) {
           dump(`FileHashManager: skip large binary hash (${describeBinarySyncLimit(this.plugin)} limit): ${file.path}`, file.stat.size);
           processedFiles++;
+          if (processedFiles % 50 === 0) await saveCheckpoint();
+          continue;
+        }
+
+        seenPaths.add(file.path);
+        const cached = this.hashMap.get(file.path);
+        if (cached && matchesFingerprint(cached, file.stat.mtime, file.stat.size, file.stat.ctime)) {
+          cacheHits++;
+          processedFiles++;
+          if (processedFiles % 50 === 0) await saveCheckpoint();
           continue;
         }
 
         await scheduleHashTask(async () => {
           try {
+            hashComputed++;
             let contentHash: string;
 
             // 根据文件类型选择不同的哈希计算方式
@@ -206,8 +390,10 @@ export class FileHashManager {
             this.hashMap.set(file.path, {
               hash: contentHash,
               mtime: file.stat.mtime,
-              size: file.stat.size
+              size: file.stat.size,
+              ...(typeof file.stat.ctime === "number" ? { ctime: file.stat.ctime } : {}),
             });
+            hashMapChangedSinceCheckpoint = true;
           } catch (error) {
             // 单个文件哈希计算失败不应中断整个构建过程
             const msg = error instanceof Error ? error.message : String(error);
@@ -220,6 +406,7 @@ export class FileHashManager {
 
         // 每处理 50 个文件更新一次进度 (Update progress every 50 files)
         if (processedFiles % 50 === 0) {
+          await saveCheckpoint();
           notice.setMessage(`正在初始化文件哈希映射... (${processedFiles}/${totalFiles})`);
           // 让出主线程,避免阻塞 UI
           await new Promise(resolve => window.setTimeout(resolve, 0));
@@ -231,14 +418,36 @@ export class FileHashManager {
         await Promise.all(Array.from(hashInFlight));
       }
 
-      // 保存到 localStorage
-      this.saveToStorage();
+      // Remove entries that disappeared or became excluded while the
+      // resumable build was running. Keep syncHashMap untouched: a local scan
+      // is not evidence that the server accepted a change.
+      for (const path of this.hashMap.keys()) {
+        if (!seenPaths.has(path)) this.hashMap.delete(path);
+      }
+      this.saveHashMapToStorage();
+      this.buildState = {
+        ...this.buildState,
+        phase: "ready",
+        processedCount: processedFiles,
+        totalFiles,
+        hashComputed,
+        cacheHits,
+        updatedAt: Date.now(),
+      };
+      this.saveBuildState();
+      await Promise.all([this.mirror.flushAsync(), this.buildMirror.flushAsync()]);
 
       notice.setMessage(`文件哈希映射初始化完成! 共处理 ${totalFiles} 个文件`);
       window.setTimeout(() => notice.hide(), 3000);
 
-      dump(`FileHashManager: 构建完成,共 ${totalFiles} 个文件`);
+      dump(`[HashBuild] phase=ready generation=${this.buildState.generation} enumeratedEntries=${totalFiles} hashComputed=${hashComputed} cacheHits=${cacheHits}`);
     } catch (error) {
+      this.buildState = {
+        ...this.buildState,
+        phase: "building",
+        updatedAt: Date.now(),
+      };
+      this.saveBuildState();
       notice.hide();
       const msg = error instanceof Error ? error.message : String(error);
       showSyncNotice(`文件哈希映射初始化失败: ${msg}`);
@@ -251,9 +460,9 @@ export class FileHashManager {
    * 获取有效的哈希值
    * 如果缓存存在且 mtime/size 匹配，则返回缓存的哈希，否则返回 null
    */
-  getValidHash(path: string, mtime: number, size: number): string | null {
+  getValidHash(path: string, mtime: number, size: number, ctime?: number): string | null {
     const cache = this.hashMap.get(path);
-    if (cache && cache.mtime === mtime && cache.size === size) {
+    if (cache && matchesFingerprint(cache, mtime, size, ctime)) {
       return cache.hash;
     }
     return null;
@@ -276,8 +485,16 @@ export class FileHashManager {
   /**
    * 添加或更新单个文件的对齐基准哈希值 (在 Ack 确认或收到推送时调用)
    */
-  setFileHash(path: string, hash: string, mtime: number = 0, size: number = 0): void {
-    this.hashMap.set(path, { hash, mtime, size });
+  setFileHash(path: string, hash: string, mtime: number = 0, size: number = 0, ctime?: number): void {
+    if (ctime === undefined) {
+      ctime = this.plugin.app.vault.getFileByPath?.(path)?.stat.ctime;
+    }
+    this.hashMap.set(path, {
+      hash,
+      mtime,
+      size,
+      ...(typeof ctime === "number" && ctime > 0 ? { ctime } : {}),
+    });
     this.syncHashMap.set(path, hash);
     this.scheduleSave();
   }
@@ -286,11 +503,16 @@ export class FileHashManager {
    * SyncEnd 兜底补偿写入 (仅更新本地缓存, 绝不更新同步基准表)
    * SyncEnd fallback cannot prove server confirmed the write; only Ack path may update syncHashMap
    */
-  setFileHashes(entries: Iterable<[string, string]>, getStat?: (path: string) => { mtime?: number; size?: number } | null | undefined): void {
+  setFileHashes(entries: Iterable<[string, string]>, getStat?: (path: string) => { mtime?: number; size?: number; ctime?: number } | null | undefined): void {
     let changed = false;
     for (const [path, hash] of entries) {
       const stat = getStat?.(path);
-      this.hashMap.set(path, { hash, mtime: stat?.mtime || 0, size: stat?.size || 0 });
+      this.hashMap.set(path, {
+        hash,
+        mtime: stat?.mtime || 0,
+        size: stat?.size || 0,
+        ...(typeof stat?.ctime === "number" && stat.ctime > 0 ? { ctime: stat.ctime } : {}),
+      });
       changed = true;
     }
     if (changed) this.saveToStorage();
@@ -473,13 +695,27 @@ export class FileHashManager {
   /**
    * 批量更新扫描得出的哈希值 (仅写入本地缓存以优化性能，绝不更新同步基准表)
    */
-  bulkSetFromScanned(scanned: Map<string, { hash: string; mtime: number; size: number }>): void {
+  bulkSetFromScanned(scanned: Map<string, { hash: string; mtime: number; size: number; ctime?: number }>): void {
     if (scanned.size === 0) return;
     let changed = false;
     for (const [path, cache] of scanned) {
       const existing = this.hashMap.get(path);
-      if (!existing || existing.mtime <= cache.mtime) {
-        this.hashMap.set(path, { hash: cache.hash, mtime: cache.mtime, size: cache.size });
+      // A same-mtime rewrite is still a real change when size or content hash
+      // differs. Only reject an older scan result; never let timestamp equality
+      // discard a freshly computed hash.
+      if (!existing
+        || cache.mtime > existing.mtime
+        || (cache.mtime === existing.mtime && (
+          cache.size !== existing.size
+          || cache.hash !== existing.hash
+          || (cache.ctime !== undefined && existing.ctime !== cache.ctime)
+        ))) {
+        this.hashMap.set(path, {
+          hash: cache.hash,
+          mtime: cache.mtime,
+          size: cache.size,
+          ...(typeof cache.ctime === "number" ? { ctime: cache.ctime } : {}),
+        });
         changed = true;
       }
     }

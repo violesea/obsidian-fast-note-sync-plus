@@ -24,13 +24,15 @@ export const noteModify = async function (file: TAbstractFile, plugin: FastSync,
       const lastSyncMtime = plugin.lastSyncMtime.get(file.path)
 
       // --- 优化：先尝试从缓存获取有效哈希 ---
-      let contentHash = plugin.fileHashManager.getValidHash(file.path, file.stat.mtime, file.stat.size);
+      let contentHash = plugin.fileHashManager.getValidHash(file.path, file.stat.mtime, file.stat.size, file.stat.ctime);
       let content: string | null = null;
 
       if (contentHash !== null) {
         // 如果哈希有效，且与 baseHash 和最后同步时间一致，则拦截
         if (contentHash === baseHash && (lastSyncMtime !== undefined && lastSyncMtime === file.stat.mtime)) {
           dump(`Note modify intercepted (cache match): ${file.path}`)
+          plugin.incrementalScanManager?.markSent("note", file.path)
+          plugin.incrementalScanManager?.acknowledge("note", file.path)
           return
         }
       } else {
@@ -62,6 +64,7 @@ export const noteModify = async function (file: TAbstractFile, plugin: FastSync,
         plugin.localStorageManager.savePending('pendingNoteModifies', plugin.pendingNoteModifies)
       }
       await plugin.concurrencyLimiter.waitForSlot(file.path)
+      plugin.incrementalScanManager?.markSent("note", file.path)
       void plugin.websocket.SendMessage("NoteModify", data)
       dump(`Note modify send`, data.path, data.contentHash, data.mtime, data.pathHash)
     } finally {
@@ -102,6 +105,7 @@ export const noteDelete = async function (file: TAbstractFile, plugin: FastSync,
       void plugin.websocket.SendMessage("NoteDelete", data, undefined, () => {
         // 消息真正写入 TCP 缓冲区后加入 pending set，等待 NoteDeleteAck 再删 hash
         // Add to pending set only after message is actually buffered; remove hash only on NoteDeleteAck
+        plugin.incrementalScanManager?.markSent("note", file.path)
         plugin.pendingNoteDeleteAcks.add(file.path)
       })
 
@@ -137,6 +141,7 @@ export const noteDeleteByPath = async function (filePath: string, plugin: FastSy
       }, undefined, () => {
         // 消息真正写入 TCP 缓冲区后加入 pending set，等待 NoteDeleteAck 再删 hash
         // Add to pending set only after message is actually buffered; remove hash only on NoteDeleteAck
+        plugin.incrementalScanManager?.markSent("note", filePath)
         plugin.pendingNoteDeleteAcks.add(filePath)
       })
       dump(`Note delete by path send`, filePath)
@@ -205,6 +210,8 @@ export const noteRename = async function (file: TAbstractFile, oldfile: string, 
       // Store rename info in Map (keyed by newPath), update hashManager only after server NoteRenameAck matches by path
       plugin.pendingNoteRenames.set(file.path, { oldPath: oldfile, newPath: file.path, contentHash })
       await plugin.concurrencyLimiter.waitForSlot(file.path, true)
+      plugin.incrementalScanManager?.markSent("note", oldfile)
+      plugin.incrementalScanManager?.markSent("note", file.path)
       void plugin.websocket.SendMessage("NoteRename", data)
       dump(`Note rename send`, data.path, data.pathHash)
     } finally {
@@ -245,7 +252,7 @@ export const receiveNoteSyncModify = async function (data: ReceiveMessage, plugi
               // mtime is newer than what we last synced; confirm with content hash whether
               // local content actually diverged from the known baseline
               const knownBaseHash = plugin.fileHashManager.getPathHash(normalizedPath)
-              let localContentHash = plugin.fileHashManager.getValidHash(normalizedPath, file.stat.mtime, file.stat.size)
+              let localContentHash = plugin.fileHashManager.getValidHash(normalizedPath, file.stat.mtime, file.stat.size, file.stat.ctime)
               if (localContentHash === null) {
                 const localContent = await plugin.app.vault.read(file)
                 localContentHash = await hashContentAsync(localContent)
@@ -384,7 +391,7 @@ export const receiveNoteUpload = async function (data: ReceivePathMessage, plugi
 
   const baseHash = plugin.fileHashManager.getPathHash(file.path)
   // 尝试从缓存获取 (Try to get from cache)
-  let contentHash = plugin.fileHashManager.getValidHash(file.path, file.stat.mtime, file.stat.size);
+  let contentHash = plugin.fileHashManager.getValidHash(file.path, file.stat.mtime, file.stat.size, file.stat.ctime);
   const content = await plugin.app.vault.read(file);
   if (contentHash === null) contentHash = await hashContentAsync(content);
 
@@ -641,9 +648,17 @@ export const receiveNoteSyncRename = async function (data: { path: string, oldPa
 // 收到 NoteModifyAck，将 pending hash 转移到正式 hashManager 并更新 lastNoteSyncTime
 // Receive NoteModifyAck, move pending hash to formal hashManager and update lastNoteSyncTime
 export const receiveNoteModifyAck = function (data: { lastTime?: number; path?: string }, plugin: FastSync) {
+  const journalResult = data.path
+    ? plugin.incrementalScanManager?.acknowledge("note", data.path)
+    : "untracked"
+  // A stale ACK must not consume the pending hash belonging to a newer local
+  // edit. Keep the journal and pending map for the next retry in that case.
+  if (journalResult === "stale") {
+    dump(`NoteModifyAck ignored as stale for ${data.path}`)
+  }
   // 服务端确认笔记写入成功，将 pending hash 转移到正式 hashManager
   // Server confirmed note write success, move pending hash to formal hashManager
-  if (data.path) {
+  if (data.path && journalResult !== "stale") {
     const contentHash = plugin.pendingNoteModifies.get(data.path)
     if (contentHash !== undefined) {
       // 尝试获取本地文件信息以存入缓存
@@ -688,10 +703,16 @@ export const receiveNoteRenameAck = function (data: { lastTime?: number; path?: 
     }
   }
   if (pending) {
-    plugin.fileHashManager.removeFileHash(pending.oldPath)
-    // 重命名 Ack 时，内容哈希未变，尝试获取新路径的文件信息
-    const file = plugin.app.vault.getFileByPath(normalizePath(pending.newPath))
-    plugin.fileHashManager.setFileHash(pending.newPath, pending.contentHash, file?.stat.mtime || 0, file?.stat.size || 0)
+    const oldResult = plugin.incrementalScanManager?.acknowledge("note", pending.oldPath)
+    const newResult = plugin.incrementalScanManager?.acknowledge("note", pending.newPath)
+    if (oldResult === "stale" || newResult === "stale") {
+      dump(`NoteRenameAck ignored as stale for ${pending.newPath}`)
+    } else {
+      plugin.fileHashManager.removeFileHash(pending.oldPath)
+      // 重命名 Ack 时，内容哈希未变，尝试获取新路径的文件信息
+      const file = plugin.app.vault.getFileByPath(normalizePath(pending.newPath))
+      plugin.fileHashManager.setFileHash(pending.newPath, pending.contentHash, file?.stat.mtime || 0, file?.stat.size || 0, file?.stat.ctime)
+    }
   }
   if (data.lastTime && data.lastTime > Number(plugin.localStorageManager.getMetadata("lastNoteSyncTime"))) {
     plugin.localStorageManager.setMetadata("lastNoteSyncTime", data.lastTime)
@@ -703,7 +724,8 @@ export const receiveNoteRenameAck = function (data: { lastTime?: number; path?: 
 // Receive NoteDeleteAck; only remove from hashManager if path is still pending
 export const receiveNoteDeleteAck = function (data: { lastTime?: number; path?: string }, plugin: FastSync) {
   if (data.path && plugin.pendingNoteDeleteAcks.has(data.path)) {
-    plugin.fileHashManager.removeFileHash(data.path)
+    const journalResult = plugin.incrementalScanManager?.acknowledge("note", data.path)
+    if (journalResult !== "stale") plugin.fileHashManager.removeFileHash(data.path)
     plugin.pendingNoteDeleteAcks.delete(data.path)
   }
   // 释放并发槽位：与 FileDeleteAck/ConfigDeleteAck 保持一致，仅检查 data.path 是否存在

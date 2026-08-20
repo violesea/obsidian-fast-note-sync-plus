@@ -238,11 +238,13 @@ export const fileModify = async function (file: TAbstractFile, plugin: FastSync,
       const lastSyncMtime = plugin.lastSyncMtime.get(file.path)
 
       // --- 优化：先尝试从缓存获取有效哈希 ---
-      let contentHash = plugin.fileHashManager.getValidHash(file.path, file.stat.mtime, file.stat.size);
+      let contentHash = plugin.fileHashManager.getValidHash(file.path, file.stat.mtime, file.stat.size, file.stat.ctime);
 
       if (contentHash !== null) {
         if (contentHash === baseHash && (lastSyncMtime !== undefined && lastSyncMtime === file.stat.mtime)) {
           dump(`File modify intercepted (cache match): ${file.path}`)
+          plugin.incrementalScanManager?.markSent("file", file.path)
+          plugin.incrementalScanManager?.acknowledge("file", file.path)
           return
         }
       } else {
@@ -269,6 +271,7 @@ export const fileModify = async function (file: TAbstractFile, plugin: FastSync,
       plugin.pendingUploadHashes.set(file.path, contentHash)
       plugin.localStorageManager.savePending('pendingUploadHashes', plugin.pendingUploadHashes)
       await plugin.concurrencyLimiter.waitForSlot(file.path)
+      plugin.incrementalScanManager?.markSent("file", file.path)
       void plugin.websocket.SendMessage("FileUploadCheck", data)
       dump(`File modify check sent`, data.path, data.contentHash)
     } finally {
@@ -322,6 +325,7 @@ export const fileDelete = async function (file: TAbstractFile, plugin: FastSync,
       void plugin.websocket.SendMessage("FileDelete", data, undefined, () => {
         // 消息真正写入 TCP 缓冲区后加入 pending set，等待 FileDeleteAck 再删 hash
         // Add to pending set only after message is actually buffered; remove hash only on FileDeleteAck
+        plugin.incrementalScanManager?.markSent("file", file.path)
         plugin.pendingFileDeleteAcks.add(file.path)
       })
       dump(`File delete send`, file.path)
@@ -368,6 +372,7 @@ export const fileDeleteByPath = async function (filePath: string, plugin: FastSy
       }, undefined, () => {
         // 消息真正写入 TCP 缓冲区后加入 pending set，等待 FileDeleteAck 再删 hash
         // Add to pending set only after message is actually buffered; remove hash only on FileDeleteAck
+        plugin.incrementalScanManager?.markSent("file", filePath)
         plugin.pendingFileDeleteAcks.add(filePath)
       })
       dump(`File delete by path send`, filePath)
@@ -431,7 +436,7 @@ export const fileRename = async function (file: TAbstractFile, oldfile: string, 
         let contentHash = plugin.fileHashManager.getPathHash(oldfile)
         if (contentHash == null) {
           // 尝试新路径哈希缓存 (Try new path cache)
-          contentHash = plugin.fileHashManager.getValidHash(file.path, file.stat.mtime, file.stat.size);
+          contentHash = plugin.fileHashManager.getValidHash(file.path, file.stat.mtime, file.stat.size, file.stat.ctime);
           if (contentHash == null) {
             if (isLargeBinarySyncRisk(file.stat.size, plugin)) {
               dump(`Skip rename hash for large attachment (${describeBinarySyncLimit()} limit): ${file.path}`, file.stat.size)
@@ -452,6 +457,8 @@ export const fileRename = async function (file: TAbstractFile, oldfile: string, 
         // Push rename to pending queue; hashManager will be updated after server FileRenameAck
         plugin.pendingFileRenames.push({ oldPath: oldfile, newPath: file.path, contentHash })
         await plugin.concurrencyLimiter.waitForSlot(file.path, true)
+        plugin.incrementalScanManager?.markSent("file", oldfile)
+        plugin.incrementalScanManager?.markSent("file", file.path)
         void plugin.websocket.SendMessage("FileRename", data)
       }
     } finally {
@@ -1480,9 +1487,15 @@ export const receiveFileRenameAck = function (data: { lastTime?: number }, plugi
   // Server confirmed rename success, dequeue FIFO and update hashManager
   const pending = plugin.pendingFileRenames.shift()
   if (pending) {
-    const file = plugin.app.vault.getFileByPath(normalizePath(pending.newPath))
-    plugin.fileHashManager.setFileHash(pending.newPath, pending.contentHash, file?.stat.mtime || 0, file?.stat.size || 0)
-    plugin.fileHashManager.removeFileHash(pending.oldPath)
+    const oldResult = plugin.incrementalScanManager?.acknowledge("file", pending.oldPath)
+    const newResult = plugin.incrementalScanManager?.acknowledge("file", pending.newPath)
+    if (oldResult !== "stale" && newResult !== "stale") {
+      const file = plugin.app.vault.getFileByPath(normalizePath(pending.newPath))
+      plugin.fileHashManager.setFileHash(pending.newPath, pending.contentHash, file?.stat.mtime || 0, file?.stat.size || 0)
+      plugin.fileHashManager.removeFileHash(pending.oldPath)
+    } else {
+      dump(`FileRenameAck ignored as stale for ${pending.newPath}`)
+    }
   }
   if (data.lastTime && data.lastTime > Number(plugin.localStorageManager.getMetadata("lastFileSyncTime"))) {
     plugin.localStorageManager.setMetadata("lastFileSyncTime", data.lastTime)
@@ -1497,8 +1510,9 @@ export const receiveFileUploadAck = function (data: { lastTime?: number; path?: 
   // 服务端确认上传成功，将 pending hash 转移到正式 hashManager
   // Server confirmed upload success, move pending hash to formal hashManager
   if (data.path) {
+    const journalResult = plugin.incrementalScanManager?.acknowledge("file", data.path)
     const contentHash = plugin.pendingUploadHashes.get(data.path)
-    if (contentHash !== undefined) {
+    if (contentHash !== undefined && journalResult !== "stale") {
       const file = plugin.app.vault.getFileByPath(normalizePath(data.path))
       plugin.fileHashManager.setFileHash(data.path, contentHash, file?.stat.mtime || 0, file?.stat.size || 0)
       plugin.pendingUploadHashes.delete(data.path)
@@ -1530,7 +1544,8 @@ export const receiveFileUploadAck = function (data: { lastTime?: number; path?: 
 // Receive FileDeleteAck; only remove from hashManager if path is still pending
 export const receiveFileDeleteAck = function (data: { lastTime?: number; path?: string }, plugin: FastSync) {
   if (data.path && plugin.pendingFileDeleteAcks.has(data.path)) {
-    plugin.fileHashManager.removeFileHash(data.path)
+    const journalResult = plugin.incrementalScanManager?.acknowledge("file", data.path)
+    if (journalResult !== "stale") plugin.fileHashManager.removeFileHash(data.path)
     plugin.pendingFileDeleteAcks.delete(data.path)
   }
   if (data.lastTime && data.lastTime > Number(plugin.localStorageManager.getMetadata("lastFileSyncTime"))) {

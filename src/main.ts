@@ -418,6 +418,10 @@ export default class FastSync extends Plugin {
     this.api = new HttpApiService(this)
     this.websocket = new WebSocketManager(this)
 
+    // Restore non-secret sync progress before settings load can consult the
+    // last-sync cursors or isInitSync flag. This survives iOS WebView storage
+    // eviction without ever mirroring the API token.
+    await this.localStorageManager.initializeMirror()
     await this.loadSettings()
     if (!this.lifecycle.isCurrent(lifecycleGeneration)) return;
 
@@ -590,6 +594,11 @@ export default class FastSync extends Plugin {
       await Promise.all(initPromises)
       if (!this.lifecycle.isCurrent(lifecycleGeneration)) return;
 
+      // The local metadata/hash baseline is now complete and recoverable. The
+      // server baseline remains a separate state and is advanced only after a
+      // full sync genuinely reaches completion.
+      this.incrementalScanManager.markLocalBaselineReady()
+
       // 崩溃恢复：按路径检查持久化 pending Map，避免启动时再次枚举整个 Vault
       // Crash recovery: validate persisted pending Maps by path instead of enumerating the whole Vault
       const restoredNoteModifies = this.localStorageManager.loadPending('pendingNoteModifies')
@@ -679,6 +688,7 @@ export default class FastSync extends Plugin {
     void this.websocket?.unRegister(true)
     abortAllFileOperations()
     this.localStorageManager?.stopWatch()
+    this.localStorageManager?.flush()
     this.incrementalScanManager?.flush()
     this.shareIndicatorManager?.unload()
     this.menuManager?.unload()
@@ -688,6 +698,15 @@ export default class FastSync extends Plugin {
     this.fileHashManager?.flush()
     this.configHashManager?.flush()
     this.folderSnapshotManager?.flush()
+    // Awaitable mirror flushes protect the last checkpoint when Obsidian gives
+    // the WebView a short unload window. A hard iOS termination can still skip
+    // onunload, so the sync path also awaits checkpoints during long scans.
+    void Promise.all([
+      this.localStorageManager?.flushAsync(),
+      this.incrementalScanManager?.flushAsync(),
+      this.fileHashManager?.flushAsync(),
+      this.configHashManager?.flushAsync(),
+    ])
     this.updateStatusBar("")
   }
 

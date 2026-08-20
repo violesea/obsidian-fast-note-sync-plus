@@ -74,36 +74,37 @@ export class EventManager {
   }
 
   private recordOfflineModify(file: TAbstractFile): boolean {
-    if (this.plugin.websocket?.isAuth && !this.isBrowserOffline()) return false
     if (file.path === "/" || isPathExcluded(file.path, this.plugin)) return true
+    if (this.plugin.isIgnoredFile?.(file.path)) return false
 
     if (file instanceof TFolder) {
       this.plugin.incrementalScanManager?.markModified("folder", file.path)
     } else if (file instanceof TFile) {
       this.plugin.incrementalScanManager?.markModified(file.path.endsWith(".md") ? "note" : "file", file.path)
     }
-    dump(`Offline vault change queued: ${file.path}`)
-    return true
+    const offline = !this.plugin.websocket?.isAuth || this.isBrowserOffline()
+    dump(`${offline ? "Offline" : "Online"} vault change journaled: ${file.path}`)
+    return offline
   }
 
   private recordOfflineDelete(file: TAbstractFile): boolean {
-    if (this.plugin.websocket?.isAuth && !this.isBrowserOffline()) return false
     if (file.path === "/" || isPathExcluded(file.path, this.plugin)) return true
+    if (this.plugin.isIgnoredFile?.(file.path)) return false
 
     if (file instanceof TFolder) {
       this.plugin.incrementalScanManager?.markDeleted("folder", file.path)
     } else if (file instanceof TFile) {
       this.plugin.incrementalScanManager?.markDeleted(file.path.endsWith(".md") ? "note" : "file", file.path)
     }
-    dump(`Offline vault deletion queued: ${file.path}`)
-    return true
+    const offline = !this.plugin.websocket?.isAuth || this.isBrowserOffline()
+    dump(`${offline ? "Offline" : "Online"} vault deletion journaled: ${file.path}`)
+    return offline
   }
 
   private recordOfflineRename(file: TAbstractFile, oldPath: string): boolean {
-    if (this.plugin.websocket?.isAuth && !this.isBrowserOffline()) return false
-
     const oldExcluded = isPathExcluded(oldPath, this.plugin)
     const newExcluded = isPathExcluded(file.path, this.plugin)
+    if (this.plugin.isIgnoredFile?.(file.path) || this.plugin.isIgnoredFile?.(oldPath)) return false
     if (!oldExcluded) {
       const oldKind = file instanceof TFolder ? "folder" : oldPath.endsWith(".md") ? "note" : "file"
       this.plugin.incrementalScanManager?.markDeleted(oldKind, oldPath)
@@ -112,8 +113,9 @@ export class EventManager {
       const newKind = file instanceof TFolder ? "folder" : file.path.endsWith(".md") ? "note" : "file"
       this.plugin.incrementalScanManager?.markModified(newKind, file.path)
     }
-    dump(`Offline vault rename queued: ${oldPath} -> ${file.path}`)
-    return true
+    const offline = !this.plugin.websocket?.isAuth || this.isBrowserOffline()
+    dump(`${offline ? "Offline" : "Online"} vault rename journaled: ${oldPath} -> ${file.path}`)
+    return offline
   }
 
   private onOnline = () => {
@@ -292,9 +294,11 @@ export class EventManager {
     if (!isPathInConfigSyncDirs(path, this.plugin)) return
 
     if (!this.plugin.settings.configSyncEnabled || configIsPathExcluded(path, this.plugin)) return
+    const normalizedPath = normalizePath(path)
+    if (this.plugin.ignoredConfigFiles?.has(normalizedPath)) return
+    this.plugin.incrementalScanManager?.markModified("config", normalizedPath)
     if (!this.plugin.websocket?.isAuth) {
-      this.plugin.incrementalScanManager?.markModified("config", normalizePath(path))
-      dump(`Offline config change queued: ${path}`)
+      dump(`Offline config change journaled: ${path}`)
       return
     }
 

@@ -1,6 +1,23 @@
-import { hashContent, dump, SyncRule } from "../utils/helpers";
+import { hashContent, dump, SyncRule, LocalStateFileMirror } from "../utils/helpers";
 import { configModify } from "../sync/operator_config";
 import type FastSync from "../../main";
+
+type MirroredMetadataField =
+    | 'lastNoteSyncTime'
+    | 'lastFileSyncTime'
+    | 'lastConfigSyncTime'
+    | 'lastFolderSyncTime'
+    | 'lastSyncSuccessTime'
+    | 'isInitSync';
+
+const MIRRORED_METADATA_FIELDS: readonly MirroredMetadataField[] = [
+    'lastNoteSyncTime',
+    'lastFileSyncTime',
+    'lastConfigSyncTime',
+    'lastFolderSyncTime',
+    'lastSyncSuccessTime',
+    'isInitSync',
+];
 
 
 /**
@@ -17,6 +34,8 @@ export class LocalStorageManager {
     private lastMtimes: Map<string, number> = new Map();
     private watchTimer: number | null = null;
     private storageHandler: ((event: StorageEvent) => void) | null = null;
+    private metadataMirror: LocalStateFileMirror;
+    private mirroredMetadata: Record<string, string> = {};
 
     /**
      * 底层读原子操作
@@ -82,7 +101,12 @@ export class LocalStorageManager {
      * 设置元数据项
      */
     setMetadata(field: 'lastNoteSyncTime' | 'lastFileSyncTime' | 'lastConfigSyncTime' | 'lastFolderSyncTime' | 'lastSyncSuccessTime' | 'clientName' | 'isInitSync' | 'serverVersion' | 'serverChangelog' | 'serverVersionIsNew' | 'serverVersionNewName' | 'serverVersionNewLink' | 'serverVersionNewChangelogContent' | 'serverVersionChangelogContent' | 'pluginVersionIsNew' | 'pluginVersionNewName' | 'pluginVersionNewLink' | 'pluginVersionNewChangelogContent' | 'pluginVersionChangelogContent' | 'internalExcludes' | 'apiToken' | 'apiUrl' | 'vault' | 'autoRedirectEnabled' | 'wsPreProbeEnabled' | 'serverVersionHistory' | 'pluginVersionHistory', value: unknown): void {
-        this.write(this.getInternalKey(field), String(value));
+        const stringValue = String(value);
+        this.write(this.getInternalKey(field), stringValue);
+        if ((MIRRORED_METADATA_FIELDS as readonly string[]).includes(field)) {
+            this.mirroredMetadata[field] = stringValue;
+            this.saveMetadataMirror();
+        }
     }
 
     /**
@@ -166,6 +190,60 @@ export class LocalStorageManager {
 
     constructor(plugin: FastSync) {
         this.plugin = plugin;
+        this.metadataMirror = new LocalStateFileMirror(plugin, "syncMetadata.json");
+    }
+
+    /**
+     * Restore only non-secret sync progress from the vault file mirror. The
+     * mirror is a fallback for iOS WebView storage eviction, not a second source
+     * for credentials or connection settings.
+     */
+    async initializeMirror(): Promise<void> {
+        let mirrored: Record<string, string> = {};
+        try {
+            const raw = await this.metadataMirror.read();
+            if (raw) {
+                const parsed = JSON.parse(raw) as { schema?: number; fields?: Record<string, unknown> };
+                if (parsed.schema === 1 && parsed.fields && typeof parsed.fields === "object") {
+                    for (const field of MIRRORED_METADATA_FIELDS) {
+                        const value = parsed.fields[field];
+                        if (typeof value === "string") mirrored[field] = value;
+                    }
+                }
+            }
+        } catch (error) {
+            dump("[LocalStorageManager] Failed to parse sync metadata mirror:", error);
+        }
+
+        for (const field of MIRRORED_METADATA_FIELDS) {
+            const key = this.getInternalKey(field);
+            const current = this.read(key);
+            if (current === null && mirrored[field] !== undefined) {
+                this.write(key, mirrored[field]);
+                this.mirroredMetadata[field] = mirrored[field];
+            } else if (current !== null) {
+                this.mirroredMetadata[field] = current;
+            } else if (mirrored[field] !== undefined) {
+                this.mirroredMetadata[field] = mirrored[field];
+            }
+        }
+        this.saveMetadataMirror();
+    }
+
+    flush(): void {
+        this.metadataMirror.flush();
+    }
+
+    async flushAsync(): Promise<void> {
+        await this.metadataMirror.flushAsync();
+    }
+
+    private saveMetadataMirror(): void {
+        this.metadataMirror.scheduleWrite(JSON.stringify({
+            schema: 1,
+            updatedAt: Date.now(),
+            fields: this.mirroredMetadata,
+        }));
     }
 
     /**

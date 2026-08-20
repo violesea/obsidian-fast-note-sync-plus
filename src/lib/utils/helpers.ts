@@ -701,7 +701,7 @@ export class LocalStateFileMirror {
   private pendingWrite: boolean = false;
   // 写入串行化：写入在途时不并发发起新写入，仅记下需要在写完后重跑一次
   // Write serialization: don't start a concurrent write while one is in-flight; just remember to rerun once it finishes
-  private isWriting: boolean = false;
+  private activeWrite: Promise<void> | null = null;
   private rerunAfterWrite: boolean = false;
   private writeTimer: number | null = null;
 
@@ -735,34 +735,34 @@ export class LocalStateFileMirror {
     if (this.writeTimer) window.clearTimeout(this.writeTimer);
     this.writeTimer = window.setTimeout(() => {
       this.writeTimer = null;
-      this.doWrite();
+      void this.doWrite();
     }, 2000);
   }
 
   /**
    * 串行化落盘：写入在途时只标记需要重跑，绝不并发 adapter.write；写失败只 dump，不弹 toast
    */
-  private doWrite(): void {
-    if (!this.pendingWrite || this.latestData === null) return;
-    if (this.isWriting) {
+  private doWrite(): Promise<void> {
+    if (!this.pendingWrite || this.latestData === null) return this.activeWrite ?? Promise.resolve();
+    if (this.activeWrite) {
       this.rerunAfterWrite = true;
-      return;
+      return this.activeWrite;
     }
-    this.isWriting = true;
     this.pendingWrite = false;
     const data = this.latestData;
-    void this.plugin.app.vault.adapter.write(this.mirrorPath, data)
+    const writePromise = Promise.resolve(this.plugin.app.vault.adapter.write(this.mirrorPath, data))
       .catch((error) => {
         dump(`LocalStateFileMirror: 写入镜像文件失败: ${this.mirrorPath}`, error);
       })
       .finally(() => {
-        this.isWriting = false;
-        if (this.rerunAfterWrite) {
+        this.activeWrite = null;
+        if (this.rerunAfterWrite || this.pendingWrite) {
           this.rerunAfterWrite = false;
-          this.pendingWrite = true;
-          this.doWrite();
+          void this.doWrite();
         }
       });
+    this.activeWrite = writePromise;
+    return writePromise;
   }
 
   /**
@@ -774,7 +774,27 @@ export class LocalStateFileMirror {
       this.writeTimer = null;
     }
     if (!this.pendingWrite) return;
-    this.doWrite();
+    void this.doWrite();
+  }
+
+  /**
+   * 等待所有当前及紧随其后的镜像写入完成。
+   *
+   * iOS 可能在插件没有机会执行 onunload 时直接终止 WebView。同步扫描的
+   * checkpoint 因此不能只“启动” adapter.write，还要等它完成后再继续下一段工作。
+   * Wait for the current mirror write and any latest-wins follow-up write to finish.
+   * iOS may terminate the WebView without running onunload, so a sync checkpoint
+   * must await adapter.write instead of merely starting it.
+   */
+  async flushAsync(): Promise<void> {
+    if (this.writeTimer) {
+      window.clearTimeout(this.writeTimer);
+      this.writeTimer = null;
+    }
+
+    while (this.pendingWrite || this.activeWrite) {
+      await this.doWrite();
+    }
   }
 }
 

@@ -210,9 +210,9 @@ export class SyncState {
    * 暂存本轮同步扫描过程中新计算出的哈希，待同步结束（SyncEnd）时统一持久化到 HashManager
    * Temporarily store newly calculated hashes during scan, commit to HashManager on SyncEnd
    */
-  scannedNoteHashes = new Map<string, { hash: string; mtime: number; size: number }>();
-  scannedFileHashes = new Map<string, { hash: string; mtime: number; size: number }>();
-  scannedConfigHashes = new Map<string, { hash: string; mtime: number; size: number }>();
+  scannedNoteHashes = new Map<string, { hash: string; mtime: number; size: number; ctime?: number }>();
+  scannedFileHashes = new Map<string, { hash: string; mtime: number; size: number; ctime?: number }>();
+  scannedConfigHashes = new Map<string, { hash: string; mtime: number; size: number; ctime?: number }>();
 
   // ─── Watch / tracking sets ────────────────────────────────────────────────────
   /** 忽略的文件集合 / Ignored files set */
