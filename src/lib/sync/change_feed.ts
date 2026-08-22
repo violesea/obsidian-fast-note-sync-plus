@@ -229,8 +229,9 @@ export function buildChangeFeedClient(plugin: FastSync): ChangeFeedClient | null
  * 变更流追平：在 handleSync 连接就绪后、扫描/announce 之前运行。
  * 成功 → 调用方强制走增量路径（跳过全量枚举）；失败 → 原因写日志，本轮回落 v1。
  * 永不抛出：任何异常都折叠为 {ok:false, reason}。
+ * context 为本轮 sync context：追平中途若被 transport 重启或新轮次顶替则让位退出。
  */
-export async function runChangeFeedCatchUp(plugin: FastSync): Promise<CatchUpResult> {
+export async function runChangeFeedCatchUp(plugin: FastSync, context?: string): Promise<CatchUpResult> {
   const client = buildChangeFeedClient(plugin);
   if (!client) return { ok: false, reason: "sidecar_url_empty" };
   const deviceId = plugin.changeFeedDeviceId;
@@ -269,7 +270,12 @@ export async function runChangeFeedCatchUp(plugin: FastSync): Promise<CatchUpRes
     let fileWatermark = cursor.fileWatermarkMs;
 
     for (let page = 0; page < CHANGE_FEED_MAX_PAGES; page++) {
-      if (plugin.syncState.syncPhase === "idle") return { ok: false, reason: "round_cancelled" };
+      // 让位判定：transport 重启或本轮 context 被新轮次顶替。（syncPhase 回到 idle
+      // 不代表取消——上一轮正常收尾也会置 idle，不能作为取消信号）
+      if (plugin.syncState.transportResetPending) return { ok: false, reason: "transport_reset" };
+      if (context && plugin.syncState.activeSyncContext && plugin.syncState.activeSyncContext !== context) {
+        return { ok: false, reason: "round_superseded" };
+      }
       const resp = await client.changes(vault, sinceRev);
       if (resp.changes.length === 0 && !resp.has_more) break;
 

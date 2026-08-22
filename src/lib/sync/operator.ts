@@ -1016,7 +1016,7 @@ export const handleSync = async function (plugin: FastSync, isLoadLastTime: bool
     if (plugin.settings.changeFeedEnabled && plugin.settings.syncEnabled && syncMode === "auto") {
       const plan = planChangeFeedRound(changeFeedDecisionInput(plugin, syncMode));
       if (plan === "adopt" || plan === "poll") {
-        changeFeedResult = await runChangeFeedCatchUp(plugin);
+        changeFeedResult = await runChangeFeedCatchUp(plugin, context);
         if (!changeFeedResult.ok) {
           dump(`[ChangeFeed] catch-up failed (${changeFeedResult.reason}); falling back to v1 path this round`);
         } else {
