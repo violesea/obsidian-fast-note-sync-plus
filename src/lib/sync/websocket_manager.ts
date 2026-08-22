@@ -540,11 +540,17 @@ export class WebSocketManager {
         return;
       }
 
-      // 基于 Context 进行过滤：如果处于活跃的同步中，必须完全匹配
-      // Filter based on Context: if there's an active sync context, incoming messages (including Acks) must match
+      // 基于 Context 进行过滤：如果处于活跃的同步中，携带 context 的消息（含 Ack）必须完全匹配。
+      // 空 context 的消息（服务端主动推送：他端编辑广播、NoteRePush/FileRePush 回包）
+      // 从不属于任何 announce 会话，放行——它们不可能是旧轮次的在途残留
+      // （旧轮次残留携带的是旧轮次的非空 context，仍被拦截）。
+      // Filter based on Context: within an active round, context-carrying messages (incl. Acks)
+      // must match exactly. Empty-context messages (server-initiated pushes: remote-edit
+      // broadcasts, RePush replies) never belong to an announce session and must pass —
+      // they cannot be stale round residue, which carries the OLD round's non-empty context.
       if (this.plugin.syncState.activeSyncContext) {
         const isControlMsg = msgAction === WSAction.ClientReceiveAuth || msgAction === WSAction.ClientReceiveInfo;
-        if (!isControlMsg && data.context !== this.plugin.syncState.activeSyncContext) {
+        if (!isControlMsg && data.context && data.context !== this.plugin.syncState.activeSyncContext) {
           dump(`[SyncContext] Discard message ${msgAction} due to mismatched context. Expected: ${this.plugin.syncState.activeSyncContext}, Got: ${data.context}`);
           return;
         }
