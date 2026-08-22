@@ -1723,6 +1723,8 @@ export const handleSync = async function (plugin: FastSync, isLoadLastTime: bool
         // 变更流轮次（A-4 验收）：enumeratedEntries 必须为 0，游标区间可与服务端 sync_log 对账
         ...(changeFeedResult?.ok ? {
           changesRequested: changeFeedResult.fetched ?? 0,
+          changesApplied: changeFeedResult.applied ?? 0,
+          changesFailed: changeFeedResult.failures ?? 0,
           changesDeleted: changeFeedResult.deleted ?? 0,
           changesSkipped: changeFeedResult.skipped ?? 0,
           cursorFrom: changeFeedResult.cursorFrom,

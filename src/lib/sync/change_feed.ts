@@ -12,7 +12,7 @@
  * v2 文档 3.3 节"读路径已全部具备"的判断在插件 token 口径下不成立，已回写项目档案。
  */
 
-import { Platform, requestUrl } from "obsidian";
+import { Platform, TFile, normalizePath, requestUrl } from "obsidian";
 
 import { dump, hashContent, isPathExcluded, LocalStateFileMirror } from "../utils/helpers";
 import { CLIENT_TYPE } from "../utils/types";
@@ -30,14 +30,100 @@ import {
   planChangeFeedRound,
   selectApplicableChanges,
 } from "./change_feed_logic";
-import type { ChangesResponse, RegisterResponse } from "./change_feed_logic";
-import * as WSAction from "./websocket_action";
+import type { ChangesResponse, RegisterResponse, SidecarChange } from "./change_feed_logic";
 
 function platformKind(): string {
   if (Platform.isIosApp) return Platform.isTablet ? "ipados" : "ios";
   if (Platform.isAndroidApp) return "android";
   if (Platform.isDesktopApp) return "desktop";
   return "web";
+}
+
+/** 附件是否属于本设备的同步面（与 operator activeTypes 同口径：云端预览全开时不落地附件） */
+function filesInSyncScope(plugin: FastSync): boolean {
+  return !plugin.settings.cloudPreviewEnabled || plugin.settings.cloudPreviewTypeRestricted;
+}
+
+/**
+ * 物化一篇服务端笔记到本地（HTTP 直取路径，2.5.1 起替代 RePush 通道）。
+ * 写入模式复刻 receiveNoteSyncModify：ignored-file 回声抑制、服务端 mtime/ctime、
+ * setFileHash 记同步基线、lastSyncMtime 拦截。失败抛出，由调用方计数。
+ */
+export async function applyRemoteNote(
+  plugin: FastSync,
+  path: string,
+  note: { content: string; contentHash: string; mtime: number; ctime: number },
+): Promise<void> {
+  const normalized = normalizePath(path);
+  plugin.addIgnoredFile(normalized);
+  try {
+    const options = {
+      ...((note.ctime ?? 0) > 0 ? { ctime: note.ctime } : {}),
+      ...((note.mtime ?? 0) > 0 ? { mtime: note.mtime } : {}),
+    };
+    const existing = plugin.app.vault.getFileByPath(normalized);
+    if (existing instanceof TFile) {
+      await plugin.app.vault.modify(existing, note.content, options);
+    } else {
+      const folder = normalized.split("/").slice(0, -1).join("/");
+      if (folder !== "" && plugin.app.vault.getFolderByPath(folder) == null) {
+        try {
+          await plugin.app.vault.createFolder(folder);
+        } catch (e) {
+          // 并发竞争时只有一方建目录成功（与 receiveNoteSyncModify 同款容忍）
+          if (plugin.app.vault.getFolderByPath(folder) == null) throw e;
+        }
+      }
+      await plugin.app.vault.create(normalized, note.content, options);
+    }
+    const written = plugin.app.vault.getFileByPath(normalized);
+    plugin.fileHashManager.setFileHash(normalized, note.contentHash, note.mtime, written instanceof TFile ? written.stat.size : 0);
+    plugin.lastSyncMtime.set(normalized, note.mtime);
+  } finally {
+    window.setTimeout(() => plugin.removeIgnoredFile(normalized), 500);
+  }
+}
+
+/**
+ * 物化一个服务端附件到本地（HTTP 直取）。
+ * 基线哈希用变更流下发的 content_hash（/api/file 只回字节），体积对不上时告警但不拒绝
+ * （服务端可能在我们取字节前又写了一版——下一轮变更流会再修正）。
+ */
+export async function applyRemoteFile(
+  plugin: FastSync,
+  change: SidecarChange,
+): Promise<void> {
+  const normalized = normalizePath(change.path);
+  const buf = await plugin.api.getFileBinary(change.path, change.path_hash);
+  if (!buf) throw new Error(`binary fetch failed: ${change.path}`);
+  if ((change.size ?? 0) > 0 && buf.byteLength !== change.size) {
+    dump(`[ChangeFeed] http-fetch size mismatch (server=${change.size}, got=${buf.byteLength}): ${change.path}`);
+  }
+  plugin.addIgnoredFile(normalized);
+  try {
+    const options = {
+      ...((change.ctime ?? 0) > 0 ? { ctime: change.ctime } : {}),
+      ...((change.mtime ?? 0) > 0 ? { mtime: change.mtime } : {}),
+    };
+    const existing = plugin.app.vault.getFileByPath(normalized);
+    if (existing instanceof TFile) {
+      await plugin.app.vault.modifyBinary(existing, buf, options);
+    } else {
+      const folder = normalized.split("/").slice(0, -1).join("/");
+      if (folder !== "" && plugin.app.vault.getFolderByPath(folder) == null) {
+        try {
+          await plugin.app.vault.createFolder(folder);
+        } catch (e) {
+          if (plugin.app.vault.getFolderByPath(folder) == null) throw e;
+        }
+      }
+      await plugin.app.vault.createBinary(normalized, buf, options);
+    }
+    plugin.fileHashManager.setFileHash(normalized, change.content_hash ?? "", change.mtime ?? 0, buf.byteLength);
+    plugin.lastSyncMtime.set(normalized, change.mtime ?? 0);
+  } finally {
+    window.setTimeout(() => plugin.removeIgnoredFile(normalized), 500);
+  }
 }
 
 // ---------------------------------------------------------------- 客户端 ---
@@ -214,7 +300,12 @@ export interface CatchUpResult {
   mode?: "adopt" | "poll";
   cursorFrom?: number;
   cursorTo?: number;
+  /** 变更流判定为需拉取的条数 */
   fetched?: number;
+  /** HTTP 直取成功物化的条数（2.5.1 起） */
+  applied?: number;
+  /** 物化失败条数（不中断追平，靠下一轮/M3 digest 修正） */
+  failures?: number;
   deleted?: number;
   skipped?: number;
 }
@@ -265,7 +356,7 @@ export async function runChangeFeedCatchUp(plugin: FastSync, context?: string): 
 
     let sinceRev = cursor.rev;
     const cursorFrom = sinceRev;
-    let fetched = 0, deleted = 0, skipped = 0;
+    let fetched = 0, deleted = 0, skipped = 0, applied = 0, failures = 0;
     let noteWatermark = cursor.noteWatermarkMs;
     let fileWatermark = cursor.fileWatermarkMs;
 
@@ -292,12 +383,25 @@ export async function runChangeFeedCatchUp(plugin: FastSync, context?: string): 
 
       for (const action of actions) {
         if (action.kind === "fetch") {
-          const payload = { vault, path: action.change.path, pathHash: action.change.path_hash ?? hashContent(action.change.path) };
-          // 复用 v1 接收管线：RePush 触发服务端标准推送（冲突/基线/回声抑制全套现成）
-          plugin.websocket.SendMessage(
-            action.type === "note" ? WSAction.NoteReceiveRePush : WSAction.FileReceiveRePush,
-            payload,
-          );
+          // HTTP 直取物化（2.5.1）：同步、可验证、可复现，绕开 RePush 通道（ISSUE-023 疑云路径）。
+          // 单条失败不中断追平：计数进 failures，游标照常推进，该路径由下一轮同路径变更或 M3 digest 修正。
+          try {
+            if (action.type === "note") {
+              const note = await plugin.api.getNoteContent(action.change.path);
+              if (!note) throw new Error(`note fetch returned null: ${action.change.path}`);
+              await applyRemoteNote(plugin, action.change.path, note);
+              applied++;
+            } else if (filesInSyncScope(plugin)) {
+              await applyRemoteFile(plugin, action.change);
+              applied++;
+            } else {
+              // 云端预览全开设备不落地附件（与 operator activeTypes 同口径）
+              skipped++;
+            }
+          } catch (itemErr) {
+            failures++;
+            dump(`[ChangeFeed] http-fetch apply failed (${failures}): ${action.change.path} — ${itemErr instanceof Error ? itemErr.message : String(itemErr)}`);
+          }
         } else if (action.kind === "delete") {
           const payload = {
             vault,
@@ -341,7 +445,7 @@ export async function runChangeFeedCatchUp(plugin: FastSync, context?: string): 
       dump(`[ChangeFeed] pushCursor failed (non-fatal): ${e instanceof Error ? e.message : String(e)}`);
     });
 
-    return { ok: true, mode, cursorFrom, cursorTo: sinceRev, fetched, deleted, skipped };
+    return { ok: true, mode, cursorFrom, cursorTo: sinceRev, fetched, deleted, skipped, applied, failures };
   } catch (e) {
     if (e instanceof SidecarProtocolError && e.isStaleCursor) {
       // INV-5：游标超出保留期 → 清游标本轮回落 v1（repair），禁止伪装增量成功

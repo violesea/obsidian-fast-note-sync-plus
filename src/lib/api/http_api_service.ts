@@ -77,6 +77,20 @@ export interface NoteListResponse {
     pager: Pager;
 }
 
+/** GET /api/note 的 data 载荷（服务端笔记当前态，handler_note.go Get）
+ *  fileLinks 为已解析的内嵌附件链接（![[ ]]），变更流物化暂不使用，留作 P5 投影面 */
+export interface NoteContentDTO {
+    path: string;
+    pathHash: string;
+    content: string;
+    contentHash: string;
+    fileLinks: Record<string, unknown>;
+    version: number;
+    ctime: number;
+    mtime: number;
+    lastTime: number;
+}
+
 export interface FileListResponse {
     list: {
         id: number;
@@ -487,6 +501,60 @@ export class HttpApiService {
 
         const res = json as ApiResponse<FileInfoResponse>;
         return res.data;
+    }
+
+    /**
+     * 按路径直取一篇笔记的服务端当前态（FNS v2 变更流物化用）。
+     * 失败（网络/4xx/5xx/非成功信封）返回 null，由调用方决定跳过或重试——
+     * 刻意不 throw：变更流追平对单篇失败必须具备免疫力。
+     * 注意鉴权语义：token scope 按 `x-client` 头匹配（c:ObsidianPlugin），本方法沿用 request() 的默认头。
+     */
+    async getNoteContent(path: string, signal?: AbortSignal): Promise<NoteContentDTO | null> {
+        const params = new URLSearchParams({
+            vault: this.plugin.settings.vault,
+            path: path
+        });
+        const { status, json } = await this.request(`/api/note?${params.toString()}`, {
+            method: "GET",
+            signal
+        });
+        if (status !== 200) return null;
+        const res = json as ApiResponse<NoteContentDTO>;
+        if (!this.isSuccess(res) || !res.data || typeof res.data.content !== "string") return null;
+        return res.data;
+    }
+
+    /**
+     * 按路径直取一个附件的服务端原始字节（FNS v2 变更流物化用）。
+     * /api/file 返回原始字节流而非 JSON 信封，故不走 request()；
+     * requestUrl/nativeFetch 双通道与 request() 同款纪律。失败返回 null。
+     */
+    async getFileBinary(path: string, pathHash?: string, signal?: AbortSignal): Promise<ArrayBuffer | null> {
+        const params = new URLSearchParams({
+            vault: this.plugin.settings.vault,
+            path: path,
+            pathHash: (pathHash ?? hashContent(path)).toString()
+        });
+        const base = (this.plugin.runApi || this.plugin.settings.api).replace(/\/+$/, "");
+        const url = addRandomParam(`${base}/api/file?${params.toString()}`);
+        const headers: Record<string, string> = {
+            "x-client": CLIENT_TYPE,
+            "x-client-name": encodeURIComponent(this.plugin.getClientName()),
+            "x-client-version": (this.plugin.manifest as { version?: string }).version || ""
+        };
+        if (this.plugin.settings.apiToken) {
+            headers["Authorization"] = `Bearer ${this.plugin.settings.apiToken}`;
+        }
+        try {
+            if (this.plugin.settings.networkLibrary === "requestUrl") {
+                const r = await requestUrl({ url, method: "GET", headers, throw: false });
+                return r.status === 200 ? r.arrayBuffer : null;
+            }
+            const resp = await fetch(url, { method: "GET", headers, redirect: "follow", signal });
+            return resp.ok ? await resp.arrayBuffer() : null;
+        } catch {
+            return null;
+        }
     }
 
     /**
