@@ -16,7 +16,12 @@ const MAX_DOWNLOAD_BUFFER_BYTES = 20 * 1024 * 1024
 // Active uploads are also tagged with a transport generation. A reconnect must
 // invalidate every task that was admitted by the old socket, including tasks
 // released from ConcurrencyLimiter.clear().
-type ActiveUpload = { cancelled: boolean; queueGeneration: number }
+type ActiveUpload = {
+  cancelled: boolean;
+  queueGeneration: number;
+  slotReleased: boolean;
+  taskRecorded: boolean;
+}
 const activeUploadsMap = new Map<string, ActiveUpload>()
 let uploadQueueGeneration = 0
 
@@ -25,6 +30,19 @@ export let isPluginUnloading = false;
 
 // 会话 ID 到文件路径的映射，用于处理 463 会话不存在错误
 const sessionIdToPathMap = new Map<string, string>()
+
+const releaseUploadSlot = (plugin: FastSync, path: string, state: ActiveUpload): void => {
+  if (state.slotReleased) return;
+  state.slotReleased = true;
+  plugin.concurrencyLimiter.releaseSlot(path);
+};
+
+const recordUploadTask = (plugin: FastSync, data: FileUploadMessage, state: ActiveUpload, failed = false): void => {
+  if (state.taskRecorded) return;
+  state.taskRecorded = true;
+  if (failed) plugin.fileSyncTasks.failed++;
+  plugin.recordSyncCompleted('file', data.pageIndex);
+};
 
 // 大文件跳过同步通知去重：本会话内已提示过的 "path|size"，避免同一文件每轮同步重复弹 toast
 const sessionLargeFileNotified = new Set<string>()
@@ -61,11 +79,18 @@ export const getTempChunksDir = (plugin: FastSync, sessionId?: string) => {
 /**
  * 清理指定会话的临时目录
  */
-export const clearTempChunksDir = async (plugin: FastSync, sessionId: string) => {
-  const path = getTempChunksDir(plugin, sessionId)
-  if (await plugin.app.vault.adapter.exists(path)) {
-    await plugin.app.vault.adapter.rmdir(path, true)
+const clearTempDirectory = async (plugin: FastSync, path: string): Promise<void> => {
+  try {
+    if (await plugin.app.vault.adapter.exists(path)) {
+      await plugin.app.vault.adapter.rmdir(path, true)
+    }
+  } catch (error) {
+    dump(`Failed to clear temporary sync directory: ${path}`, error)
   }
+};
+
+export const clearTempChunksDir = async (plugin: FastSync, sessionId: string) => {
+  await clearTempDirectory(plugin, getTempChunksDir(plugin, sessionId))
 }
 
 const shouldUseMemoryDownload = (size: number) => Platform.isMobile && size <= MAX_DOWNLOAD_BUFFER_BYTES
@@ -180,13 +205,39 @@ export const clearAllTempChunks = async (plugin: FastSync) => {
   }
 }
 
-export const clearUploadQueue = () => {
+/**
+ * Drop download sessions owned by a dead WebSocket without counting them as
+ * completed work. The prepared sync snapshot will request fresh sessions on
+ * the replacement connection.
+ */
+export const resetFileDownloadSessions = (plugin: FastSync): void => {
+  const sessions = Array.from(plugin.fileDownloadSessions.values());
+  plugin.fileDownloadSessions.clear();
+
+  for (const session of sessions) {
+    releaseSessionMemory(session);
+    plugin.concurrencyLimiter.releaseSlot(session.initialSlotKey || `download_${session.path}`);
+    // An initialization directory has no stable server session ID yet. Leave
+    // it for the next FileSyncChunkDownload handler, which clears it before
+    // adopting the path. A real session directory is safe to remove now.
+    if (session.tempDir && session.sessionId) {
+      void clearTempDirectory(plugin, session.tempDir);
+    }
+  }
+}
+
+export const clearUploadQueue = (plugin?: FastSync) => {
   uploadQueueGeneration++
   let cancelledCount = 0
   for (const upload of activeUploadsMap.values()) {
     if (!upload.cancelled) cancelledCount++
     upload.cancelled = true
   }
+  // Session IDs belong to the old WebSocket. Late 463 responses must not be
+  // allowed to settle a replacement upload task.
+  sessionIdToPathMap.clear()
+  // A replacement transport must not accept ACKs belonging to the dead socket.
+  plugin?.syncState.pendingFileUploadAcks.clear()
   if (cancelledCount > 0) {
     dump(`Upload queue cancelled for transport generation ${uploadQueueGeneration}: ${cancelledCount} task(s)`)
   }
@@ -272,7 +323,9 @@ export const fileModify = async function (file: TAbstractFile, plugin: FastSync,
       plugin.localStorageManager.savePending('pendingUploadHashes', plugin.pendingUploadHashes)
       await plugin.concurrencyLimiter.waitForSlot(file.path)
       plugin.incrementalScanManager?.markSent("file", file.path)
-      void plugin.websocket.SendMessage("FileUploadCheck", data)
+      void plugin.websocket.SendMessage("FileUploadCheck", data, undefined, () => {
+        plugin.syncState.pendingFileUploadAcks.add(normalizePath(file.path))
+      })
       dump(`File modify check sent`, data.path, data.contentHash)
     } finally {
       plugin.removeIgnoredFile(file.path)
@@ -302,6 +355,7 @@ export const fileDelete = async function (file: TAbstractFile, plugin: FastSync,
     if (activeUploadsMap.has(file.path)) {
       activeUploadsMap.get(file.path)!.cancelled = true;
       dump(`Upload cancelled due to file deletion: ${file.path}`);
+      plugin.syncState.pendingFileUploadAcks.delete(normalizePath(file.path))
       // 仅清理本地状态
       plugin.fileHashManager.removeFileHash(file.path)
       plugin.pendingUploadHashes.delete(file.path)
@@ -312,6 +366,7 @@ export const fileDelete = async function (file: TAbstractFile, plugin: FastSync,
     // 清理可能存在的待确认上传记录，避免 pending map 内存泄漏
     // Clean up any pending upload record to avoid pending map memory leak
     plugin.pendingUploadHashes.delete(file.path)
+    plugin.syncState.pendingFileUploadAcks.delete(normalizePath(file.path))
     plugin.localStorageManager.savePending('pendingUploadHashes', plugin.pendingUploadHashes)
 
     plugin.addIgnoredFile(file.path)
@@ -351,6 +406,7 @@ export const fileDeleteByPath = async function (filePath: string, plugin: FastSy
     // If the file is being uploaded or in the queue, cancel and skip server delete
     if (activeUploadsMap.has(filePath)) {
       activeUploadsMap.get(filePath)!.cancelled = true;
+      plugin.syncState.pendingFileUploadAcks.delete(normalizePath(filePath))
       plugin.fileHashManager.removeFileHash(filePath)
       plugin.pendingUploadHashes.delete(filePath)
       plugin.localStorageManager.savePending('pendingUploadHashes', plugin.pendingUploadHashes)
@@ -360,6 +416,7 @@ export const fileDeleteByPath = async function (filePath: string, plugin: FastSy
     // 清理可能存在的待确认上传记录，避免 pending map 内存泄漏
     // Clean up any pending upload record to avoid pending map memory leak
     plugin.pendingUploadHashes.delete(filePath)
+    plugin.syncState.pendingFileUploadAcks.delete(normalizePath(filePath))
     plugin.localStorageManager.savePending('pendingUploadHashes', plugin.pendingUploadHashes)
 
     plugin.addIgnoredFile(filePath)
@@ -516,7 +573,12 @@ export const receiveFileUpload = async function (data: FileUploadMessage, plugin
 
   const runUpload = async () => {
     // 标记该路径进入活跃上传状态
-    const uploadState: ActiveUpload = { cancelled: false, queueGeneration: uploadQueueGeneration }
+    const uploadState: ActiveUpload = {
+      cancelled: false,
+      queueGeneration: uploadQueueGeneration,
+      slotReleased: false,
+      taskRecorded: false,
+    }
     activeUploadsMap.set(data.path, uploadState);
     await plugin.concurrencyLimiter.waitForSlot(data.path, false, 10) // 优先级设为 10，优先处理上传
 
@@ -525,7 +587,7 @@ export const receiveFileUpload = async function (data: FileUploadMessage, plugin
     // to a replacement socket.
     if (isPluginUnloading || uploadState.cancelled || uploadState.queueGeneration !== uploadQueueGeneration) {
       dump(`Upload dropped after transport reset: ${data.path}`)
-      plugin.concurrencyLimiter.releaseSlot(data.path)
+      releaseUploadSlot(plugin, data.path, uploadState)
       activeUploadsMap.delete(data.path)
       sessionIdToPathMap.delete(data.sessionId)
       return
@@ -547,8 +609,8 @@ export const receiveFileUpload = async function (data: FileUploadMessage, plugin
       }
       if (!content) {
         plugin.totalChunksToUpload -= actualTotalChunks
-        plugin.concurrencyLimiter.releaseSlot(data.path)
-        plugin.recordSyncCompleted('file', data.pageIndex)
+        releaseUploadSlot(plugin, data.path, uploadState)
+        recordUploadTask(plugin, data, uploadState)
         return;
       }
 
@@ -559,7 +621,8 @@ export const receiveFileUpload = async function (data: FileUploadMessage, plugin
       plugin.pendingUploadHashes.set(data.path, contentHash)
       plugin.localStorageManager.savePending('pendingUploadHashes', plugin.pendingUploadHashes)
       // 记录当前文件的 mtime/size 到缓存，以便后续利用
-      plugin.fileHashManager.setFileHash(data.path, contentHash, file.stat.mtime, file.stat.size)
+      plugin.fileHashManager.setLocalFileHash(data.path, contentHash, file.stat.mtime, file.stat.size)
+      plugin.syncState.pendingFileUploadAcks.add(normalizePath(data.path))
 
       // 使用外层计算好的 actualTotalChunks
 
@@ -680,6 +743,8 @@ export const receiveFileUpload = async function (data: FileUploadMessage, plugin
             status: 'pending',
             message: '连接已断开，等待重连后续传'
           });
+          plugin.syncState.pendingFileUploadAcks.delete(normalizePath(data.path))
+          releaseUploadSlot(plugin, data.path, uploadState)
           return;
         }
 
@@ -688,8 +753,9 @@ export const receiveFileUpload = async function (data: FileUploadMessage, plugin
           // 取消时清除 checkpoint，避免使用已失效的会话
           // Clear checkpoint on cancel to avoid stale session reuse
           try { plugin.app.saveLocalStorage(checkpointKey, null) } catch { /* ignore */ }
-          plugin.concurrencyLimiter.releaseSlot(data.path)
-          plugin.recordSyncCompleted('file', data.pageIndex)
+          plugin.syncState.pendingFileUploadAcks.delete(normalizePath(data.path))
+          releaseUploadSlot(plugin, data.path, uploadState)
+          recordUploadTask(plugin, data, uploadState)
           return;
         }
 
@@ -744,9 +810,10 @@ export const receiveFileUpload = async function (data: FileUploadMessage, plugin
       dump(`Upload process error for ${data.path}`, e);
       // 异常退出时清除 checkpoint，避免下次用无效的 sessionId 继续
       try { plugin.app.saveLocalStorage(checkpointKey, null) } catch { /* ignore */ }
+      plugin.syncState.pendingFileUploadAcks.delete(normalizePath(data.path))
       plugin.totalChunksToUpload -= actualTotalChunks
-      plugin.concurrencyLimiter.releaseSlot(data.path);
-      plugin.recordSyncCompleted('file', data.pageIndex)
+      releaseUploadSlot(plugin, data.path, uploadState)
+      recordUploadTask(plugin, data, uploadState, true)
     } finally {
       // 任务结束（完成或取消/失败），移除活跃标记
       activeUploadsMap.delete(data.path);
@@ -998,6 +1065,12 @@ export const receiveFileSyncChunkDownload = async function (data: FileSyncChunkD
   let session: FileDownloadSession
 
   if (tempSession) {
+    // The initialization directory is keyed by pathHash because the server
+    // session ID is not known yet. Clear it before a replacement session can
+    // write new chunks, so stale chunks are never mixed into the new download.
+    if (tempSession.tempDir) {
+      await clearTempDirectory(plugin, tempSession.tempDir)
+    }
     session = {
       path: data.path,
       contentHash: data.contentHash,
@@ -1507,6 +1580,13 @@ export const receiveFileRenameAck = function (data: { lastTime?: number }, plugi
 // 收到 FileUploadAck，将 pending hash 转移到正式 hashManager 并更新 lastFileSyncTime
 // Receive FileUploadAck, move pending hash to formal hashManager and update lastFileSyncTime
 export const receiveFileUploadAck = function (data: { lastTime?: number; path?: string; pathHash?: string }, plugin: FastSync) {
+  if (data.path) {
+    const ackKey = normalizePath(data.path)
+    if (!plugin.syncState.pendingFileUploadAcks.delete(ackKey)) {
+      dump(`FileUploadAck ignored as duplicate or stale: ${data.path}`)
+      return
+    }
+  }
   // 服务端确认上传成功，将 pending hash 转移到正式 hashManager
   // Server confirmed upload success, move pending hash to formal hashManager
   if (data.path) {
@@ -1561,14 +1641,27 @@ export const receiveFileDeleteAck = function (data: { lastTime?: number; path?: 
  */
 export const receiveFileUploadSessionNotFound = function (sessionId: string, plugin: FastSync) {
   const path = sessionIdToPathMap.get(sessionId)
-  if (path) {
-    const active = activeUploadsMap.get(path)
-    if (active) {
-      active.cancelled = true
-    }
-    plugin.concurrencyLimiter.releaseSlot(path)
-    plugin.fileSyncTasks.failed++
-    plugin.fileSyncTasks.completed++
-    dump(`FileUploadSessionNotFound: Cleaned active state and completed task for path: ${path} (${sessionId})`)
+  if (!path) return
+
+  // Consume the mapping before doing any cleanup. The server can repeat a
+  // 463 response, and completion accounting must remain exactly-once.
+  sessionIdToPathMap.delete(sessionId)
+  const active = activeUploadsMap.get(path)
+  if (!active) {
+    dump(`FileUploadSessionNotFound: Ignored stale session for path: ${path} (${sessionId})`)
+    return
   }
+
+  active.cancelled = true
+  plugin.syncState.pendingFileUploadAcks.delete(normalizePath(path))
+  releaseUploadSlot(plugin, path, active)
+  recordUploadTask(plugin, {
+    path,
+    pathHash: hashContent(path),
+    ctime: 0,
+    mtime: 0,
+    sessionId,
+    chunkSize: 0,
+  }, active, true)
+  dump(`FileUploadSessionNotFound: Cleaned active state and completed task for path: ${path} (${sessionId})`)
 }

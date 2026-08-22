@@ -35,6 +35,15 @@ const EMPTY_BUILD_STATE = (): HashBuildState => ({
   updatedAt: 0,
 });
 
+// Persisting the complete vault index is intentionally coarse-grained. The
+// progress indicator can update frequently without serializing a multi-MB map
+// on every few dozen files.
+// A cold build checkpoint serializes the complete local cache.  Keep the
+// recovery window bounded, but do not make a multi-megabyte synchronous write
+// part of the mobile UI's normal cadence.
+const HASH_CHECKPOINT_ENTRY_INTERVAL = 5000;
+const HASH_CHECKPOINT_INTERVAL_MS = 10000;
+
 const matchesFingerprint = (cache: HashCache, mtime: number, size: number, ctime?: number): boolean => {
   return cache.mtime === mtime
     && cache.size === size
@@ -56,9 +65,10 @@ export class FileHashManager {
   private buildStorageKey: string;
   private isInitialized: boolean = false;
   private buildState: HashBuildState = EMPTY_BUILD_STATE();
-  // 脏标记 + 防抖落盘：高频单条写入（下载/Ack 路径）不再逐条同步整表 JSON.stringify，
-  // 避免高频写 localStorage 阻塞主线程导致界面白屏
-  private isDirty: boolean = false;
+  // Dirty flags are tracked per map so a local scan checkpoint never rewrites
+  // the server-confirmed baseline unless that baseline actually changed.
+  private hashMapDirty = false;
+  private syncHashMapDirty = false;
   private debouncedFlush: () => void;
   // 文件镜像：localStorage 被移动端系统清除后的兜底恢复
   private mirror: LocalStateFileMirror;
@@ -81,8 +91,9 @@ export class FileHashManager {
   /**
    * 标记为脏并安排一次防抖落盘（用于高频单条写入路径）
    */
-  private scheduleSave(): void {
-    this.isDirty = true;
+  private scheduleSave(hashMap = true, syncHashMap = true): void {
+    this.hashMapDirty = this.hashMapDirty || hashMap;
+    this.syncHashMapDirty = this.syncHashMapDirty || syncHashMap;
     this.debouncedFlush();
   }
 
@@ -90,20 +101,28 @@ export class FileHashManager {
    * 立即将脏数据落盘（用于同步结束、插件卸载等需要保证持久化的时机）
    */
   flush(): void {
-    if (this.isDirty) {
-      this.isDirty = false;
-      this.saveToStorage();
+    if (this.hashMapDirty) {
+      this.hashMapDirty = false;
+      this.saveHashMapToStorage();
     }
-    // 最后冲镜像：既包含 saveToStorage 刚安排的一份，也包含与 isDirty 无关的防抖中镜像写
+    if (this.syncHashMapDirty) {
+      this.syncHashMapDirty = false;
+      this.saveSyncToStorage();
+    }
+    // Flush pending mirror writes even when localStorage was not dirty.
     this.mirror.flush();
     this.syncMirror.flush();
     this.buildMirror.flush();
   }
 
   async flushAsync(): Promise<void> {
-    if (this.isDirty) {
-      this.isDirty = false;
-      this.saveToStorage();
+    if (this.hashMapDirty) {
+      this.hashMapDirty = false;
+      this.saveHashMapToStorage();
+    }
+    if (this.syncHashMapDirty) {
+      this.syncHashMapDirty = false;
+      this.saveSyncToStorage();
     }
     await Promise.all([
       this.mirror.flushAsync(),
@@ -322,6 +341,8 @@ export class FileHashManager {
       };
 
       let hashMapChangedSinceCheckpoint = false;
+      let lastCheckpointProcessed = 0;
+      let lastCheckpointAt = Date.now();
       const saveCheckpoint = async (): Promise<void> => {
         if (hashInFlight.size > 0) {
           await Promise.all(Array.from(hashInFlight));
@@ -345,20 +366,27 @@ export class FileHashManager {
         // Do not leave the recovery point behind the normal mirror debounce:
         // iOS may terminate the WebView immediately after yielding to the UI.
         await Promise.all([this.mirror.flushAsync(), this.buildMirror.flushAsync()]);
+        lastCheckpointProcessed = processedFiles;
+        lastCheckpointAt = Date.now();
+      };
+
+      const shouldSaveCheckpoint = (): boolean => {
+        return processedFiles - lastCheckpointProcessed >= HASH_CHECKPOINT_ENTRY_INTERVAL
+          || Date.now() - lastCheckpointAt >= HASH_CHECKPOINT_INTERVAL_MS;
       };
 
       for (const file of files) {
         // 跳过已排除的文件
         if (isPathExcluded(file.path, this.plugin)) {
           processedFiles++;
-          if (processedFiles % 50 === 0) await saveCheckpoint();
+          if (shouldSaveCheckpoint()) await saveCheckpoint();
           continue;
         }
 
         if (file.extension !== "md" && isLargeBinarySyncRisk(file.stat.size, this.plugin)) {
           dump(`FileHashManager: skip large binary hash (${describeBinarySyncLimit(this.plugin)} limit): ${file.path}`, file.stat.size);
           processedFiles++;
-          if (processedFiles % 50 === 0) await saveCheckpoint();
+          if (shouldSaveCheckpoint()) await saveCheckpoint();
           continue;
         }
 
@@ -367,7 +395,7 @@ export class FileHashManager {
         if (cached && matchesFingerprint(cached, file.stat.mtime, file.stat.size, file.stat.ctime)) {
           cacheHits++;
           processedFiles++;
-          if (processedFiles % 50 === 0) await saveCheckpoint();
+          if (shouldSaveCheckpoint()) await saveCheckpoint();
           continue;
         }
 
@@ -404,8 +432,8 @@ export class FileHashManager {
 
         processedFiles++;
 
-        // 每处理 50 个文件更新一次进度 (Update progress every 50 files)
-        if (processedFiles % 50 === 0) {
+        // Update the notice only when a durable checkpoint is written.
+        if (shouldSaveCheckpoint()) {
           await saveCheckpoint();
           notice.setMessage(`正在初始化文件哈希映射... (${processedFiles}/${totalFiles})`);
           // 让出主线程,避免阻塞 UI
@@ -496,7 +524,21 @@ export class FileHashManager {
       ...(typeof ctime === "number" && ctime > 0 ? { ctime } : {}),
     });
     this.syncHashMap.set(path, hash);
-    this.scheduleSave();
+    this.scheduleSave(true, true);
+  }
+
+  /**
+   * Update only the local content cache. The server baseline must change only
+   * after an explicit server acknowledgement.
+   */
+  setLocalFileHash(path: string, hash: string, mtime: number = 0, size: number = 0, ctime?: number): void {
+    this.hashMap.set(path, {
+      hash,
+      mtime,
+      size,
+      ...(typeof ctime === "number" && ctime > 0 ? { ctime } : {}),
+    });
+    this.scheduleSave(true, false);
   }
 
   /**
@@ -515,7 +557,7 @@ export class FileHashManager {
       });
       changed = true;
     }
-    if (changed) this.saveToStorage();
+    if (changed) this.scheduleSave(true, false);
   }
 
   /**
@@ -612,6 +654,8 @@ export class FileHashManager {
    * 保存哈希映射到 localStorage，同时镜像写入文件 (兜底移动端 localStorage 被清除)
    */
   private saveToStorage(): void {
+    this.hashMapDirty = false;
+    this.syncHashMapDirty = false;
     this.saveHashMapToStorage();
 
     // 同步保存基准哈希表
@@ -695,7 +739,10 @@ export class FileHashManager {
   /**
    * 批量更新扫描得出的哈希值 (仅写入本地缓存以优化性能，绝不更新同步基准表)
    */
-  bulkSetFromScanned(scanned: Map<string, { hash: string; mtime: number; size: number; ctime?: number }>): void {
+  bulkSetFromScanned(
+    scanned: Map<string, { hash: string; mtime: number; size: number; ctime?: number }>,
+    persist = true,
+  ): void {
     if (scanned.size === 0) return;
     let changed = false;
     for (const [path, cache] of scanned) {
@@ -719,22 +766,11 @@ export class FileHashManager {
         changed = true;
       }
     }
-    if (changed) {
-      // 仅触发本地缓存表的 localStorage 和文件镜像保存
-      let data: string;
-      try {
-        const obj = Object.fromEntries(this.hashMap);
-        data = JSON.stringify(obj);
-      } catch {
-        return;
-      }
-      try {
-        this.plugin.app.saveLocalStorage(this.storageKey, data);
-      } catch {
-        // Ignore storage saving error // 忽略本地存储保存错误
-      }
-      this.mirror.scheduleWrite(data);
-    }
+    // During a live sync, intermediate scan checkpoints update the in-memory
+    // cache only.  The caller performs one durable flush after the prepared
+    // snapshot is complete; otherwise every checkpoint serializes the entire
+    // vault hash map and can freeze the mobile renderer.
+    if (changed && persist) this.scheduleSave(true, false);
   }
 
   /**

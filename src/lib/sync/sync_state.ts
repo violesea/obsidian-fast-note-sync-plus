@@ -21,6 +21,17 @@ export interface SyncTaskStats {
 export type SyncLifecyclePhase = "idle" | "scanning" | "waiting-connection" | "sending" | "monitoring";
 
 /**
+ * A send can complete at the same moment that its physical transport closes.
+ * Do not enter monitoring until the replacement transport is still usable.
+ */
+export const getPostSendSyncPhase = (
+  transportResetPending: boolean,
+  connectionReady: boolean,
+): Extract<SyncLifecyclePhase, "waiting-connection" | "monitoring"> => {
+  return transportResetPending || !connectionReady ? "waiting-connection" : "monitoring";
+};
+
+/**
  * Centralised container for all runtime sync-session state.
  * Eliminates the need to scatter 30+ fields across the FastSync plugin class.
  *
@@ -76,6 +87,9 @@ export class SyncState {
   pendingFilePushPageIndex = new Map<string, number>();
   pendingConfigPushPageIndex = new Map<string, number>();
 
+  /** File upload requests sent on the current transport and awaiting one Ack. */
+  pendingFileUploadAcks = new Set<string>();
+
   // ─── Sync-session control flags ──────────────────────────────────────────────
   /** 是否正在执行同步流程 / Whether sync process is running */
   isSyncing = false;
@@ -91,6 +105,8 @@ export class SyncState {
   currentSyncType: "full" | "incremental" = "incremental";
   /** 当前活跃的同步上下文 UUID / Current active sync context UUID */
   activeSyncContext: string | null = null;
+  /** A physical transport close occurred during this logical sync round. */
+  transportResetPending = false;
   /** 连接恢复后唤醒已准备快照的回调，不得创建新的扫描会话 */
   resumePendingSync?: () => void;
   /** 用户通过 ribbon 手动触发的待执行同步类型（断开时暂存，重连成功后执行）

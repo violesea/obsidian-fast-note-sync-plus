@@ -57,7 +57,7 @@ function makeModule() {
           isLargeBinarySyncRisk: () => false,
           describeBinarySyncLimit: () => "limit",
           logMemorySnapshot: () => undefined,
-          debounce: (fn) => fn,
+          debounce: () => () => undefined,
           LocalStateFileMirror: FakeMirror,
         };
       }
@@ -78,7 +78,7 @@ function makeModule() {
   return module.exports.FileHashManager;
 }
 
-const files = Array.from({ length: 60 }, (_, index) => ({
+const files = Array.from({ length: 5100 }, (_, index) => ({
   path: "notes/" + index + ".md",
   extension: "md",
   stat: { mtime: index + 1, size: 10, ctime: index + 1 },
@@ -88,6 +88,7 @@ const localStorage = new Map();
 const mirroredFiles = new Map();
 let hashCalls = 0;
 let shouldInterrupt = true;
+let hashMapSaveCalls = 0;
 
 function makePlugin() {
   return {
@@ -105,6 +106,7 @@ function makePlugin() {
       },
       loadLocalStorage: (key) => localStorage.get(key) ?? null,
       saveLocalStorage: (key, value) => {
+        if (key === "fns-fileHashMap") hashMapSaveCalls++;
         if (value === null || value === undefined) localStorage.delete(key);
         else localStorage.set(key, String(value));
       },
@@ -114,8 +116,8 @@ function makePlugin() {
 
 // Contract: if the process disappears after a checkpoint, restarting reuses
 // completed metadata entries and hashes only the unfinished suffix.
-// Re-evaluate with a window that interrupts exactly at the first 50-entry
-// progress yield, after the checkpoint has already been persisted.
+// Re-evaluate with a window that interrupts exactly at the first 5000-entry
+// checkpoint, after the checkpoint has already been persisted.
 // The first module above is non-interrupting, so run the actual interruption in
 // a dedicated evaluation context.
 const interruptedSource = transpiled;
@@ -132,7 +134,7 @@ vm.runInNewContext(interruptedSource, {
         isLargeBinarySyncRisk: () => false,
         describeBinarySyncLimit: () => "limit",
         logMemorySnapshot: () => undefined,
-        debounce: (fn) => fn,
+        debounce: () => () => undefined,
         LocalStateFileMirror: FakeMirror,
       };
     }
@@ -144,7 +146,7 @@ vm.runInNewContext(interruptedSource, {
   console,
   window: {
     setTimeout(callback) {
-      if (shouldInterrupt) {
+      if (shouldInterrupt && hashCalls >= 5000) {
         shouldInterrupt = false;
         throw new Error("simulated iOS process termination");
       }
@@ -157,20 +159,30 @@ vm.runInNewContext(interruptedSource, {
 const InterruptedFileHashManager = interruptedModule.exports.FileHashManager;
 const interruptedManager = new InterruptedFileHashManager(makePlugin());
 await assert.rejects(() => interruptedManager.initialize(), /simulated iOS process termination/);
-assert.equal(hashCalls, 50);
+assert.equal(hashCalls, 5000);
 assert.equal(JSON.parse(localStorage.get("fns-fileHashBuildState")).phase, "building");
 
 const ReloadedFileHashManager = makeModule();
 const resumed = new ReloadedFileHashManager(makePlugin());
 await resumed.initialize();
-assert.equal(hashCalls, 60);
+assert.equal(hashCalls, 5100);
 assert.equal(resumed.getBuildStats().phase, "ready");
-assert.equal(resumed.getBuildStats().cacheHits, 50);
+assert.equal(resumed.getBuildStats().cacheHits, 5000);
+
+// Contract: bulk scan updates do not synchronously serialize the complete
+// hash map; an explicit flush still persists the latest local cache.
+const savesBeforeBulk = hashMapSaveCalls;
+resumed.bulkSetFromScanned(new Map([["notes/checkpoint.md", { hash: "checkpoint", mtime: 98, size: 9 }]]), false);
+assert.equal(hashMapSaveCalls, savesBeforeBulk, "中间扫描 checkpoint 不应触发完整哈希表落盘");
+assert.equal(resumed.getValidHash("notes/checkpoint.md", 98, 9), "checkpoint");
+resumed.bulkSetFromScanned(new Map([["notes/0.md", { hash: "old", mtime: 99, size: 10 }]]));
+resumed.bulkSetFromScanned(new Map([["notes/0.md", { hash: "new", mtime: 99, size: 11, ctime: 7 }]]));
+assert.equal(hashMapSaveCalls, savesBeforeBulk);
+resumed.flush();
+assert.equal(hashMapSaveCalls, savesBeforeBulk + 1);
 
 // Contract: a same-mtime rewrite with a different size/hash must replace the
 // cache entry; timestamp equality alone is not a valid change detector.
-resumed.bulkSetFromScanned(new Map([["notes/0.md", { hash: "old", mtime: 99, size: 10 }]]));
-resumed.bulkSetFromScanned(new Map([["notes/0.md", { hash: "new", mtime: 99, size: 11, ctime: 7 }]]));
 assert.equal(resumed.getValidHash("notes/0.md", 99, 11, 7), "new");
 assert.equal(resumed.getValidHash("notes/0.md", 99, 11, 8), null, "ctime 变化时不能误用旧缓存");
 

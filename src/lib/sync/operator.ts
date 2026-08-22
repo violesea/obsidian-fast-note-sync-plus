@@ -1,6 +1,6 @@
 import { TFolder, TFile, normalizePath } from "obsidian";
 
-import { receiveFileUpload, receiveFileSyncUpdate, receiveFileSyncDelete, receiveFileSyncMtime, receiveFileSyncChunkDownload, receiveFileSyncEnd, checkAndUploadAttachments, receiveFileSyncRename, receiveFileRenameAck, receiveFileUploadAck, receiveFileDeleteAck, isPluginUnloading } from "./operator_file";
+import { receiveFileUpload, receiveFileSyncUpdate, receiveFileSyncDelete, receiveFileSyncMtime, receiveFileSyncChunkDownload, receiveFileSyncEnd, checkAndUploadAttachments, receiveFileSyncRename, receiveFileRenameAck, receiveFileUploadAck, receiveFileDeleteAck, isPluginUnloading, clearUploadQueue, resetFileDownloadSessions } from "./operator_file";
 import { hashContent, hashContentAsync, dump, isPathExcluded, isFolderSyncPathExcluded, configIsPathExcluded, getConfigSyncCustomDirs, generateUUID, showSyncNotice, isLargeBinarySyncRisk, describeBinarySyncLimit, hashFileAsync, formatFileSize, yieldToMain, getPluginDir, sleep } from "../utils/helpers";
 import { receiveConfigSyncModify, receiveConfigUpload, receiveConfigSyncMtime, receiveConfigSyncDelete, receiveConfigSyncEnd, configAllPaths, receiveConfigSyncClear, receiveConfigModifyAck, receiveConfigDeleteAck } from "./operator_config";
 import { receiveNoteSyncModify, receiveNoteUpload, receiveNoteSyncMtime, receiveNoteSyncDelete, receiveNoteSyncEnd, receiveNoteSyncRename, receiveNoteModifyAck, receiveNoteRenameAck, receiveNoteDeleteAck } from "./operator_note";
@@ -15,6 +15,7 @@ import { SyncType } from "./sync_progress_tracker";
 import { ConfirmModal } from "../../views/confirm-modal";
 import { incrementalEntryKey, mergeDirtyEntries } from "./incremental_scan_manager";
 import type { DirtyEntry, DirtySnapshot } from "./incremental_scan_manager";
+import { getPostSendSyncPhase } from "./sync_state";
 
 // C9: 离线超墓碑期保护 — 默认与服务端 soft-delete-retention-time 默认值对应（90 天），
 // 先硬编码常量；服务端墓碑物理清除窗口过后，长期离线设备重连若检测到"本地有服务端无"的
@@ -69,6 +70,12 @@ interface ScanStats {
   cacheHits: number;
   dirtyJournalEntries: number;
 }
+
+// Progress rendering remains frequent, but complete hash-map serialization is
+// intentionally coarse-grained because a large vault can make each write block
+// the Obsidian renderer for a noticeable interval.
+const SCAN_CHECKPOINT_ENTRY_INTERVAL = 2000;
+const SCAN_CHECKPOINT_INTERVAL_MS = 2000;
 
 const collectIncrementalEntries = (plugin: FastSync, snapshot: DirtySnapshot): DirtyEntry[] => {
   const supplementalEntries: DirtyEntry[] = [];
@@ -938,11 +945,12 @@ export const handleSync = async function (plugin: FastSync, isLoadLastTime: bool
   // Claim the logical round before the first await. Mobile reconnects can
   // arrive while the conflict-directory cleanup is still in flight; a late
   // transport callback must see this context and cannot clear ownership.
-  const context = generateUUID();
+  let context = generateUUID();
   if (!plugin.syncState.tryBeginSync(context)) {
     dump("Sync already in progress, skipping");
     return;
   }
+  plugin.syncState.transportResetPending = false;
   plugin.beginSyncContext(context);
   dump(`Sync context generated: ${context}`);
   // These caches belong to this logical round. They must survive a transport
@@ -1182,14 +1190,20 @@ export const handleSync = async function (plugin: FastSync, isLoadLastTime: bool
         }
       };
 
-      const persistScanCheckpoint = async (): Promise<void> => {
+      const commitScanCheckpoint = async (): Promise<void> => {
         if (hashInFlight.size > 0) {
           await Promise.all(Array.from(hashInFlight));
         }
-        commitScannedHashes(plugin.scannedNoteHashes, (entries) => plugin.fileHashManager.bulkSetFromScanned(entries));
-        commitScannedHashes(plugin.scannedFileHashes, (entries) => plugin.fileHashManager.bulkSetFromScanned(entries));
-        plugin.fileHashManager.flush();
+        // Commit intermediate results in memory only.  A full hash-map flush
+        // here serializes the complete vault every checkpoint and can make the
+        // mobile renderer appear hung.  The final scan commit below performs
+        // the single durable flush for this prepared sync snapshot.
+        commitScannedHashes(plugin.scannedNoteHashes, (entries) => plugin.fileHashManager.bulkSetFromScanned(entries, false));
+        commitScannedHashes(plugin.scannedFileHashes, (entries) => plugin.fileHashManager.bulkSetFromScanned(entries, false));
       };
+
+      let lastScanCheckpointProcessed = 0;
+      let lastScanCheckpointAt = Date.now();
 
       for (const file of list) {
         if (++processedCount % 20 === 0) {
@@ -1214,7 +1228,6 @@ export const handleSync = async function (plugin: FastSync, isLoadLastTime: bool
           const pct = Math.floor((processedCount / totalToProcess) * 100);
           plugin.progressTracker.recordHashProgress(pct);
           if (processedCount % 100 === 0) {
-            await persistScanCheckpoint();
             SyncLogManager.getInstance().addOrUpdateLog({
               id: hashingLogId,
               type: 'info',
@@ -1223,6 +1236,12 @@ export const handleSync = async function (plugin: FastSync, isLoadLastTime: bool
               progress: pct,
               message: `${plugin.currentSyncType === 'full' ? '🔍 正在全量扫描' : '🔍 正在增量扫描'}... (${processedCount}/${totalFiles})`
             });
+          }
+          if (processedCount - lastScanCheckpointProcessed >= SCAN_CHECKPOINT_ENTRY_INTERVAL
+            || Date.now() - lastScanCheckpointAt >= SCAN_CHECKPOINT_INTERVAL_MS) {
+            await commitScanCheckpoint();
+            lastScanCheckpointProcessed = processedCount;
+            lastScanCheckpointAt = Date.now();
           }
         }
 
@@ -1396,6 +1415,7 @@ export const handleSync = async function (plugin: FastSync, isLoadLastTime: bool
       // Persist any newly computed hashes (breaks the Catch-22)
       commitScannedHashes(plugin.scannedNoteHashes, (entries) => plugin.fileHashManager.bulkSetFromScanned(entries));
       commitScannedHashes(plugin.scannedFileHashes, (entries) => plugin.fileHashManager.bulkSetFromScanned(entries));
+      plugin.fileHashManager.flush();
       dump(`[ScanPerf] Scan done: ${hashComputeCount}/${MAX_HASH_PER_CYCLE} hashes computed, notes=${notes.length}, files=${files.length}, folders=${folders.length}`);
 
       // 检测被删除的文件 (对比哈希表和本地 Vault)
@@ -1480,12 +1500,12 @@ export const handleSync = async function (plugin: FastSync, isLoadLastTime: bool
     // 获取已处理的基础文件数，用于连续进度条
     const baseProcessedCount = plugin.settings.syncEnabled && !fastIncremental ? scannedVaultEntryCount : 0;
     const overallTotal = baseProcessedCount + totalConfigs;
+    let lastConfigCheckpointCount = 0;
+    let lastConfigCheckpointAt = Date.now();
 
     for (const path of configPaths) {
       if (++configCount % 20 === 0) { // 已将 50 优化为 20
         await sleep(0);
-        commitScannedHashes(plugin.scannedConfigHashes, (entries) => plugin.configHashManager.bulkSetFromScanned(entries));
-        plugin.configHashManager.flush();
         if (isPluginUnloading) {
           plugin.incrementalScanManager?.abortSync();
           plugin.syncState.clearScannedHashCaches();
@@ -1511,6 +1531,13 @@ export const handleSync = async function (plugin: FastSync, isLoadLastTime: bool
           progress: pct,
           message: `${plugin.currentSyncType === 'full' ? '⚙️ 正在全量扫描配置' : '⚙️ 正在增量扫描配置'}... (${configCount}/${totalConfigs})`
         });
+        if (configCount - lastConfigCheckpointCount >= SCAN_CHECKPOINT_ENTRY_INTERVAL
+          || Date.now() - lastConfigCheckpointAt >= SCAN_CHECKPOINT_INTERVAL_MS) {
+          commitScannedHashes(plugin.scannedConfigHashes, (entries) => plugin.configHashManager.bulkSetFromScanned(entries));
+          plugin.configHashManager.flush();
+          lastConfigCheckpointCount = configCount;
+          lastConfigCheckpointAt = Date.now();
+        }
       }
 
       try {
@@ -1580,6 +1607,11 @@ export const handleSync = async function (plugin: FastSync, isLoadLastTime: bool
         dump(`Error processing config file ${path}:`, e);
       }
     }
+
+    // Persist the final partial checkpoint as well; relying on SyncEnd would
+    // lose the local cache when the transport dies after scanning.
+    commitScannedHashes(plugin.scannedConfigHashes, (entries) => plugin.configHashManager.bulkSetFromScanned(entries));
+    plugin.configHashManager.flush();
 
     // 加入 LocalStorage 同步项
     if (plugin.settings.configSyncEnabled && shouldSyncConfigs) {
@@ -1684,8 +1716,22 @@ export const handleSync = async function (plugin: FastSync, isLoadLastTime: bool
     plugin.isSyncRequesting = true;
 
     const resetTransportAttempt = () => {
+      clearUploadQueue(plugin);
+      resetFileDownloadSessions(plugin);
       plugin.resetSyncTasks();
       plugin.syncPageStateMap.clear();
+      plugin.syncState.pendingNotePushPageIndex.clear();
+      plugin.syncState.pendingFilePushPageIndex.clear();
+      plugin.syncState.pendingConfigPushPageIndex.clear();
+      plugin.pendingNoteDeleteAcks.clear();
+      plugin.pendingFileDeleteAcks.clear();
+      plugin.pendingConfigDeleteAcks.clear();
+      plugin.pendingDeleteNotePaths.clear();
+      plugin.pendingDeleteFilePaths.clear();
+      plugin.pendingDeleteFolderPaths.clear();
+      plugin.pendingDeleteConfigPaths.clear();
+      plugin.pendingFileRenames = [];
+      plugin.pendingNoteRenames = new Map();
       plugin.progressTracker.reset(activeTypes);
       plugin.totalFilesToDownload = 0;
       plugin.downloadedFilesCount = 0;
@@ -1695,36 +1741,28 @@ export const handleSync = async function (plugin: FastSync, isLoadLastTime: bool
       plugin.uploadedChunksCount = 0;
     };
 
-    try {
-      // The snapshot is immutable for this logical round.  If the transport
-      // drops while batches are being sent, wait for auth and retry these
-      // already prepared arrays; never call handleSync/startupSync again.
-      while (plugin.syncState.activeSyncContext === context) {
-        if (!await waitForSyncConnection(plugin, context)) return;
-        plugin.syncState.syncPhase = "sending";
-        try {
-          await handleRequestSend(plugin, syncMode, noteData, fileData, configData, folderData);
-          break;
-        } catch (error) {
-          if (!(error instanceof SyncTransportError)) throw error;
-          dump(`[SyncSession] send interrupted for context=${context}; preserving scan snapshot and waiting for reconnect`);
-          resetTransportAttempt();
-          plugin.syncState.syncPhase = "waiting-connection";
-        }
-      }
-    } finally {
-      plugin.isSyncRequesting = false;
-    }
+    const rotateTransportContext = (): void => {
+      const previousContext = context;
+      context = generateUUID();
+      plugin.syncState.activeSyncContext = context;
+      plugin.syncState.transportResetPending = false;
+      plugin.beginSyncContext(context);
+      noteData.context = context;
+      fileData.context = context;
+      configData.context = context;
+      folderData.context = context;
+      dump(`[SyncSession] rotated transport context ${previousContext} -> ${context}`);
+    };
 
-    if (plugin.syncState.activeSyncContext !== context) return;
-    plugin.syncState.syncPhase = "monitoring";
-
-    // Once the initial request set is out, a later transport close can happen
-    // before SyncEnd arrives.  Keep the prepared snapshot reachable so the
-    // authenticated reconnect retries the send phase without scanning again.
+    let initialSendInFlight = true;
     let resumeInFlight = false;
     const resumePreparedSync = () => {
-      if (resumeInFlight || plugin.syncState.activeSyncContext !== context || plugin.syncState.syncPhase !== "waiting-connection") {
+      // The initial send loop owns retries while the first request set is in
+      // flight.  A reconnect callback must not start a competing send loop.
+      if (initialSendInFlight
+        || resumeInFlight
+        || plugin.syncState.activeSyncContext !== context
+        || plugin.syncState.syncPhase !== "waiting-connection") {
         return;
       }
       resumeInFlight = true;
@@ -1732,10 +1770,19 @@ export const handleSync = async function (plugin: FastSync, isLoadLastTime: bool
       void (async () => {
         try {
           if (!await waitForSyncConnection(plugin, context)) return;
+          // A service restart invalidates all server-side page/session state.
+          // Keep the prepared local snapshot, but bind its retry to a fresh
+          // context so no old page ACK or download session can be reused.
+          rotateTransportContext();
           resetTransportAttempt();
           plugin.syncState.syncPhase = "sending";
           await handleRequestSend(plugin, syncMode, noteData, fileData, configData, folderData);
-          plugin.syncState.syncPhase = "monitoring";
+          if (plugin.syncState.activeSyncContext === context) {
+            plugin.syncState.syncPhase = getPostSendSyncPhase(
+              plugin.syncState.transportResetPending,
+              isSyncConnectionReady(plugin),
+            );
+          }
         } catch (error) {
           if (error instanceof SyncTransportError) {
             plugin.syncState.syncPhase = "waiting-connection";
@@ -1755,7 +1802,45 @@ export const handleSync = async function (plugin: FastSync, isLoadLastTime: bool
         }
       })();
     };
+
+    // Install the wake-up callback before the first request set is sent.  A
+    // close between the final send await and the old late registration point
+    // must leave the session resumable after authentication.
     plugin.syncState.resumePendingSync = resumePreparedSync;
+
+    try {
+      // The snapshot is immutable for this logical round.  If the transport
+      // drops while batches are being sent, wait for auth and retry these
+      // already prepared arrays; never call handleSync/startupSync again.
+      while (plugin.syncState.activeSyncContext === context) {
+        if (!await waitForSyncConnection(plugin, context)) return;
+        if (plugin.syncState.transportResetPending) {
+          dump(`[SyncSession] rotating context before first resend after transport close`);
+          rotateTransportContext();
+          resetTransportAttempt();
+        }
+        plugin.syncState.syncPhase = "sending";
+        try {
+          await handleRequestSend(plugin, syncMode, noteData, fileData, configData, folderData);
+          break;
+        } catch (error) {
+          if (!(error instanceof SyncTransportError)) throw error;
+          dump(`[SyncSession] send interrupted for context=${context}; preserving scan snapshot and waiting for reconnect`);
+          rotateTransportContext();
+          resetTransportAttempt();
+          plugin.syncState.syncPhase = "waiting-connection";
+        }
+      }
+    } finally {
+      initialSendInFlight = false;
+      plugin.isSyncRequesting = false;
+    }
+
+    if (plugin.syncState.activeSyncContext !== context) return;
+    plugin.syncState.syncPhase = getPostSendSyncPhase(
+      plugin.syncState.transportResetPending,
+      isSyncConnectionReady(plugin),
+    );
 
     // 启动进度检测循环,每 100ms 检测一次(更频繁以获得更平滑的进度更新)
     // 同时记录开始时间，用于超时保底
@@ -1799,6 +1884,7 @@ export const handleSync = async function (plugin: FastSync, isLoadLastTime: bool
  * Cancel the current sync and reset all runtime states.
  */
 export function cancelSync(plugin: FastSync): void {
+  clearUploadQueue(plugin);
   plugin.incrementalScanManager?.abortSync();
   plugin.syncState.clearScannedHashCaches();
   if (plugin.syncState.progressCheckIntervalId !== null) {

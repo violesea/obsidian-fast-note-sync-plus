@@ -295,7 +295,7 @@ export class ConfigHashManager {
                 changed = true;
             }
         }
-        if (changed) this.saveToStorage();
+        if (changed) this.scheduleSave();
     }
 
 

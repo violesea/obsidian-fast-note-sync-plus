@@ -1,6 +1,6 @@
 import { moment, Platform, normalizePath } from "obsidian";
 
-import { handleFileChunkDownload, BINARY_PREFIX_FILE_SYNC, clearUploadQueue, receiveFileUploadSessionNotFound } from "./operator_file";
+import { handleFileChunkDownload, BINARY_PREFIX_FILE_SYNC, clearUploadQueue, resetFileDownloadSessions, receiveFileUploadSessionNotFound } from "./operator_file";
 import { dump, dumpError, addRandomParam, showSyncNotice, safeStringify, getPluginDir, hashContent } from "../utils/helpers";
 import { enSendDTOToProtobuf, deReceivePacket } from "../../pb/protobuf_mapper";
 import { receiveOperators, handleSync, cancelSync, settleAllBatchSendSessionsOnClose } from "./operator";
@@ -187,6 +187,7 @@ export class WebSocketManager {
         if (this.plugin.syncState.activeSyncContext) {
           const previousPhase = this.plugin.syncState.syncPhase;
           this.plugin.syncState.syncPhase = "waiting-connection";
+          this.plugin.syncState.transportResetPending = true;
           // Page ACKs and page metadata belong to the old physical socket.
           // Keep the prepared scan snapshot, but never flush those ACKs into a
           // replacement socket before it has created fresh server-side pages.
@@ -198,7 +199,8 @@ export class WebSocketManager {
           this.plugin.isSyncing = false;
           this.plugin.isSyncRequesting = false;
         }
-        clearUploadQueue();
+        clearUploadQueue(this.plugin);
+        resetFileDownloadSessions(this.plugin);
         this.plugin.concurrencyLimiter.clear();
         // 断线：清空所有在途上行批发送窗口会话的重传 timer（设计稿 §3.2 异常路径表）；
         // W==0/旧路径下没有会话注册，no-op
