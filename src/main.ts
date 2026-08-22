@@ -28,6 +28,8 @@ import { HttpApiService } from "./lib/api/http_api_service";
 import { SyncState } from "./lib/sync/sync_state";
 import { RuntimeConfig } from "./lib/sync/runtime_config";
 import { IncrementalScanManager } from "./lib/sync/incremental_scan_manager";
+import { loadOrCreateDeviceId } from "./lib/sync/device_identity";
+import { ChangeFeedCursorStore, buildChangeFeedClient } from "./lib/sync/change_feed";
 import { $ } from "./i18n/lang";
 import { SsoImportModal } from "./views/sso-import-modal";
 import { StatusBarManager } from "./lib/ui/status_bar_manager";
@@ -76,6 +78,8 @@ export default class FastSync extends Plugin {
   configHashManager: ConfigHashManager            // 配置哈希管理器
   localStorageManager: LocalStorageManager        // 本地存储管理器
   incrementalScanManager: IncrementalScanManager  // 断线增量扫描状态
+  changeFeedDeviceId: string | null = null        // FNS v2 设备身份（INV-6，UUIDv4，永不由设备名推导）
+  changeFeedCursor: ChangeFeedCursorStore | null = null  // FNS v2 变更流游标（localStorage + 镜像双持久化）
   fileCloudPreview: FileCloudPreview              // 云端文件预览管理器
   folderSnapshotManager: FolderSnapshotManager    // 文件夹快照管理器
   statusBarManager: StatusBarManager              // 状态栏管理器
@@ -598,6 +602,32 @@ export default class FastSync extends Plugin {
       // server baseline remains a separate state and is advanced only after a
       // full sync genuinely reaches completion.
       this.incrementalScanManager.markLocalBaselineReady()
+
+      // FNS v2 变更流：设备身份与游标存储初始化（INV-6）；失败不阻断启动，
+      // 变更流门在身份缺失时自动回落 v1 路径
+      try {
+        this.changeFeedDeviceId = await loadOrCreateDeviceId(this)
+        this.changeFeedCursor = new ChangeFeedCursorStore(this)
+        await this.changeFeedCursor.initialize()
+        if (this.settings.changeFeedEnabled && (this.settings.sidecarUrl ?? "").trim() !== "") {
+          const cfClient = buildChangeFeedClient(this)
+          if (cfClient && this.changeFeedDeviceId) {
+            const platform = Platform.isIosApp ? (Platform.isTablet ? "ipados" : "ios")
+              : Platform.isAndroidApp ? "android"
+              : Platform.isDesktopApp ? "desktop" : "web"
+            void cfClient.register(
+              this.changeFeedDeviceId,
+              this.settings.vault,
+              this.getClientName(),
+              platform,
+              this.manifest.version ?? "",
+            ).then((r) => dump(`[ChangeFeed] registered device_id=${this.changeFeedDeviceId} cursor_rev=${r.cursor_rev} safe_rev=${r.safe_rev}`))
+              .catch((e) => dump(`[ChangeFeed] register failed (non-fatal): ${e instanceof Error ? e.message : String(e)}`))
+          }
+        }
+      } catch (e) {
+        dump("[ChangeFeed] identity init failed (non-fatal):", e)
+      }
 
       // 崩溃恢复：按路径检查持久化 pending Map，避免启动时再次枚举整个 Vault
       // Crash recovery: validate persisted pending Maps by path instead of enumerating the whole Vault

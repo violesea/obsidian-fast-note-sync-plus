@@ -16,6 +16,8 @@ import { ConfirmModal } from "../../views/confirm-modal";
 import { incrementalEntryKey, mergeDirtyEntries } from "./incremental_scan_manager";
 import type { DirtyEntry, DirtySnapshot } from "./incremental_scan_manager";
 import { getPostSendSyncPhase } from "./sync_state";
+import { planChangeFeedRound, changeFeedDecisionInput, runChangeFeedCatchUp } from "./change_feed";
+import type { CatchUpResult as ChangeFeedCatchUpResult } from "./change_feed";
 
 // C9: 离线超墓碑期保护 — 默认与服务端 soft-delete-retention-time 默认值对应（90 天），
 // 先硬编码常量；服务端墓碑物理清除窗口过后，长期离线设备重连若检测到"本地有服务端无"的
@@ -1008,6 +1010,28 @@ export const handleSync = async function (plugin: FastSync, isLoadLastTime: bool
       dump("Read-only mode: Proceeding with state gathering for remote-to-local sync.");
     }
 
+    // ─── FNS v2 变更流门（M2）：连接就绪后先按游标追平，成功则本轮强制增量路径 ───
+    // 追平失败（sidecar 不可达/409 过期/未配置）一律回落 v1 原路径，绝不阻塞常规同步。
+    let changeFeedResult: ChangeFeedCatchUpResult | null = null;
+    if (plugin.settings.changeFeedEnabled && plugin.settings.syncEnabled && syncMode === "auto") {
+      const plan = planChangeFeedRound(changeFeedDecisionInput(plugin, syncMode));
+      if (plan === "adopt" || plan === "poll") {
+        changeFeedResult = await runChangeFeedCatchUp(plugin);
+        if (!changeFeedResult.ok) {
+          dump(`[ChangeFeed] catch-up failed (${changeFeedResult.reason}); falling back to v1 path this round`);
+        } else {
+          dump(`[ChangeFeed] mode=${changeFeedResult.mode} cursor ${changeFeedResult.cursorFrom}->${changeFeedResult.cursorTo} fetched=${changeFeedResult.fetched} deleted=${changeFeedResult.deleted} skipped=${changeFeedResult.skipped}`);
+        }
+      }
+    }
+    if (changeFeedResult?.ok) {
+      // 变更流轮次（D-101/D-106）：跳过全量枚举、元数据对账与文件夹快照重通告；
+      // 上传仍走 dirty journal 增量路径；基线推进与完成判定复用 v1 机制不变
+      fastIncremental = true;
+      metadataReconciliation = false;
+      isLoadLastTime = true;
+    }
+
     plugin.currentSyncType = fastIncremental ? 'incremental' : 'full';
     plugin.syncTypeCompleteCount = 0;
     plugin.resetSyncTasks();
@@ -1028,7 +1052,8 @@ export const handleSync = async function (plugin: FastSync, isLoadLastTime: bool
       cacheHits: 0,
       dirtyJournalEntries: fastIncremental ? incrementalEntries.length : dirtySnapshot?.entries.length ?? 0,
     };
-    const scanMode = fastIncremental ? "incremental" : metadataReconciliation ? "metadata-reconcile" : "full";
+    let scanMode = fastIncremental ? "incremental" : metadataReconciliation ? "metadata-reconcile" : "full";
+    if (changeFeedResult?.ok) scanMode = "change-feed";
 
     const shouldSyncNotes = syncMode === "auto" || syncMode === "note";
     const shouldSyncConfigs = syncMode === "auto" || syncMode === "config";
@@ -1695,6 +1720,14 @@ export const handleSync = async function (plugin: FastSync, isLoadLastTime: bool
         dirtyJournalEntries: scanStats.dirtyJournalEntries,
         pendingJournalEntries: plugin.incrementalScanManager?.getPendingCount() ?? 0,
         baselineGeneration: buildStats.generation,
+        // 变更流轮次（A-4 验收）：enumeratedEntries 必须为 0，游标区间可与服务端 sync_log 对账
+        ...(changeFeedResult?.ok ? {
+          changesRequested: changeFeedResult.fetched ?? 0,
+          changesDeleted: changeFeedResult.deleted ?? 0,
+          changesSkipped: changeFeedResult.skipped ?? 0,
+          cursorFrom: changeFeedResult.cursorFrom,
+          cursorTo: changeFeedResult.cursorTo,
+        } : {}),
       };
       dump(`[SyncTelemetry] ${JSON.stringify(telemetry)}`);
       SyncLogManager.getInstance().addOrUpdateLog({

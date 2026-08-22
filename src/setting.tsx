@@ -62,6 +62,12 @@ export interface PluginSettings {
   manualSyncEnabled: boolean
   /** 是否启用只读同步模式（不上传本地修改） */
   readonlySyncEnabled: boolean
+  /** FNS v2 变更流：启用后常规轮次按游标拉增量，跳过全量枚举（默认关闭，回滚=关闭重启） */
+  changeFeedEnabled: boolean
+  /** 变更流挎斗服务地址（fns-sidecar，如 http://127.0.0.1:9100） */
+  sidecarUrl: string
+  /** 挎斗服务令牌（X-Sidecar-Token） */
+  sidecarToken: string
   /** 远程服务调试地址（多行） */
   debugRemoteUrls: string
   /** 是否在菜单中显示版本信息 */
@@ -148,6 +154,9 @@ export const DEFAULT_SETTINGS: PluginSettings = {
   isShowNotice: true,
   manualSyncEnabled: false,
   readonlySyncEnabled: false,
+  changeFeedEnabled: false,
+  sidecarUrl: "",
+  sidecarToken: "",
   debugRemoteUrls: "",
   showVersionInfo: false,
   configSyncOtherDirs: "",
@@ -1393,6 +1402,62 @@ export class SettingTab extends PluginSettingTab {
       set.lastElementChild as HTMLElement,
       $("setting.remote.client_name_desc") + "\n*(隐私提示：若不配置将默认回退为操作系统通用标识，如需自定义建议使用不包含您真实全名或设备隐私特征的代号)*"
     )
+
+    // ─── FNS v2 变更流（change-feed）：默认关闭，关闭后重启即回 v1 路径 ───
+    new Setting(set).setName($("setting.remote.change_feed") || "变更流同步（v2 实验性）").setClass("fns-setting-item-checkbox").addToggle((toggle) =>
+      toggle.setValue(this.plugin.settings.changeFeedEnabled).onChange(async (value) => {
+        this.plugin.settings.changeFeedEnabled = value
+        await this.plugin.saveSettings()
+        if (value) {
+          showSyncNotice($("setting.remote.change_feed_enabled_notice") || "已启用变更流：重启 Obsidian 后生效；关闭并重启即可回滚")
+        }
+      }),
+    )
+    this.setDescWithBreaks(
+      set.lastElementChild as HTMLElement,
+      $("setting.remote.change_feed_desc") || "启用后常规同步按游标只拉增量（跳过全库枚举与文件夹通告）。首次启用需本地与服务端基线就绪，之后新设备/游标过期会自动回落一次全量对账。"
+    )
+
+    if (this.plugin.settings.changeFeedEnabled) {
+      new Setting(set).setName($("setting.remote.sidecar_url") || "挎斗服务地址").addText((text) =>
+        text
+          .setPlaceholder("http://127.0.0.1:9100")
+          .setValue(this.plugin.settings.sidecarUrl || "")
+          .onChange(async (value) => {
+            this.plugin.settings.sidecarUrl = value.trim()
+            await this.plugin.saveSettings()
+          }),
+      )
+      this.setDescWithBreaks(
+        set.lastElementChild as HTMLElement,
+        $("setting.remote.sidecar_url_desc") || "fns-sidecar 只读变更流服务的地址；留空则禁用变更流。"
+      )
+
+      new Setting(set).setName($("setting.remote.sidecar_token") || "挎斗服务令牌").addText((text) =>
+        text
+          .setPlaceholder("X-Sidecar-Token")
+          .setValue(this.plugin.settings.sidecarToken || "")
+          .onChange(async (value) => {
+            this.plugin.settings.sidecarToken = value.trim()
+            await this.plugin.saveSettings()
+          }),
+      )
+      this.setDescWithBreaks(
+        set.lastElementChild as HTMLElement,
+        $("setting.remote.sidecar_token_desc") || "挎斗服务的访问令牌；仅本机回环部署可留空。"
+      )
+
+      new Setting(set).setName($("setting.remote.device_id") || "设备标识（deviceId）").addText((text) => {
+        text
+          .setPlaceholder("-")
+          .setValue(this.plugin.changeFeedDeviceId ?? ($("setting.remote.device_id_pending") || ""))
+          .setDisabled(true)
+      })
+      this.setDescWithBreaks(
+        set.lastElementChild as HTMLElement,
+        $("setting.remote.device_id_desc") || "安装时生成的 UUID，与设备名解耦、永不变更；用于服务端记忆每台设备的同步游标。"
+      )
+    }
   }
 
   private renderShortcutSettings(set: HTMLElement) {
