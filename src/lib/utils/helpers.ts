@@ -322,6 +322,11 @@ export const configIsPathExcluded = function (relativePath: string, plugin: Fast
     normalizedPath === `${pluginSelfDir}/fileHashMap.json` ||
     normalizedPath === `${pluginSelfDir}/syncHashMap.json` ||
     normalizedPath === `${pluginSelfDir}/folderSnapshot.json` ||
+    normalizedPath === `${pluginSelfDir}/data.json` ||
+    normalizedPath === `${pluginSelfDir}/deviceId.json` ||
+    normalizedPath === `${pluginSelfDir}/changeFeedCursor.json` ||
+    normalizedPath === `${pluginSelfDir}/incrementalScanState.json` ||
+    normalizedPath === `${pluginSelfDir}/syncMetadata.json` ||
     normalizedPath === `${pluginSelfDir}/conflict-notes` ||
     normalizedPath.startsWith(`${pluginSelfDir}/conflict-notes/`)
   ) {

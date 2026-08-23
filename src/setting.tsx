@@ -15,6 +15,7 @@ import { RuleEditor } from "./views/rule-editor";
 import { $ } from "./i18n/lang";
 import FastSync from "./main";
 import { updateVaultName } from "./lib/settings/vault_name";
+import { saveDeviceDisplayName } from "./lib/sync/device_identity";
 
 
 export interface PluginSettings {
@@ -1396,6 +1397,10 @@ export class SettingTab extends PluginSettingTab {
           if (trimmedValue != this.plugin.localStorageManager.getMetadata("clientName")) {
             this.plugin.localStorageManager.setMetadata("clientName", trimmedValue)
           }
+          // 2.5.2：显示名同时落 deviceId.json（per-device，不参与配置同步），
+          // getClientName 优先读它——修复 clientName 被配置同步舰队级拉平
+          await saveDeviceDisplayName(this.plugin, trimmedValue)
+          this.plugin.deviceDisplayName = trimmedValue !== "" ? trimmedValue : null
         }),
     )
     this.setDescWithBreaks(

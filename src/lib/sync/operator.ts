@@ -2298,6 +2298,18 @@ export const handleRequestSend = async function (plugin: FastSync, syncMode: Syn
   const shouldSyncNotes = syncMode === "auto" || syncMode === "note";
   const shouldSyncConfigs = syncMode === "auto" || syncMode === "config";
 
+  // 只读闸（2026-08-23 实测补洞）：readonly 此前只拦 receive*Upload（服务端请求上传），
+  // announce 路径无闸——只读设备在对账轮仍会把本地快照/missing 清单整体上报
+  // （实测一台 readonly 设备凌晨全量 announce 1100 条，ISSUE-016 的删除权缺口同源）。
+  // 清空数组但保留协议流程（空 announce 无害，SyncEnd 握手照常完成）。
+  if (plugin.settings.readonlySyncEnabled) {
+    noteData.notes = []; noteData.delNotes = []; noteData.missingNotes = [];
+    fileData.files = []; fileData.delFiles = []; fileData.missingFiles = [];
+    folderData.folders = []; folderData.delFolders = []; folderData.missingFolders = [];
+    configData.configs = []; configData.delConfigs = []; configData.missingConfigs = [];
+    dump("[ReadOnly] announce arrays cleared; read-only device reports nothing");
+  }
+
   const jobs: Promise<void>[] = [];
 
   if (plugin.settings.syncEnabled && shouldSyncNotes) {

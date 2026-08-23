@@ -80,6 +80,7 @@ export default class FastSync extends Plugin {
   incrementalScanManager: IncrementalScanManager  // 断线增量扫描状态
   changeFeedDeviceId: string | null = null        // FNS v2 设备身份（INV-6，UUIDv4，永不由设备名推导）
   changeFeedCursor: ChangeFeedCursorStore | null = null  // FNS v2 变更流游标（localStorage + 镜像双持久化）
+  deviceDisplayName: string | null = null         // 本机显示名（deviceId.json，不参与配置同步；空=回落 metadata）
   fileCloudPreview: FileCloudPreview              // 云端文件预览管理器
   folderSnapshotManager: FolderSnapshotManager    // 文件夹快照管理器
   statusBarManager: StatusBarManager              // 状态栏管理器
@@ -338,7 +339,9 @@ export default class FastSync extends Plugin {
     }
 
     const clientMetadata = (this.localStorageManager.getMetadata("clientName") as string) || "";
-    return clientMetadata + (clientMetadata !== "" && platformName !== "" ? " " + platformName : platformName);
+    // 2.5.2：per-device 显示名优先（deviceId.json，免疫配置同步拉平），metadata 仅作回落
+    const baseName = this.deviceDisplayName ?? clientMetadata;
+    return baseName + (baseName !== "" && platformName !== "" ? " " + platformName : platformName);
   }
 
   addIgnoredFile(path: string) {
@@ -606,7 +609,9 @@ export default class FastSync extends Plugin {
       // FNS v2 变更流：设备身份与游标存储初始化（INV-6）；失败不阻断启动，
       // 变更流门在身份缺失时自动回落 v1 路径
       try {
-        this.changeFeedDeviceId = await loadOrCreateDeviceId(this)
+        const identity = await loadOrCreateDeviceId(this)
+        this.changeFeedDeviceId = identity.deviceId
+        this.deviceDisplayName = identity.displayName
         this.changeFeedCursor = new ChangeFeedCursorStore(this)
         await this.changeFeedCursor.initialize()
         if (this.settings.changeFeedEnabled && (this.settings.sidecarUrl ?? "").trim() !== "") {
