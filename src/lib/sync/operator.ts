@@ -3,7 +3,7 @@ import { TFolder, TFile, normalizePath } from "obsidian";
 import { receiveFileUpload, receiveFileSyncUpdate, receiveFileSyncDelete, receiveFileSyncMtime, receiveFileSyncChunkDownload, receiveFileSyncEnd, checkAndUploadAttachments, receiveFileSyncRename, receiveFileRenameAck, receiveFileUploadAck, receiveFileDeleteAck, isPluginUnloading, clearUploadQueue, resetFileDownloadSessions } from "./operator_file";
 import { hashContent, hashContentAsync, dump, isPathExcluded, isFolderSyncPathExcluded, configIsPathExcluded, getConfigSyncCustomDirs, generateUUID, showSyncNotice, isLargeBinarySyncRisk, describeBinarySyncLimit, hashFileAsync, formatFileSize, yieldToMain, getPluginDir, sleep } from "../utils/helpers";
 import { receiveConfigSyncModify, receiveConfigUpload, receiveConfigSyncMtime, receiveConfigSyncDelete, receiveConfigSyncEnd, configAllPaths, receiveConfigSyncClear, receiveConfigModifyAck, receiveConfigDeleteAck } from "./operator_config";
-import { receiveNoteSyncModify, receiveNoteUpload, receiveNoteSyncMtime, receiveNoteSyncDelete, receiveNoteSyncEnd, receiveNoteSyncRename, receiveNoteModifyAck, receiveNoteRenameAck, receiveNoteDeleteAck } from "./operator_note";
+import { receiveNoteSyncModify, receiveNoteUpload, receiveNoteSyncMtime, receiveNoteSyncDelete, receiveNoteSyncEnd, receiveNoteSyncRename, receiveNoteModifyAck, receiveNoteRenameAck, receiveNoteDeleteAck, repairSuspiciousEmptyNotes } from "./operator_note";
 import { SyncMode, SnapFile, SnapFolder, SyncEndData, PathHashFile, NoteSyncData, FileSyncData, ConfigSyncData, FolderSyncData } from "../utils/types";
 import { receiveFolderSyncModify, receiveFolderSyncDelete, receiveFolderSyncRename, receiveFolderSyncEnd } from "./operator_folder";
 import { FileCloudPreview } from "../storage/file_cloud_preview";
@@ -902,10 +902,8 @@ async function receiveSyncEndWrapper(data: unknown, plugin: FastSync, type: "not
   if (type === "note") {
     plugin.fileHashManager.removeFileHashes(plugin.pendingDeleteNotePaths)
     plugin.pendingDeleteNotePaths.clear()
-    // 同步结束，提交本轮同步中可能产生的待确认上传 hash
-    plugin.fileHashManager.setFileHashes(plugin.pendingNoteModifies, (path) => plugin.app.vault.getFileByPath(path)?.stat)
-    plugin.pendingNoteModifies.clear()
-    plugin.localStorageManager.clearPending('pendingNoteModifies')
+    // SyncEnd does not prove that every NoteModify received its Ack. Keep
+    // pending hashes durable; only an explicit NoteModifyAck may retire them.
     // 同步结束，提交扫描阶段计算出的哈希 (Commit hashes calculated during scan)
     commitScannedHashes(plugin.scannedNoteHashes, (entries) => plugin.fileHashManager.bulkSetFromScanned(entries));
     // 同步结束，强制落盘本轮防抖累积的哈希写入
@@ -1132,6 +1130,10 @@ export const handleSync = async function (plugin: FastSync, isLoadLastTime: bool
       activeTypes.push('setting');
     }
     plugin.progressTracker.reset(activeTypes);
+    const repairedEmptyNotes = await repairSuspiciousEmptyNotes(plugin);
+    if (repairedEmptyNotes > 0) {
+      dump(`[FastSync] Repaired ${repairedEmptyNotes} suspicious empty note(s) before sync scan`);
+    }
     plugin.syncPageStateMap.clear(); // 开始新一轮同步，清空上一轮的页状态残留，防 Context 错乱 / Start new sync, clear stale page states
     plugin.totalFilesToDownload = 0;
     plugin.downloadedFilesCount = 0;
@@ -2032,8 +2034,9 @@ export function cancelSync(plugin: FastSync): void {
   plugin.syncState.pendingConfigPushPageIndex.clear();
   plugin.pendingConfigModifies.clear();
   plugin.localStorageManager.clearPending('pendingConfigModifies');
-  plugin.pendingNoteModifies.clear();
-  plugin.localStorageManager.clearPending('pendingNoteModifies');
+  // Keep pending note modifications durable across manual cancellation and
+  // transport recovery. Only NoteModifyAck or a superseding local delete may
+  // retire an entry.
   plugin.pendingUploadHashes.clear();
   plugin.localStorageManager.clearPending('pendingUploadHashes');
 

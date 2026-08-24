@@ -8,6 +8,47 @@ import { waitForForeground } from "./background_activity_gate";
 
 const waitForNoteActivity = async (plugin: FastSync): Promise<boolean> => waitForForeground(plugin);
 
+const EMPTY_NOTE_HASH = hashContent("");
+const MAX_EMPTY_NOTE_REPAIRS_PER_ROUND = 20;
+
+type NoteReceiveOptions = {
+  recordCompletion?: boolean;
+};
+
+const resolveIncomingNoteContent = async (data: ReceiveMessage, plugin: FastSync): Promise<string> => {
+  if (typeof data.content !== "string") {
+    throw new Error(`Invalid note content payload: ${data.path}`);
+  }
+
+  const expectedHash = String(data.contentHash ?? "");
+  // A missing hash is an old/invalid server payload that cannot be verified;
+  // preserve the legacy behavior. When a hash is present, accept the payload
+  // only if its content actually matches. This covers empty, truncated, and
+  // otherwise incomplete WebSocket payloads through the existing HTTP path.
+  if (expectedHash === "") {
+    return data.content;
+  }
+
+  const payloadHash = await hashContentAsync(data.content, plugin);
+  if (payloadHash === expectedHash) {
+    return data.content;
+  }
+
+  dump(`[FastSync] Note payload hash mismatch (${payloadHash} != ${expectedHash}); fetching canonical content: ${data.path}`);
+  const note = await plugin.api.getNoteContent(data.path);
+  if (!note || typeof note.content !== "string") {
+    throw new Error(`Canonical note fetch failed: ${data.path}`);
+  }
+
+  const fetchedHash = await hashContentAsync(note.content, plugin);
+  if (fetchedHash !== expectedHash || String(note.contentHash ?? "") !== expectedHash) {
+    throw new Error(`Canonical note hash mismatch: ${data.path}`);
+  }
+
+  dump(`[FastSync] Canonical note content recovered: ${data.path}`);
+  return note.content;
+};
+
 
 /**
  * 笔记修改事件处理
@@ -73,7 +114,15 @@ export const noteModify = async function (file: TAbstractFile, plugin: FastSync,
       }
       await plugin.concurrencyLimiter.waitForSlot(file.path)
       plugin.incrementalScanManager?.markSent("note", file.path)
-      void plugin.websocket.SendMessage("NoteModify", data)
+      void plugin.websocket.SendMessage("NoteModify", data).then((result) => {
+        if (result !== "sent") {
+          plugin.concurrencyLimiter.releaseSlot(file.path)
+          dump(`[FastSync] NoteModify was not sent; retaining pending hash for retry: ${file.path}`)
+        }
+      }).catch((error) => {
+        plugin.concurrencyLimiter.releaseSlot(file.path)
+        dumpError(`[FastSync] NoteModify send failed; retaining pending hash: ${file.path}`, error)
+      })
       dump(`Note modify send`, data.path, data.contentHash, data.mtime, data.pathHash)
     } finally {
       plugin.removeIgnoredFile(file.path)
@@ -116,6 +165,11 @@ export const noteDelete = async function (file: TAbstractFile, plugin: FastSync,
         // Add to pending set only after message is actually buffered; remove hash only on NoteDeleteAck
         plugin.incrementalScanManager?.markSent("note", file.path)
         plugin.pendingNoteDeleteAcks.add(file.path)
+      }).then((result) => {
+        if (result !== "sent") plugin.concurrencyLimiter.releaseSlot(file.path)
+      }).catch((error) => {
+        plugin.concurrencyLimiter.releaseSlot(file.path)
+        dumpError(`[FastSync] NoteDelete send failed: ${file.path}`, error)
       })
 
       dump(`Note delete send`, file.path)
@@ -153,6 +207,11 @@ export const noteDeleteByPath = async function (filePath: string, plugin: FastSy
         // Add to pending set only after message is actually buffered; remove hash only on NoteDeleteAck
         plugin.incrementalScanManager?.markSent("note", filePath)
         plugin.pendingNoteDeleteAcks.add(filePath)
+      }).then((result) => {
+        if (result !== "sent") plugin.concurrencyLimiter.releaseSlot(filePath)
+      }).catch((error) => {
+        plugin.concurrencyLimiter.releaseSlot(filePath)
+        dumpError(`[FastSync] NoteDelete send failed: ${filePath}`, error)
       })
       dump(`Note delete by path send`, filePath)
     } finally {
@@ -223,7 +282,12 @@ export const noteRename = async function (file: TAbstractFile, oldfile: string, 
       await plugin.concurrencyLimiter.waitForSlot(file.path, true)
       plugin.incrementalScanManager?.markSent("note", oldfile)
       plugin.incrementalScanManager?.markSent("note", file.path)
-      void plugin.websocket.SendMessage("NoteRename", data)
+      void plugin.websocket.SendMessage("NoteRename", data).then((result) => {
+        if (result !== "sent") plugin.concurrencyLimiter.releaseFifoSlot()
+      }).catch((error) => {
+        plugin.concurrencyLimiter.releaseFifoSlot()
+        dumpError(`[FastSync] NoteRename send failed: ${file.path}`, error)
+      })
       dump(`Note rename send`, data.path, data.pathHash)
     } finally {
       plugin.removeIgnoredFile(file.path)
@@ -234,7 +298,7 @@ export const noteRename = async function (file: TAbstractFile, oldfile: string, 
 /**
  * 接收服务端笔记修改通知
  */
-export const receiveNoteSyncModify = async function (data: ReceiveMessage, plugin: FastSync) {
+export const receiveNoteSyncModify = async function (data: ReceiveMessage, plugin: FastSync, options: NoteReceiveOptions = {}) {
   if (!(await waitForNoteActivity(plugin))) return
   if (plugin.settings.syncEnabled == false) return
   if (isPathExcluded(data.path, plugin)) {
@@ -244,8 +308,11 @@ export const receiveNoteSyncModify = async function (data: ReceiveMessage, plugi
   dump(`Receive note modify:`, data.path, data.contentHash, data.mtime, data.pathHash)
 
   const normalizedPath = normalizePath(data.path)
+  let resolvedContent = data.content
+  let processed = false
 
   try {
+    resolvedContent = await resolveIncomingNoteContent(data, plugin)
     await plugin.lockManager.withLock(normalizedPath, async () => {
       const file = plugin.app.vault.getFileByPath(normalizedPath)
       plugin.addIgnoredFile(normalizedPath)
@@ -294,7 +361,7 @@ export const receiveNoteSyncModify = async function (data: ReceiveMessage, plugi
 
               // 写入服务端最新推送的内容至 remote 备份文件
               if (!(await waitForNoteActivity(plugin))) return
-              await adapter.write(remoteBackupPath, data.content || "");
+              await adapter.write(remoteBackupPath, resolvedContent);
 
               // 若 base 备份不存在，使用当前本地内容建立初始 base 备份
               if (!(await waitForNoteActivity(plugin))) return
@@ -317,11 +384,12 @@ export const receiveNoteSyncModify = async function (data: ReceiveMessage, plugi
             plugin.statusBarManager.updateConflictBadge();
 
             SyncLogManager.getInstance().addLog('receive', 'NoteModifyConflict', `本地存在未同步的改动，跳过服务端覆盖，等待下一轮同步处理冲突: ${normalizedPath}`, 'cancelled', data.path)
+            processed = true
             return
           }
 
           if (!(await waitForNoteActivity(plugin))) return
-          await plugin.app.vault.modify(file, data.content, { ...(data.ctime > 0 && { ctime: data.ctime }), ...(data.mtime > 0 && { mtime: data.mtime }) })
+          await plugin.app.vault.modify(file, resolvedContent, { ...(data.ctime > 0 && { ctime: data.ctime }), ...(data.mtime > 0 && { mtime: data.mtime }) })
         } else {
           const folder = normalizedPath.split("/").slice(0, -1).join("/")
           if (folder != "") {
@@ -339,16 +407,26 @@ export const receiveNoteSyncModify = async function (data: ReceiveMessage, plugi
             }
           }
           if (!(await waitForNoteActivity(plugin))) return
-          await plugin.app.vault.create(normalizedPath, data.content, { ...(data.ctime > 0 && { ctime: data.ctime }), ...(data.mtime > 0 && { mtime: data.mtime }) })
+          await plugin.app.vault.create(normalizedPath, resolvedContent, { ...(data.ctime > 0 && { ctime: data.ctime }), ...(data.mtime > 0 && { mtime: data.mtime }) })
         }
         if (data.lastTime && data.lastTime > Number(plugin.localStorageManager.getMetadata("lastNoteSyncTime"))) {
           plugin.localStorageManager.setMetadata("lastNoteSyncTime", data.lastTime)
         }
 
-        // 服务端推送笔记更新,更新哈希表(使用内容哈希)
-        // 注意：由于是服务端推送，我们信任服务端返回的 mtime，并尝试获取本地文件大小
+        // Read back the materialized file before advancing the local hash or
+        // page ACK. A process kill or adapter failure after the write must
+        // remain retryable instead of becoming a false synced baseline.
         const updatedFile = plugin.app.vault.getFileByPath(normalizedPath);
-        plugin.fileHashManager.setFileHash(data.path, data.contentHash, data.mtime, updatedFile?.stat.size || 0)
+        if (!(await waitForNoteActivity(plugin))) return
+        if (!(updatedFile instanceof TFile)) {
+          throw new Error(`Materialized note is missing after write: ${normalizedPath}`)
+        }
+        const writtenContent = await plugin.app.vault.read(updatedFile)
+        const writtenHash = await hashContentAsync(writtenContent, plugin)
+        if (String(data.contentHash ?? "") !== "" && writtenHash !== String(data.contentHash)) {
+          throw new Error(`Materialized note hash mismatch: ${normalizedPath}`)
+        }
+        plugin.fileHashManager.setFileHash(data.path, data.contentHash, data.mtime, updatedFile.stat.size)
         // 记录同步后的 mtime 用于拦截
         plugin.lastSyncMtime.set(data.path, data.mtime)
         // 服务端版本已覆盖本地，清理 pending 避免增量过滤器旁路导致该笔记无限重传
@@ -358,6 +436,7 @@ export const receiveNoteSyncModify = async function (data: ReceiveMessage, plugi
         // 服务端推送新内容说明该路径已被创建/更新，清理可能残留 de deleteAck pending
         // Server push means path was created/updated; clear any stale deleteAck pending
         plugin.pendingNoteDeleteAcks.delete(data.path)
+        processed = true
       } finally {
         window.setTimeout(() => {
           plugin.removeIgnoredFile(normalizedPath)
@@ -371,8 +450,60 @@ export const receiveNoteSyncModify = async function (data: ReceiveMessage, plugi
     }
     plugin.noteSyncTasks.failed++
   } finally {
-    plugin.recordSyncCompleted('note', data.pageIndex)
+    if (options.recordCompletion !== false && processed) {
+      plugin.recordSyncCompleted('note', data.pageIndex)
+    }
   }
+}
+
+/**
+ * Repair the narrow corruption signature produced by an interrupted remote
+ * note write: a zero-byte local file whose cached local and server hashes are
+ * both non-empty and identical. This scans the in-memory hash index only.
+ */
+export const repairSuspiciousEmptyNotes = async function (plugin: FastSync): Promise<number> {
+  if (!plugin.api?.getNoteContent || !plugin.fileHashManager?.getZeroLengthNoteHashEntries) return 0
+
+  let repaired = 0
+  const candidates = plugin.fileHashManager.getZeroLengthNoteHashEntries()
+  for (const candidate of candidates) {
+    if (repaired >= MAX_EMPTY_NOTE_REPAIRS_PER_ROUND) break
+    if (candidate.hash === EMPTY_NOTE_HASH || !candidate.path.endsWith(".md")) continue
+
+    const file = plugin.app.vault.getFileByPath(candidate.path)
+    if (!(file instanceof TFile) || file.stat.size !== 0 || file.stat.mtime !== candidate.mtime) continue
+    if (plugin.fileHashManager.getPathHash(candidate.path) !== candidate.hash) continue
+    if (plugin.pendingNoteModifies.has(candidate.path) || plugin.syncState.conflictedPaths.has(candidate.path)) continue
+
+    try {
+      const note = await plugin.api.getNoteContent(candidate.path)
+      if (!note || typeof note.content !== "string" || String(note.contentHash ?? "") !== candidate.hash) {
+        throw new Error(`Suspicious empty note recovery hash mismatch: ${candidate.path}`)
+      }
+
+      await receiveNoteSyncModify({
+        vault: plugin.settings.vault,
+        path: candidate.path,
+        pathHash: note.pathHash || hashContent(candidate.path),
+        action: "modify",
+        content: note.content,
+        contentHash: candidate.hash,
+        ctime: note.ctime,
+        mtime: note.mtime,
+        lastTime: note.lastTime,
+      }, plugin, { recordCompletion: false })
+
+      const restored = plugin.app.vault.getFileByPath(candidate.path)
+      if (!(restored instanceof TFile)) throw new Error(`Recovered note is missing: ${candidate.path}`)
+      const restoredHash = await hashContentAsync(await plugin.app.vault.read(restored), plugin)
+      if (restoredHash !== candidate.hash) throw new Error(`Recovered note verification failed: ${candidate.path}`)
+      repaired++
+      dump(`[FastSync] Repaired suspicious empty note: ${candidate.path}`)
+    } catch (error) {
+      dumpError(`[FastSync] Suspicious empty note repair deferred: ${candidate.path}`, error)
+    }
+  }
+  return repaired
 }
 
 /**
@@ -440,9 +571,16 @@ export const receiveNoteUpload = async function (data: ReceivePathMessage, plugi
   plugin.pendingNoteModifies.set(file.path, contentHash)
   plugin.localStorageManager.savePending('pendingNoteModifies', plugin.pendingNoteModifies)
   await plugin.concurrencyLimiter.waitForSlot(file.path)
-  void plugin.websocket.SendMessage("NoteModify", sendData, undefined, () => {
+  const sendResult = await plugin.websocket.SendMessage("NoteModify", sendData, undefined, () => {
     plugin.removeIgnoredFile(file.path)
   }, (data as ReceivePathMessage & { context?: string }).context)
+  if (sendResult !== "sent") {
+    plugin.removeIgnoredFile(file.path)
+    plugin.syncState.pendingNotePushPageIndex.delete(file.path)
+    plugin.concurrencyLimiter.releaseSlot(file.path)
+    dump(`[FastSync] NeedPush NoteModify was not sent; retaining pending hash for retry: ${file.path}`)
+    return
+  }
   dump(`Note modify send`, sendData.path, sendData.contentHash, sendData.mtime, sendData.pathHash)
 }
 

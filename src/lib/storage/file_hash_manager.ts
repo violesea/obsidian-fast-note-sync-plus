@@ -510,6 +510,16 @@ export class FileHashManager {
     return null;
   }
 
+  /** Return cached zero-byte note entries without touching the vault. */
+  getZeroLengthNoteHashEntries(): Array<{ path: string; hash: string; mtime: number; size: number; ctime?: number }> {
+    const entries: Array<{ path: string; hash: string; mtime: number; size: number; ctime?: number }> = [];
+    for (const [path, cache] of this.hashMap.entries()) {
+      if (!path.endsWith(".md") || cache.size !== 0) continue;
+      entries.push({ path, hash: cache.hash, mtime: cache.mtime, size: cache.size, ctime: cache.ctime });
+    }
+    return entries;
+  }
+
   /**
    * 获取指定路径的同步基准哈希值 (提供给同步作为 baseHash 的唯一来源)
    */

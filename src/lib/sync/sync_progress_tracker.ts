@@ -72,6 +72,7 @@ export class SyncProgressTracker {
   // can uniformly clear it on sync end/cancel.
   private stagnationTimers: Map<SyncType, number> = new Map();
   private lastAckedPage: Map<SyncType, number> = new Map();
+  private stagnationGeneration = 0;
 
   // notify() 节流：整数百分比/阶段未变化时最多每 NOTIFY_THROTTLE_MS 触发一次，
   // 变化时（含阶段切换）立即触发，避免每完成一个文件就刷一次状态栏 + workspace 事件
@@ -130,13 +131,8 @@ export class SyncProgressTracker {
     this.hashProgress = 0;
     this.isForcedComplete = false;
 
-    // 新一轮同步开始，清空上一轮遗留的停滞重发 timer（设计稿 §4.5：同步结束/取消时清理）
-    // New sync round starting; clear any stagnation-resend timers left from the previous round
-    for (const timer of this.stagnationTimers.values()) {
-      window.clearTimeout(timer);
-    }
-    this.stagnationTimers.clear();
-    this.lastAckedPage.clear();
+    // New sync round starting; clear any stagnation-resend timers left from the previous round.
+    this.clearStagnationTimers();
 
     for (const type of activeTypes) {
       this.progressMap.set(type, {
@@ -158,6 +154,16 @@ export class SyncProgressTracker {
     }
 
     this.notify();
+  }
+
+  /** Invalidate all delayed ACK callbacks owned by the previous transport. */
+  clearStagnationTimers(): void {
+    this.stagnationGeneration++;
+    for (const timer of this.stagnationTimers.values()) {
+      window.clearTimeout(timer);
+    }
+    this.stagnationTimers.clear();
+    this.lastAckedPage.clear();
   }
 
   /**
@@ -330,11 +336,13 @@ export class SyncProgressTracker {
     if (existing !== undefined) {
       window.clearTimeout(existing);
     }
-    const timer = window.setTimeout(() => this.onStagnationTimeout(type), 15000);
+    const generation = this.stagnationGeneration;
+    const timer = window.setTimeout(() => this.onStagnationTimeout(type, generation), 15000);
     this.stagnationTimers.set(type, timer);
   }
 
-  private onStagnationTimeout(type: SyncType): void {
+  private onStagnationTimeout(type: SyncType, generation: number): void {
+    if (generation !== this.stagnationGeneration) return;
     this.stagnationTimers.delete(type);
     if (this.isForcedComplete) return;
     const highest = this.lastAckedPage.get(type);
@@ -415,12 +423,9 @@ export class SyncProgressTracker {
    */
   forceComplete(): void {
     this.isForcedComplete = true;
-    // 同步已结束（完成/取消/超时保底），清理所有停滞重发 timer（设计稿 §4.5）
-    // Sync has ended (completed/cancelled/timeout fallback); clear all stagnation-resend timers
-    for (const timer of this.stagnationTimers.values()) {
-      window.clearTimeout(timer);
-    }
-    this.stagnationTimers.clear();
+    // Sync has ended (completed/cancelled/timeout fallback); clear all
+    // stagnation-resend timers and invalidate callbacks already queued.
+    this.clearStagnationTimers();
     this.lastReportedPct = 100;
     if (this.onChange) {
       this.onChange(100, this.getDetailText(), 'idle');

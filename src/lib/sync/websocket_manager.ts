@@ -202,6 +202,7 @@ export class WebSocketManager {
         }
         clearUploadQueue(this.plugin);
         resetFileDownloadSessions(this.plugin);
+        this.plugin.progressTracker.clearStagnationTimers();
         this.plugin.concurrencyLimiter.clear();
         // 断线：清空所有在途上行批发送窗口会话的重传 timer（设计稿 §3.2 异常路径表）；
         // W==0/旧路径下没有会话注册，no-op

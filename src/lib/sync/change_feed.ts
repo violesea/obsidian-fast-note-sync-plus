@@ -64,6 +64,10 @@ export async function applyRemoteNote(
   note: { content: string; contentHash: string; mtime: number; ctime: number },
 ): Promise<void> {
   const normalized = normalizePath(path);
+  const fetchedHash = await hashContentAsync(note.content, plugin);
+  if (!note.contentHash || fetchedHash !== String(note.contentHash)) {
+    throw new Error(`note content hash mismatch: ${path}`);
+  }
   await requireForeground(plugin);
   plugin.addIgnoredFile(normalized);
   try {
@@ -92,6 +96,14 @@ export async function applyRemoteNote(
     }
     await requireForeground(plugin);
     const written = plugin.app.vault.getFileByPath(normalized);
+    if (!(written instanceof TFile)) {
+      throw new Error(`materialized note is missing after write: ${normalized}`);
+    }
+    const writtenContent = await plugin.app.vault.read(written);
+    const writtenHash = await hashContentAsync(writtenContent, plugin);
+    if (writtenHash !== String(note.contentHash)) {
+      throw new Error(`materialized note hash mismatch after write: ${normalized}`);
+    }
     plugin.fileHashManager.setFileHash(normalized, note.contentHash, note.mtime, written instanceof TFile ? written.stat.size : 0);
     plugin.lastSyncMtime.set(normalized, note.mtime);
   } finally {
