@@ -11,6 +11,8 @@ export interface DirtyEntry {
   operation: DirtyOperation;
   path: string;
   version: number;
+  /** Reconciliation candidates may reuse a valid local hash. */
+  forceHash?: boolean;
   sentVersion?: number;
 }
 

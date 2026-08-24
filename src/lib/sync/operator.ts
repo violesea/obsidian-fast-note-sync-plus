@@ -15,6 +15,8 @@ import { SyncType } from "./sync_progress_tracker";
 import { ConfirmModal } from "../../views/confirm-modal";
 import { incrementalEntryKey, mergeDirtyEntries } from "./incremental_scan_manager";
 import type { DirtyEntry, DirtySnapshot } from "./incremental_scan_manager";
+import { collectIncrementalReconciliationEntries } from "./incremental_reconciliation";
+import type { ReconciliationLocalEntry } from "./incremental_reconciliation";
 import { getPostSendSyncPhase } from "./sync_state";
 import { planChangeFeedRound, changeFeedDecisionInput, runChangeFeedCatchUp } from "./change_feed";
 import type { CatchUpResult as ChangeFeedCatchUpResult } from "./change_feed";
@@ -110,6 +112,53 @@ const collectIncrementalEntries = (plugin: FastSync, snapshot: DirtySnapshot): D
     supplementalEntries.push({ kind: "file", operation: "modify", path: pending.newPath, version: 0 });
   }
   return mergeDirtyEntries(snapshot.entries, supplementalEntries);
+};
+
+const collectVaultMetadataEntries = (plugin: FastSync): ReconciliationLocalEntry[] => {
+  const entries: ReconciliationLocalEntry[] = [];
+  for (const file of plugin.app.vault.getAllLoadedFiles()) {
+    if (file instanceof TFolder) {
+      entries.push({ path: file.path, kind: "folder" });
+      continue;
+    }
+    if (file instanceof TFile) {
+      entries.push({
+        path: file.path,
+        kind: file.extension === "md" ? "note" : "file",
+        mtime: file.stat.mtime,
+        size: file.stat.size,
+        ctime: file.stat.ctime,
+      });
+    }
+  }
+  return entries;
+};
+
+const collectIncrementalReconciliation = (
+  plugin: FastSync,
+  incrementalEntries: DirtyEntry[],
+): DirtyEntry[] => {
+  const dirtyKeys = new Set(incrementalEntries.map((entry) => incrementalEntryKey(entry.kind, entry.path)));
+  const candidates = collectIncrementalReconciliationEntries(
+    collectVaultMetadataEntries(plugin),
+    {
+      getValidHash: (path, mtime, size, ctime) => plugin.fileHashManager.getValidHash(path, mtime, size, ctime),
+      getPathHash: (path) => plugin.fileHashManager.getPathHash(path),
+      getAllPaths: () => plugin.fileHashManager.getAllPaths(),
+      getFolderMtime: (path) => plugin.folderSnapshotManager.getMtime(path),
+      getAllFolderPaths: () => plugin.folderSnapshotManager.getAllPaths(),
+    },
+    {
+      dirtyKeys,
+      isPathExcluded: (path) => isPathExcluded(path, plugin),
+      isFolderPathExcluded: (path) => isFolderSyncPathExcluded(path, plugin),
+      isIgnoredPath: (path) => plugin.isIgnoredFile?.(path) === true,
+    },
+  );
+  if (candidates.length > 0) {
+    dump(`[IncrementalReconcile] metadata candidates=${candidates.length}`);
+  }
+  return mergeDirtyEntries(incrementalEntries, candidates);
 };
 
 const shouldSkipUnchangedLocalEntry = (
@@ -209,7 +258,7 @@ const scanIncrementalVaultEntries = async (
       // A queued modify event is the source of truth that the file changed. Do not
       // reuse a cache entry when mtime/size happen to have the same filesystem
       // precision; that would turn a real edit into a silent no-op.
-      let contentHash = entry.operation === "modify"
+      let contentHash = entry.operation === "modify" && entry.forceHash !== false
         ? null
         : plugin.fileHashManager.getValidHash(file.path, file.stat.mtime, file.stat.size, file.stat.ctime);
       if (entry.operation === "modify") stats.metadataChanged++;
@@ -259,7 +308,7 @@ const scanIncrementalVaultEntries = async (
       continue;
     }
 
-    let contentHash = entry.operation === "modify"
+    let contentHash = entry.operation === "modify" && entry.forceHash !== false
       ? null
       : plugin.fileHashManager.getValidHash(file.path, file.stat.mtime, file.stat.size, file.stat.ctime);
     if (entry.operation === "modify") stats.metadataChanged++;
@@ -1052,9 +1101,12 @@ export const handleSync = async function (plugin: FastSync, isLoadLastTime: bool
     // leaves entries for the types it did not reconcile.
     const dirtySnapshot = plugin.incrementalScanManager?.beginSync(!fastIncremental && syncMode === "auto") ?? null;
     const dirtyKeys = new Set((dirtySnapshot?.entries ?? []).map((entry) => incrementalEntryKey(entry.kind, entry.path)));
-    const incrementalEntries = fastIncremental && dirtySnapshot
+    let incrementalEntries = fastIncremental && dirtySnapshot
       ? collectIncrementalEntries(plugin, dirtySnapshot)
       : [];
+    if (fastIncremental) {
+      incrementalEntries = collectIncrementalReconciliation(plugin, incrementalEntries);
+    }
     const scanStats: ScanStats = {
       enumeratedEntries: 0,
       metadataChanged: 0,
