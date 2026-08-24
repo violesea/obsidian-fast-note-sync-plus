@@ -69,6 +69,7 @@ const probe = {
   trackedHash: (p) => (p === "synced.md" ? "ch-server" : null),
   fileExists: (p) => p !== "missing.md" && p !== "gone.md",
   hasPendingEdit: (p) => p === "dirty-local.md",
+  verifyLocalHash: async (change) => change.path === "synced.md" ? "ch-server" : "ch-local",
 };
 const batch = [
   mk({ path: "synced.md", content_hash: "ch-server" }),     // 已最新 → skip
@@ -77,18 +78,59 @@ const batch = [
   mk({ path: "gone.md", action: "soft_delete" }),            // 本地已不存在 → skip
   mk({ path: "here.md", action: "delete" }),                 // 本地存在 → delete
 ];
-const { actions, counts } = L.selectApplicableChanges(batch, probe, noExcl);
+const { actions, counts } = await L.selectApplicableChanges(batch, probe, noExcl);
 assert.equal(counts.fetch, 1);
 assert.equal(counts.delete, 1);
 assert.equal(counts.skipped, 3);
 assert.equal(actions.filter((a) => a.kind === "fetch")[0].change.path, "changed.md");
 assert.equal(actions.filter((a) => a.kind === "delete")[0].change.path, "here.md");
 
+// Contract: a persisted baseline match without a current filesystem
+// verification must not suppress the remote fetch.
+const unverifiable = await L.selectApplicableChanges(
+  [mk({ path: "synced.md", content_hash: "ch-server" })],
+  {
+    trackedHash: () => "ch-server",
+    fileExists: () => true,
+    hasPendingEdit: () => false,
+  },
+  noExcl,
+);
+assert.equal(unverifiable.counts.fetch, 1);
+assert.equal(unverifiable.actions[0].kind, "fetch");
+
 // ------------------------------------------------------ computeAdoption ---
 // 服务端记得游标则以服务端为准（幂等重装）；新设备回溯 ADOPTION_BACKTRACK_REVS
 assert.equal(L.computeAdoptionRev(457263, 459900), 457263);
 assert.equal(L.computeAdoptionRev(0, 459900), 459900 - 5000);
 assert.equal(L.computeAdoptionRev(0, 100), 0);
+assert.equal(L.computeRepairStartRev(464990), 459990);
+assert.equal(L.computeRepairStartRev(3000), 0);
+
+// Contract: schema 1 cursors are downgraded to a bounded replay window and
+// remain marked until a successful catch-up clears the repair flag.
+const migratedCursor = L.migrateChangeFeedCursorState({
+  schema: 1,
+  deviceId: "ipad-device",
+  vault: "New-World",
+  rev: 464990,
+  noteWatermarkMs: 123,
+  fileWatermarkMs: 456,
+});
+assert.equal(migratedCursor.migrated, true);
+assert.equal(migratedCursor.state.schema, 2);
+assert.equal(migratedCursor.state.rev, 459990);
+assert.equal(migratedCursor.state.repairPending, true);
+const v2Cursor = L.migrateChangeFeedCursorState({
+  schema: 2,
+  deviceId: "ipad-device",
+  vault: "New-World",
+  rev: 464990,
+  repairPending: false,
+});
+assert.equal(v2Cursor.migrated, false);
+assert.equal(v2Cursor.state.rev, 464990);
+assert.equal(v2Cursor.state.repairPending, false);
 
 // ------------------------------------------------------ advanceWatermark ---
 // 无时区后缀按 UTC 解析；水位只进不退

@@ -64,9 +64,24 @@ export type ChangeFeedPlan = "off" | "defer" | "adopt" | "poll";
  * 重复应用是幂等的（哈希命中即跳过），更早的缺口由 M3 digest 兜底。 */
 export const ADOPTION_BACKTRACK_REVS = 5000;
 
+/** Cursor state schema written by the client. Schema 1 is migrated once. */
+export const CHANGE_FEED_CURSOR_SCHEMA = 2;
+
 export const CHANGE_FEED_PAGE_LIMIT = 500;
 /** 单轮最多翻 40 页，防止一次轮次吞掉超长积压导致移动端卡死 */
 export const CHANGE_FEED_MAX_PAGES = 40;
+
+export interface ChangeFeedCursorStateRecord {
+  schema: 2;
+  deviceId: string;
+  vault: string;
+  rev: number;
+  noteWatermarkMs: number;
+  fileWatermarkMs: number;
+  updatedAt: number;
+  /** True until a post-migration replay reaches a successful page boundary. */
+  repairPending: boolean;
+}
 
 // ---------------------------------------------------------------- 判定 ---
 
@@ -130,6 +145,13 @@ export interface LocalHashProbe {
   fileExists(path: string): boolean;
   /** 本地存在未同步编辑的路径（pending 修改/冲突），须跳过以免覆盖 */
   hasPendingEdit(path: string): boolean;
+  /**
+   * Re-read and hash a path before trusting a persisted baseline hash.
+   * A process can be terminated after the baseline is persisted but before
+   * the vault write is durable, so the baseline alone is not proof of local
+   * content. Return null when the path cannot be verified.
+   */
+  verifyLocalHash?: (change: SidecarChange) => Promise<string | null>;
 }
 
 export interface RoundActionCounts {
@@ -142,11 +164,11 @@ export interface RoundActionCounts {
  * 汇总分类一批变更：内容已最新的 fetch 降级为 skip；有本地未同步编辑的条目跳过，
  * 交给随后的 v1 announce 上传/冲突流程处理。
  */
-export function selectApplicableChanges(
+export async function selectApplicableChanges(
   changes: SidecarChange[],
   probe: LocalHashProbe,
   isPathExcluded: (path: string) => boolean,
-): { actions: ChangeAction[]; counts: RoundActionCounts } {
+): Promise<{ actions: ChangeAction[]; counts: RoundActionCounts }> {
   const actions: ChangeAction[] = [];
   const counts: RoundActionCounts = { fetch: 0, delete: 0, skipped: 0 };
   for (const change of changes) {
@@ -160,9 +182,17 @@ export function selectApplicableChanges(
       }
       const local = probe.trackedHash(change.path);
       if (local !== null && local === change.content_hash && probe.fileExists(change.path)) {
-        actions.push({ kind: "skip", reason: "mtime-only", change });
-        counts.skipped++;
-        continue;
+        // Never let a persisted server baseline suppress a fetch without a
+        // current filesystem read. Legacy callers without a verifier fail
+        // closed and fetch the changed path.
+        const verified = probe.verifyLocalHash
+          ? await probe.verifyLocalHash(change)
+          : null;
+        if (verified === change.content_hash) {
+          actions.push({ kind: "skip", reason: "mtime-only", change });
+          counts.skipped++;
+          continue;
+        }
       }
       counts.fetch++;
     } else if (action.kind === "delete") {
@@ -194,6 +224,52 @@ export function selectApplicableChanges(
 export function computeAdoptionRev(serverCursorRev: number, safeRev: number): number {
   if (serverCursorRev > 0) return serverCursorRev;
   return Math.max(0, safeRev - ADOPTION_BACKTRACK_REVS);
+}
+
+/**
+ * Start a bounded replay for a cursor written by the old client. This repairs
+ * a local file that was missed before the old client advanced its cursor.
+ */
+export function computeRepairStartRev(cursorRev: number): number {
+  return Math.max(0, cursorRev - ADOPTION_BACKTRACK_REVS);
+}
+
+/**
+ * Parse the persisted cursor and migrate schema 1 without trusting its
+ * acknowledged position. The migrated state deliberately replays a bounded
+ * window; current local hashes decide whether each entry needs materializing.
+ */
+export function migrateChangeFeedCursorState(raw: unknown): { state: ChangeFeedCursorStateRecord; migrated: boolean } | null {
+  if (typeof raw !== "object" || raw === null) return null;
+  const parsed = raw as {
+    schema?: number;
+    deviceId?: unknown;
+    vault?: unknown;
+    rev?: unknown;
+    noteWatermarkMs?: unknown;
+    fileWatermarkMs?: unknown;
+    updatedAt?: unknown;
+    repairPending?: unknown;
+  };
+  if (parsed.schema !== 1 && parsed.schema !== CHANGE_FEED_CURSOR_SCHEMA) return null;
+  if (typeof parsed.deviceId !== "string" || parsed.deviceId === "") return null;
+  if (typeof parsed.rev !== "number" || !Number.isFinite(parsed.rev) || parsed.rev < 0) return null;
+  const migrated = parsed.schema === 1;
+  const asFiniteNumber = (value: unknown, fallback: number): number =>
+    typeof value === "number" && Number.isFinite(value) ? value : fallback;
+  return {
+    migrated,
+    state: {
+      schema: CHANGE_FEED_CURSOR_SCHEMA,
+      deviceId: parsed.deviceId,
+      vault: typeof parsed.vault === "string" ? parsed.vault : "",
+      rev: migrated ? computeRepairStartRev(parsed.rev) : parsed.rev,
+      noteWatermarkMs: asFiniteNumber(parsed.noteWatermarkMs, 0),
+      fileWatermarkMs: asFiniteNumber(parsed.fileWatermarkMs, 0),
+      updatedAt: asFiniteNumber(parsed.updatedAt, 0),
+      repairPending: migrated || parsed.repairPending === true,
+    },
+  };
 }
 
 /** 按类型推进 lastTime 水位（ms）。取窗口内最新事件的 created_at，与现值取 max。 */

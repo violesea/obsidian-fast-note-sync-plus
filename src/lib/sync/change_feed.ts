@@ -7,14 +7,20 @@
  * - ChangeFeedCursorStore：游标持久化（localStorage + 文件镜像，iOS 清储兜底）
  * - runChangeFeedCatchUp：轮次追平执行器（拉变更 → 分类 → 复用 v1 接收管线应用 → 推进游标）
  *
- * 正文获取走既有 WS RePush 链路（施工方案 4.2）。实测 2026-08-22：插件 apiToken
- * 对 GET /api/note 与 GET /api/file 均 315 scope restricted，HTTP 直读不可用，
- * v2 文档 3.3 节"读路径已全部具备"的判断在插件 token 口径下不成立，已回写项目档案。
+ * 正文获取走插件 REST 直读（2.5.1 起）：笔记与附件分别通过既有 API 读取，
+ * 避免依赖 WS RePush 的时序；请求头必须使用 ObsidianPlugin 客户端类型。
  */
 
 import { Platform, TFile, normalizePath, requestUrl } from "obsidian";
 
-import { dump, hashContent, isPathExcluded, LocalStateFileMirror } from "../utils/helpers";
+import {
+  dump,
+  hashContent,
+  hashContentAsync,
+  hashFileAsync,
+  isPathExcluded,
+  LocalStateFileMirror,
+} from "../utils/helpers";
 import { CLIENT_TYPE } from "../utils/types";
 import { receiveNoteSyncDelete } from "./operator_note";
 import { receiveFileSyncDelete } from "./operator_file";
@@ -22,9 +28,11 @@ import type FastSync from "../../main";
 import {
   CHANGE_FEED_MAX_PAGES,
   CHANGE_FEED_PAGE_LIMIT,
+  CHANGE_FEED_CURSOR_SCHEMA,
   SidecarProtocolError,
   advanceWatermark,
   computeAdoptionRev,
+  migrateChangeFeedCursorState,
   parseChangesResponse,
   parseRegisterResponse,
   planChangeFeedRound,
@@ -210,7 +218,7 @@ export class ChangeFeedClient {
 // ---------------------------------------------------------------- 游标存储 ---
 
 export interface ChangeFeedCursorState {
-  schema: 1;
+  schema: 2;
   deviceId: string;
   vault: string;
   rev: number;
@@ -218,6 +226,8 @@ export interface ChangeFeedCursorState {
   noteWatermarkMs: number;
   fileWatermarkMs: number;
   updatedAt: number;
+  /** 旧游标有一次有界回放待完成，期间每页成功仍可推进游标。 */
+  repairPending: boolean;
 }
 
 const CURSOR_STORAGE_KEY = "fns-changeFeedCursor";
@@ -225,6 +235,7 @@ const CURSOR_MIRROR_FILE = "changeFeedCursor.json";
 
 export class ChangeFeedCursorStore {
   private state: ChangeFeedCursorState | null = null;
+  private migratedOnLoad = false;
   private readonly mirror: LocalStateFileMirror;
 
   constructor(private readonly plugin: FastSync) {
@@ -233,9 +244,14 @@ export class ChangeFeedCursorStore {
 
   async initialize(): Promise<void> {
     const raw = this.plugin.app.loadLocalStorage(CURSOR_STORAGE_KEY) as string | null;
-    if (raw && this.load(raw)) return;
+    if (raw && this.load(raw)) {
+      if (this.migratedOnLoad) this.persist();
+      return;
+    }
     const mirrored = await this.mirror.read();
     if (mirrored && this.load(mirrored)) {
+      // Mirror recovery always rehydrates localStorage; schema 1 migration is
+      // persisted here as well so the next restart cannot lose the repair flag.
       this.persist();
       return;
     }
@@ -244,17 +260,10 @@ export class ChangeFeedCursorStore {
 
   private load(raw: string): boolean {
     try {
-      const parsed = JSON.parse(raw) as Partial<ChangeFeedCursorState>;
-      if (parsed.schema !== 1 || !parsed.deviceId || typeof parsed.rev !== "number") return false;
-      this.state = {
-        schema: 1,
-        deviceId: parsed.deviceId,
-        vault: parsed.vault ?? "",
-        rev: parsed.rev,
-        noteWatermarkMs: parsed.noteWatermarkMs ?? 0,
-        fileWatermarkMs: parsed.fileWatermarkMs ?? 0,
-        updatedAt: parsed.updatedAt ?? 0,
-      };
+      const migrated = migrateChangeFeedCursorState(JSON.parse(raw));
+      if (!migrated) return false;
+      this.state = migrated.state;
+      this.migratedOnLoad = migrated.migrated;
       return true;
     } catch {
       return false;
@@ -277,14 +286,23 @@ export class ChangeFeedCursorStore {
 
   adopt(deviceId: string, vault: string, rev: number): void {
     this.state = {
-      schema: 1,
+      schema: CHANGE_FEED_CURSOR_SCHEMA,
       deviceId,
       vault,
       rev,
       noteWatermarkMs: 0,
       fileWatermarkMs: 0,
       updatedAt: Date.now(),
+      repairPending: false,
     };
+    this.persist();
+  }
+
+  /** Mark the one-time bounded replay complete after a successful catch-up. */
+  completeRepair(): void {
+    if (!this.state?.repairPending) return;
+    this.state.repairPending = false;
+    this.state.updatedAt = Date.now();
     this.persist();
   }
 
@@ -381,7 +399,16 @@ export async function runChangeFeedCatchUp(plugin: FastSync, context?: string): 
         return { ok: false, reason: "round_superseded" };
       }
       const resp = await client.changes(vault, sinceRev);
-      if (resp.changes.length === 0 && !resp.has_more) break;
+      if (resp.changes.length === 0 && !resp.has_more) {
+        // An empty response still carries the server's next watermark. This
+        // matters after schema migration: do not leave the device at the
+        // replay start when there is nothing left to materialize.
+        if (resp.next_rev > sinceRev) {
+          cursorStore.setRev(resp.next_rev, { noteMs: noteWatermark, fileMs: fileWatermark });
+          sinceRev = resp.next_rev;
+        }
+        break;
+      }
 
       await requireForeground(plugin);
 
@@ -390,17 +417,29 @@ export async function runChangeFeedCatchUp(plugin: FastSync, context?: string): 
         fileExists: (path: string) => plugin.app.vault.getAbstractFileByPath(path) != null,
         hasPendingEdit: (path: string) =>
           plugin.pendingNoteModifies.has(path) || plugin.syncState.conflictedPaths.has(path),
+        verifyLocalHash: async (change: SidecarChange): Promise<string | null> => {
+          const file = plugin.app.vault.getFileByPath(change.path);
+          if (!(file instanceof TFile)) return null;
+          await requireForeground(plugin);
+          if (change.type === "note") {
+            const content = await plugin.app.vault.read(file);
+            await requireForeground(plugin);
+            return await hashContentAsync(content, plugin);
+          }
+          return await hashFileAsync(plugin.app, change.path, plugin);
+        },
       };
-      const { actions, counts } = selectApplicableChanges(resp.changes, probe, (p) => isPathExcluded(p, plugin));
+      const { actions, counts } = await selectApplicableChanges(resp.changes, probe, (p) => isPathExcluded(p, plugin));
       fetched += counts.fetch;
       deleted += counts.delete;
       skipped += counts.skipped;
 
+      let pageFailures = 0;
       for (const action of actions) {
         await requireForeground(plugin);
         if (action.kind === "fetch") {
           // HTTP 直取物化（2.5.1）：同步、可验证、可复现，绕开 RePush 通道（ISSUE-023 疑云路径）。
-          // 单条失败不中断追平：计数进 failures，游标照常推进，该路径由下一轮同路径变更或 M3 digest 修正。
+          // 单条失败不影响其它条目，但本页不确认，失败项必须在下一轮重试。
           try {
             if (action.type === "note") {
               const note = await plugin.api.getNoteContent(action.change.path);
@@ -416,6 +455,7 @@ export async function runChangeFeedCatchUp(plugin: FastSync, context?: string): 
             }
           } catch (itemErr) {
             failures++;
+            pageFailures++;
             dump(`[ChangeFeed] http-fetch apply failed (${failures}): ${action.change.path} — ${itemErr instanceof Error ? itemErr.message : String(itemErr)}`);
           }
         } else if (action.kind === "delete") {
@@ -438,6 +478,15 @@ export async function runChangeFeedCatchUp(plugin: FastSync, context?: string): 
         }
       }
 
+      // Commit the page cursor only after every materialization in the page
+      // succeeded. Failed items must remain replayable after iOS termination
+      // or a transient API failure; the old code acknowledged the whole page
+      // and permanently skipped those items.
+      if (pageFailures > 0) {
+        dump(`[ChangeFeed] page not acknowledged: failures=${pageFailures} since_rev=${sinceRev}`);
+        return { ok: false, reason: "materialization_failed", mode, cursorFrom, cursorTo: sinceRev, fetched, deleted, skipped, applied, failures };
+      }
+
       // 水位与游标逐页推进（崩溃/断连时已消费区间不重放）
       noteWatermark = advanceWatermark(noteWatermark, resp.changes.filter((c) => c.type === "note"));
       fileWatermark = advanceWatermark(fileWatermark, resp.changes.filter((c) => c.type === "file"));
@@ -455,6 +504,8 @@ export async function runChangeFeedCatchUp(plugin: FastSync, context?: string): 
       const lastFile = Number(plugin.localStorageManager.getMetadata("lastFileSyncTime")) || 0;
       if (cur.fileWatermarkMs > lastFile) plugin.localStorageManager.setMetadata("lastFileSyncTime", cur.fileWatermarkMs);
     }
+
+    cursorStore.completeRepair();
 
     // 服务端游标观察点（失败不影响本地推进）
     void client.pushCursor(deviceId, vault, sinceRev).catch((e) => {
