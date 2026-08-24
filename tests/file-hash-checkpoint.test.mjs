@@ -62,6 +62,13 @@ function makeModule() {
         };
       }
       if (id === "../../main") return {};
+      if (id === "../sync/background_activity_gate") {
+        return {
+          isBackgroundActivityClosedError: () => false,
+          requireForeground: async () => undefined,
+          waitForForeground: async () => true,
+        };
+      }
       throw new Error("Unexpected require: " + id);
     },
     module,
@@ -139,6 +146,13 @@ vm.runInNewContext(interruptedSource, {
       };
     }
     if (id === "../../main") return {};
+    if (id === "../sync/background_activity_gate") {
+      return {
+        isBackgroundActivityClosedError: () => false,
+        requireForeground: async () => undefined,
+        waitForForeground: async () => true,
+      };
+    }
     throw new Error("Unexpected require: " + id);
   },
   module: interruptedModule,

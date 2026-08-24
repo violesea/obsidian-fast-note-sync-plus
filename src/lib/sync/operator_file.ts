@@ -6,6 +6,9 @@ import { FileCloudPreview } from "../storage/file_cloud_preview";
 import { SyncLogManager } from "./sync_log_manager";
 import { HttpApiService } from "../api/http_api_service";
 import type FastSync from "../../main";
+import { waitForForeground } from "./background_activity_gate";
+
+const waitForFileActivity = async (plugin: FastSync): Promise<boolean> => waitForForeground(plugin);
 
 
 // 下载内存缓冲控制 (20MB 阈值防止 OOM)
@@ -80,8 +83,10 @@ export const getTempChunksDir = (plugin: FastSync, sessionId?: string) => {
  * 清理指定会话的临时目录
  */
 const clearTempDirectory = async (plugin: FastSync, path: string): Promise<void> => {
+  if (!(await waitForFileActivity(plugin))) return
   try {
     if (await plugin.app.vault.adapter.exists(path)) {
+      if (!(await waitForFileActivity(plugin))) return
       await plugin.app.vault.adapter.rmdir(path, true)
     }
   } catch (error) {
@@ -169,6 +174,7 @@ const storeMemoryChunk = (session: FileDownloadSession, chunkIndex: number, chun
 }
 
 const fallbackFileDownloadSessionToMemory = async (plugin: FastSync, session: FileDownloadSession, chunkIndex: number, chunkData: ArrayBuffer) => {
+  if (!(await waitForFileActivity(plugin))) return false
   const oldTempDir = session.tempDir
   const downloadedChunks = Array.from(session.downloadedChunks || [])
   session.chunks = new Map<number, ArrayBuffer>()
@@ -176,7 +182,9 @@ const fallbackFileDownloadSessionToMemory = async (plugin: FastSync, session: Fi
   if (oldTempDir) {
     for (const index of downloadedChunks) {
       const chunkPath = normalizePath(`${oldTempDir}/${index}.bin`)
+      if (!(await waitForFileActivity(plugin))) return false
       if (await plugin.app.vault.adapter.exists(chunkPath)) {
+        if (!(await waitForFileActivity(plugin))) return false
         const chunk = await plugin.app.vault.adapter.readBinary(chunkPath)
         storeMemoryChunk(session, index, chunk)
       }
@@ -194,13 +202,17 @@ const fallbackFileDownloadSessionToMemory = async (plugin: FastSync, session: Fi
  * 清理所有残留的临时目录
  */
 export const clearAllTempChunks = async (plugin: FastSync) => {
+  if (!(await waitForFileActivity(plugin))) return
   const path = getTempChunksDir(plugin)
   if (await plugin.app.vault.adapter.exists(path)) {
     dump(`Cleaning all temp chunks: ${path}`)
+    if (!(await waitForFileActivity(plugin))) return
     await plugin.app.vault.adapter.rmdir(path, true)
   }
   // 确保基础目录在清理后立即存在 (Ensure base dir exists immediately after cleanup)
+  if (!(await waitForFileActivity(plugin))) return
   if (!(await plugin.app.vault.adapter.exists(path))) {
+    if (!(await waitForFileActivity(plugin))) return
     await plugin.app.vault.adapter.mkdir(path)
   }
 }
@@ -270,6 +282,7 @@ export const BINARY_PREFIX_FILE_SYNC = "00"
  * 文件（非笔记）修改事件处理
  */
 export const fileModify = async function (file: TAbstractFile, plugin: FastSync, eventEnter: boolean = false) {
+  if (!(await waitForFileActivity(plugin))) return
   if (plugin.settings.syncEnabled == false || plugin.settings.readonlySyncEnabled) return
   if (!(file instanceof TFile)) return
   if (file.path.endsWith(".md")) return
@@ -299,7 +312,7 @@ export const fileModify = async function (file: TAbstractFile, plugin: FastSync,
           return
         }
       } else {
-        contentHash = await hashFileAsync(plugin.app, file.path);
+        contentHash = await hashFileAsync(plugin.app, file.path, plugin);
         logMemorySnapshot(`after modify hash ${file.path}`)
       }
 
@@ -337,6 +350,7 @@ export const fileModify = async function (file: TAbstractFile, plugin: FastSync,
  * 文件删除事件处理
  */
 export const fileDelete = async function (file: TAbstractFile, plugin: FastSync, eventEnter: boolean = false) {
+  if (!(await waitForFileActivity(plugin))) return
   if (plugin.settings.syncEnabled == false || plugin.settings.readonlySyncEnabled) return
   if (!(file instanceof TFile)) return
   if (file.path.endsWith(".md")) return
@@ -395,6 +409,7 @@ export const fileDelete = async function (file: TAbstractFile, plugin: FastSync,
  * Send file delete message by path string (for scenarios where TFile object is unavailable, e.g., old path after rename)
  */
 export const fileDeleteByPath = async function (filePath: string, plugin: FastSync) {
+  if (!(await waitForFileActivity(plugin))) return
   if (plugin.settings.syncEnabled == false || plugin.settings.readonlySyncEnabled) return
   if (filePath.endsWith(".md")) return
   if (isPathExcluded(filePath, plugin)) return
@@ -443,6 +458,7 @@ export const fileDeleteByPath = async function (filePath: string, plugin: FastSy
  * 文件重命名事件处理
  */
 export const fileRename = async function (file: TAbstractFile, oldfile: string, plugin: FastSync, eventEnter: boolean = false) {
+  if (!(await waitForFileActivity(plugin))) return
   if (plugin.settings.syncEnabled == false || plugin.settings.readonlySyncEnabled) return
   if (file.path.endsWith(".md")) return
   if (plugin.isIgnoredFile(file.path) && eventEnter) return
@@ -499,7 +515,7 @@ export const fileRename = async function (file: TAbstractFile, oldfile: string, 
               dump(`Skip rename hash for large attachment (${describeBinarySyncLimit()} limit): ${file.path}`, file.stat.size)
               return
             }
-            contentHash = await hashFileAsync(plugin.app, file.path)
+            contentHash = await hashFileAsync(plugin.app, file.path, plugin)
           }
         }
 
@@ -529,6 +545,7 @@ export const fileRename = async function (file: TAbstractFile, oldfile: string, 
  * 接收服务端文件上传指令 (FileUpload)
  */
 export const receiveFileUpload = async function (data: FileUploadMessage, plugin: FastSync) {
+  if (!(await waitForFileActivity(plugin))) return
   if (plugin.settings.syncEnabled == false) return
 
   if (plugin.settings.readonlySyncEnabled) {
@@ -614,7 +631,7 @@ export const receiveFileUpload = async function (data: FileUploadMessage, plugin
         return;
       }
 
-      const contentHash = await hashFileAsync(plugin.app, file.path)
+      const contentHash = await hashFileAsync(plugin.app, file.path, plugin)
       logMemorySnapshot(`after upload hash ${data.path}`)
       // 将 hash 暂存到 pending map，等待服务端 FileUploadAck 后再写入 hashManager
       // Temporarily store hash in pending map, update hashManager only after server FileUploadAck
@@ -829,6 +846,7 @@ export const receiveFileUpload = async function (data: FileUploadMessage, plugin
  * 接收服务端文件更新通知 (FileSyncUpdate)
  */
 export const receiveFileSyncUpdate = async function (data: ReceiveFileSyncUpdateMessage, plugin: FastSync) {
+  if (!(await waitForFileActivity(plugin))) return
   if (plugin.settings.syncEnabled == false) return
 
   // 服务端推送说明该路径已有新内容，清除可能残留的 deleteAck pending 防止 Ack 删除新 hash
@@ -913,6 +931,7 @@ export const receiveFileSyncUpdate = async function (data: ReceiveFileSyncUpdate
  * 接收服务端文件删除通知
  */
 export const receiveFileSyncDelete = async function (data: ReceivePathMessage, plugin: FastSync) {
+  if (!(await waitForFileActivity(plugin))) return
   if (plugin.settings.syncEnabled == false) return
 
   if (isPathExcluded(data.path, plugin)) {
@@ -945,6 +964,7 @@ export const receiveFileSyncDelete = async function (data: ReceivePathMessage, p
       // 记录待删除路径
       plugin.lastSyncPathDeleted.add(normalizedPath)
       try {
+        if (!(await waitForFileActivity(plugin))) return
         await vaultDelete(plugin.app.vault, file)
         // 服务端推送删除,从哈希表中移除
         plugin.fileHashManager.removeFileHash(normalizedPath)
@@ -974,6 +994,7 @@ export const receiveFileSyncDelete = async function (data: ReceivePathMessage, p
  * 接收服务端文件元数据(mtime)更新通知
  */
 export const receiveFileSyncMtime = async function (data: ReceiveMtimeMessage, plugin: FastSync) {
+  if (!(await waitForFileActivity(plugin))) return
   if (plugin.settings.syncEnabled == false) return
 
   if (isPathExcluded(data.path, plugin)) {
@@ -1010,9 +1031,11 @@ export const receiveFileSyncMtime = async function (data: ReceiveMtimeMessage, p
         }
         return
       }
+      if (!(await waitForFileActivity(plugin))) return
       const content = await plugin.app.vault.readBinary(file)
       plugin.addIgnoredFile(normalizedPath)
       try {
+        if (!(await waitForFileActivity(plugin))) return
         await plugin.app.vault.modifyBinary(file, content, { ...(data.ctime > 0 && { ctime: data.ctime }), ...(data.mtime > 0 && { mtime: data.mtime }) })
         // 记录 mtime
         plugin.lastSyncMtime.set(data.path, data.mtime)
@@ -1044,6 +1067,7 @@ export const receiveFileSyncMtime = async function (data: ReceiveMtimeMessage, p
  * 接收服务端分片下载响应 (FileSyncChunkDownload)
  */
 export const receiveFileSyncChunkDownload = async function (data: FileSyncChunkDownloadMessage, plugin: FastSync) {
+  if (!(await waitForFileActivity(plugin))) return
   if (plugin.settings.syncEnabled == false) return
 
   dump(`Receive file chunk download: `, data.path, data.sessionId, `totalChunks: ${data.totalChunks}`)
@@ -1108,13 +1132,18 @@ export const receiveFileSyncChunkDownload = async function (data: FileSyncChunkD
   if (data.totalChunks > 0 && session.tempDir) {
     const baseDir = getTempChunksDir(plugin)
     try {
+      if (!(await waitForFileActivity(plugin))) return
       if (!(await plugin.app.vault.adapter.exists(baseDir))) {
+        if (!(await waitForFileActivity(plugin))) return
         await plugin.app.vault.adapter.mkdir(baseDir)
       }
+      if (!(await waitForFileActivity(plugin))) return
       if (!(await plugin.app.vault.adapter.exists(session.tempDir))) {
+        if (!(await waitForFileActivity(plugin))) return
         await plugin.app.vault.adapter.mkdir(session.tempDir)
       }
     } catch (e) {
+      if (!(await waitForFileActivity(plugin))) return
       if (!(await plugin.app.vault.adapter.exists(session.tempDir))) {
         dumpError(`Temp dir creation failed for session ${session.sessionId}, will retry on first chunk`, e)
       }
@@ -1152,6 +1181,7 @@ export const receiveFileSyncChunkDownload = async function (data: FileSyncChunkD
  * 接收文件同步结束通知
  */
 export const receiveFileSyncEnd = async function (data: unknown, plugin: FastSync) {
+  if (!(await waitForFileActivity(plugin))) return
   if (plugin.settings.syncEnabled == false) return
   dump(`Receive file sync end:`, data)
 
@@ -1172,6 +1202,7 @@ export const receiveFileSyncEnd = async function (data: unknown, plugin: FastSyn
  * 检查并上传附件 (用于开启云预览后的首次同步后)
  */
 export const checkAndUploadAttachments = async function (plugin: FastSync) {
+  if (!(await waitForFileActivity(plugin))) return
   if (!plugin.settings.cloudPreviewEnabled || plugin.settings.readonlySyncEnabled) return;
 
   const apiService = new HttpApiService(plugin);
@@ -1213,6 +1244,7 @@ export const checkAndUploadAttachments = async function (plugin: FastSync) {
  * 处理接收到的二进制文件分片
  */
 export const handleFileChunkDownload = async function (buf: ArrayBuffer | Blob, plugin: FastSync) {
+  if (!(await waitForFileActivity(plugin))) return
   if (plugin.settings.syncEnabled == false || isPluginUnloading) return
 
   const binaryData = buf instanceof Blob ? await buf.arrayBuffer() : buf
@@ -1253,16 +1285,21 @@ export const handleFileChunkDownload = async function (buf: ArrayBuffer | Blob, 
 
     if (session.tempDir) {
       try {
+        if (!(await waitForFileActivity(plugin))) return
         if (!(await plugin.app.vault.adapter.exists(session.tempDir))) {
           const baseDir = getTempChunksDir(plugin)
           try {
+            if (!(await waitForFileActivity(plugin))) return
             if (!(await plugin.app.vault.adapter.exists(baseDir))) {
+              if (!(await waitForFileActivity(plugin))) return
               await plugin.app.vault.adapter.mkdir(baseDir)
             }
+            if (!(await waitForFileActivity(plugin))) return
             await plugin.app.vault.adapter.mkdir(session.tempDir)
           } catch (mkdirErr) {
             // 并发下多个分片会话可能同时 mkdir 同一目录：复验已存在则吞掉；
             // 仍不存在说明是真实创建失败，交给外层 catch 走既有失败路径（内存 fallback / failFileDownloadSession）
+            if (!(await waitForFileActivity(plugin))) return
             if (!(await plugin.app.vault.adapter.exists(session.tempDir))) {
               throw mkdirErr
             }
@@ -1270,6 +1307,7 @@ export const handleFileChunkDownload = async function (buf: ArrayBuffer | Blob, 
         }
         const chunkPath = normalizePath(`${session.tempDir}/${chunkIndex}.bin`)
         isNewChunk = !session.downloadedChunks?.has(chunkIndex)
+        if (!(await waitForFileActivity(plugin))) return
         await plugin.app.vault.adapter.writeBinary(chunkPath, chunkData)
         session.downloadedChunks?.add(chunkIndex)
       } catch (e) {
@@ -1313,6 +1351,7 @@ export const handleFileChunkDownload = async function (buf: ArrayBuffer | Blob, 
  * 接收服务端文件重命名通知
  */
 export const receiveFileSyncRename = async function (data: { oldPath: string; path: string; mtime?: number; ctime?: number; contentHash?: string; lastTime?: number; size?: number; pathHash?: string; pageIndex?: number }, plugin: FastSync) {
+  if (!(await waitForFileActivity(plugin))) return
   if (plugin.settings.syncEnabled == false) return
 
     if (isPathExcluded(data.path, plugin) || isPathExcluded(data.oldPath, plugin)) {
@@ -1359,9 +1398,11 @@ export const receiveFileSyncRename = async function (data: { oldPath: string; pa
       try {
         const targetFile = plugin.app.vault.getFileByPath(normalizedNewPath)
         if (targetFile) {
+          if (!(await waitForFileActivity(plugin))) return
           await vaultDelete(plugin.app.vault, targetFile)
         }
 
+        if (!(await waitForFileActivity(plugin))) return
         await plugin.app.vault.rename(file, normalizedNewPath)
 
         if (data.mtime) {
@@ -1370,7 +1411,9 @@ export const receiveFileSyncRename = async function (data: { oldPath: string; pa
             if (isLargeBinarySyncRisk(renamedFile.stat.size, plugin)) {
               dump(`Skip renamed binary mtime rewrite for large attachment (${describeBinarySyncLimit()} limit): ${normalizedNewPath}`, renamedFile.stat.size)
             } else {
+              if (!(await waitForFileActivity(plugin))) return
               const content = await plugin.app.vault.readBinary(renamedFile)
+              if (!(await waitForFileActivity(plugin))) return
               await plugin.app.vault.modifyBinary(renamedFile, content, { ...((data.ctime ?? 0) > 0 && { ctime: data.ctime }), ...((data.mtime ?? 0) > 0 && { mtime: data.mtime }) })
             }
           }
@@ -1402,7 +1445,7 @@ export const receiveFileSyncRename = async function (data: { oldPath: string; pa
             plugin.recordSyncCompleted('file', data.pageIndex)
             return
           }
-          const localContentHash = await hashFileAsync(plugin.app, targetFile.path)
+          const localContentHash = await hashFileAsync(plugin.app, targetFile.path, plugin)
           if (localContentHash === data.contentHash) {
             dump(`Target attachment already exists and matches hash, skipping rename: ${data.path}`)
             plugin.fileHashManager.setFileHash(data.path, data.contentHash, targetFile.stat.mtime, targetFile.stat.size)
@@ -1439,6 +1482,7 @@ export const receiveFileSyncRename = async function (data: { oldPath: string; pa
  * 完成文件下载
  */
 const handleFileChunkDownloadComplete = async function (session: FileDownloadSession, plugin: FastSync) {
+  if (!(await waitForFileActivity(plugin))) return
   const slotKey = session.initialSlotKey || `download_${session.path}`;
   try {
     if (isLargeBinarySyncRisk(session.size, plugin)) {
@@ -1455,7 +1499,9 @@ const handleFileChunkDownloadComplete = async function (session: FileDownloadSes
       let chunk: ArrayBuffer | undefined;
       if (session.tempDir) {
         const chunkPath = normalizePath(`${session.tempDir}/${i}.bin`)
+        if (!(await waitForFileActivity(plugin))) return
         if (await plugin.app.vault.adapter.exists(chunkPath)) {
+          if (!(await waitForFileActivity(plugin))) return
           chunk = await plugin.app.vault.adapter.readBinary(chunkPath)
         }
       } else {
@@ -1485,6 +1531,7 @@ const handleFileChunkDownloadComplete = async function (session: FileDownloadSes
       try {
         const file = plugin.app.vault.getFileByPath(normalizedPath)
         if (file) {
+          if (!(await waitForFileActivity(plugin))) return
           await plugin.app.vault.modifyBinary(file, completeFile.buffer, { ...(session.ctime > 0 && { ctime: session.ctime }), ...(session.mtime > 0 && { mtime: session.mtime }) })
         } else {
           const folder = normalizedPath.split("/").slice(0, -1).join("/")
@@ -1492,14 +1539,17 @@ const handleFileChunkDownloadComplete = async function (session: FileDownloadSes
             const dirExists = plugin.app.vault.getFolderByPath(folder)
             if (dirExists == null) {
               try {
+                if (!(await waitForFileActivity(plugin))) return
                 await plugin.app.vault.createFolder(folder)
               } catch (e) {
                 // 并发竞争时只有一个调用成功，另一方忽略"已存在"错误
                 // In concurrent race only one call succeeds; ignore "already exists" error
+                if (!(await waitForFileActivity(plugin))) return
                 if (!plugin.app.vault.getFolderByPath(folder)) throw e
               }
             }
           }
+          if (!(await waitForFileActivity(plugin))) return
           await plugin.app.vault.createBinary(normalizedPath, completeFile.buffer, { ...(session.ctime > 0 && { ctime: session.ctime }), ...(session.mtime > 0 && { mtime: session.mtime }) })
         }
       } finally {

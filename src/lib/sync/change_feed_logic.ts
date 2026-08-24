@@ -113,7 +113,7 @@ export function classifyChange(change: SidecarChange, isPathExcluded: (path: str
   if (isPathExcluded(change.path)) {
     return { kind: "skip", reason: "excluded-path", change };
   }
-  const type = change.type as "note" | "file";
+  const type = change.type;
   if (DELETE_ACTIONS.has(change.action)) {
     return { kind: "delete", type, change };
   }
@@ -153,7 +153,7 @@ export function selectApplicableChanges(
     let action = classifyChange(change, isPathExcluded);
     if (action.kind === "fetch") {
       if (probe.hasPendingEdit(change.path)) {
-        action = { kind: "skip", reason: "excluded-path", change } as ChangeAction;
+        action = { kind: "skip", reason: "excluded-path", change };
         actions.push(action);
         counts.skipped++;
         continue;

@@ -36,6 +36,7 @@ import { StatusBarManager } from "./lib/ui/status_bar_manager";
 import { SyncProgressTracker } from "./lib/sync/sync_progress_tracker";
 import { LifecycleGeneration } from "./lib/sync/lifecycle_generation";
 import { SyncPageAckOutbox, type SyncPageAckType } from "./lib/sync/sync_page_ack_outbox";
+import { BackgroundActivityGate } from "./lib/sync/background_activity_gate";
 
 
 
@@ -85,6 +86,8 @@ export default class FastSync extends Plugin {
   folderSnapshotManager: FolderSnapshotManager    // 文件夹快照管理器
   statusBarManager: StatusBarManager              // 状态栏管理器
   readonly progressTracker = new SyncProgressTracker() // 进度追踪器
+  /** Mobile vault-I/O barrier; the WebSocket remains alive while it is closed. */
+  readonly backgroundActivityGate = new BackgroundActivityGate()
   private menuManagerInitialized = false          // 防止 onLayoutReady 重复初始化 / Guard against duplicate onLayoutReady init
   private readonly lifecycle = new LifecycleGeneration()
 
@@ -590,6 +593,11 @@ export default class FastSync extends Plugin {
       this.folderSnapshotManager = new FolderSnapshotManager(this)
       this.configManager = new ConfigManager(this)
 
+      // Register lifecycle events before any cold hash/config scan starts.
+      // Mobile scene transitions can happen during plugin initialization.
+      this.eventManager = new EventManager(this)
+      this.eventManager.registerEvents()
+
       // 5. 并行初始化哈希和快照 (耗时任务)
       const initPromises: Promise<void>[] = [
         this.fileHashManager.initialize(),
@@ -692,10 +700,10 @@ export default class FastSync extends Plugin {
         }
       }
 
-      if (this.fileHashManager.isReady()) {
-        this.eventManager = new EventManager(this)
-        void this.eventManager.registerEvents()
-      }
+      // The lifecycle listeners were registered before initialization; this
+      // second call only installs vault/workspace listeners after hash state is
+      // ready. EventManager makes registration idempotent.
+      if (this.fileHashManager.isReady()) void this.eventManager.registerEvents()
 
       // 7. 刷新运行时设置 (包含网络探测，不阻塞主流程)
       if (this.lifecycle.isCurrent(lifecycleGeneration)) void this.reloadServices()
@@ -718,6 +726,7 @@ export default class FastSync extends Plugin {
 
   onunload() {
     this.lifecycle.invalidate()
+    if (Platform.isMobile) this.backgroundActivityGate.close()
     // 取消当前正在进行的同步，重置运行时状态
     cancelSync(this)
     void this.websocket?.unRegister(true)

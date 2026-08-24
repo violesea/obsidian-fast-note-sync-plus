@@ -3,6 +3,9 @@ import { normalizePath } from "obsidian";
 import { dump, dumpError, getFileName, getDirNameOrEmpty, configAddPathExcluded, isPathInConfigSyncDirs, getConfigSyncCustomDirs, isInWhitelist, getPluginDir } from "../utils/helpers";
 import { CONFIG_PLUGIN_EXTS_TO_WATCH, CONFIG_ROOT_FILES_EXCLUDE, CONFIG_THEME_EXTS_TO_WATCH, configModify, configDelete, configAllPaths } from "./operator_config";
 import type FastSync from "../../main";
+import { waitForForeground } from "./background_activity_gate";
+
+const waitForConfigActivity = async (plugin: FastSync): Promise<boolean> => waitForForeground(plugin);
 
 
 export class ConfigManager {
@@ -35,12 +38,14 @@ export class ConfigManager {
 
   private async initializeFileStates() {
     if (!this.plugin.settings.configSyncEnabled) return
+    if (!(await waitForConfigActivity(this.plugin))) return
 
     const configDir = this.plugin.app.vault.configDir
     const customDirs = getConfigSyncCustomDirs(this.plugin)
     const paths = await configAllPaths([configDir, ...customDirs], this.plugin)
 
     for (const relPath of paths) {
+      if (!(await waitForConfigActivity(this.plugin))) return
       const fullPath = normalizePath(relPath)
       try {
         const stat = await this.plugin.app.vault.adapter.stat(fullPath)
@@ -55,6 +60,7 @@ export class ConfigManager {
   }
 
   public async handleRawEvent(path: string, eventEnter: boolean = false) {
+    if (!(await waitForConfigActivity(this.plugin))) return
     if (!this.plugin.settings.configSyncEnabled || this.plugin.isSyncing) return
 
     const configDir = this.plugin.app.vault.configDir
@@ -117,6 +123,7 @@ export class ConfigManager {
         window.setTimeout(() => {
           void (async () => {
             try {
+              if (!(await waitForConfigActivity(this.plugin))) return
               const content = await this.plugin.app.vault.adapter.read(path)
               const manifest = JSON.parse(content) as { version?: string }
               if (manifest.version && manifest.version !== this.plugin.manifest.version) {
@@ -136,8 +143,10 @@ export class ConfigManager {
 
   async loadEnabledPlugins() {
     try {
+      if (!(await waitForConfigActivity(this.plugin))) return
       const filePath = normalizePath(`${this.plugin.app.vault.configDir}/community-plugins.json`)
       if (await this.plugin.app.vault.adapter.exists(filePath)) {
+        if (!(await waitForConfigActivity(this.plugin))) return
         const plugins = JSON.parse(await this.plugin.app.vault.adapter.read(filePath)) as string[]
         if (Array.isArray(plugins)) this.enabledPlugins = new Set(plugins)
       }
@@ -147,10 +156,12 @@ export class ConfigManager {
   }
 
   private async checkFileChange(filePath: string, eventEnter: boolean = false, isFolder: boolean = false) {
+    if (!(await waitForConfigActivity(this.plugin))) return
     const relativePath = filePath
     if (this.plugin.ignoredConfigFiles.has(relativePath)) return
 
     try {
+      if (!(await waitForConfigActivity(this.plugin))) return
       const stat = await this.plugin.app.vault.adapter.stat(filePath)
 
       // 1. 处理删除 (包括目录递归删除)

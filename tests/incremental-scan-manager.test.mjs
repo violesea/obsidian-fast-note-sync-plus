@@ -47,6 +47,7 @@ const module = { exports: {} };
 vm.runInNewContext(transpiled, {
   require: (id) => {
     if (id === "../utils/helpers") return { LocalStateFileMirror: FakeMirror, dump: () => undefined };
+    if (id === "./background_activity_gate") return { waitForForeground: async () => true };
     throw new Error(`Unexpected require: ${id}`);
   },
   module,

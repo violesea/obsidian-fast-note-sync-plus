@@ -3,6 +3,7 @@ import { normalizePath } from "obsidian";
 import { hashContentAsync, dump, dumpError, configIsPathExcluded, getConfigSyncCustomDirs, showSyncNotice, hashFileAsync, debounce, LocalStateFileMirror } from "../utils/helpers";
 import { configAllPaths } from "../sync/operator_config";
 import type FastSync from "../../main";
+import { isBackgroundActivityClosedError, requireForeground, waitForForeground } from "../sync/background_activity_gate";
 
 
 /**
@@ -59,6 +60,7 @@ export class ConfigHashManager {
      * 立即将脏数据落盘（用于同步结束、插件卸载等需要保证持久化的时机）
      */
     flush(): void {
+        if (this.plugin.backgroundActivityGate?.isBackgrounded || this.plugin.backgroundActivityGate?.isClosed) return;
         if (this.isDirty) {
             this.isDirty = false;
             this.saveToStorage();
@@ -68,6 +70,7 @@ export class ConfigHashManager {
     }
 
     async flushAsync(): Promise<void> {
+        if (!(await waitForForeground(this.plugin))) return;
         if (this.isDirty) {
             this.isDirty = false;
             this.saveToStorage();
@@ -117,6 +120,7 @@ export class ConfigHashManager {
         const notice = showSyncNotice("正在初始化配置哈希映射...", 0);
 
         try {
+            await requireForeground(this.plugin);
             // 获取所有配置文件路径
             const configDir = this.plugin.app.vault.configDir;
             const customDirs = getConfigSyncCustomDirs(this.plugin);
@@ -145,6 +149,7 @@ export class ConfigHashManager {
             };
 
             for (const path of allPaths) {
+                await requireForeground(this.plugin);
                 // 跳过已排除的配置
                 if (configIsPathExcluded(path, this.plugin)) {
                     processedConfigs++;
@@ -160,7 +165,7 @@ export class ConfigHashManager {
                         if (key) {
                             let value: string | null = this.plugin.localStorageManager.getItemValue(key);
                             if (value) {
-                                contentHash = await hashContentAsync(value);
+                                contentHash = await hashContentAsync(value, this.plugin);
                                 this.hashMap.set(path, { hash: contentHash, mtime: 0, size: 0 });
                                 value = null; // 显式释放引用 (Explicitly release reference)
                             }
@@ -172,7 +177,7 @@ export class ConfigHashManager {
                         try {
                             const stat = await this.plugin.app.vault.adapter.stat(filePath);
                             if (stat) {
-                                contentHash = await hashFileAsync(this.plugin.app, filePath);
+                                contentHash = await hashFileAsync(this.plugin.app, filePath, this.plugin);
                                 this.hashMap.set(path, {
                                     hash: contentHash,
                                     mtime: stat.mtime,
@@ -181,6 +186,7 @@ export class ConfigHashManager {
                                 });
                             }
                         } catch (error) {
+                            if (isBackgroundActivityClosedError(error)) throw error;
                             dumpError("读取配置文件出错:", error);
                         }
                     }
@@ -209,6 +215,11 @@ export class ConfigHashManager {
 
             dump(`ConfigHashManager: 构建完成,共 ${totalConfigs} 个配置`);
         } catch (error) {
+            if (isBackgroundActivityClosedError(error)) {
+                notice.hide();
+                dump("ConfigHashManager: build abandoned because the plugin is unloading");
+                return;
+            }
             notice.hide();
             const errorMsg = error instanceof Error ? error.message : String(error);
             showSyncNotice(`配置哈希映射初始化失败: ${errorMsg}`);

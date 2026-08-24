@@ -3,6 +3,7 @@ import { $ } from "../../i18n/lang";
 
 import FastSync from "../../main";
 import { SyncLogManager } from "../sync/sync_log_manager";
+import { requireForeground, waitForForeground, type BackgroundActivityOwner } from "../sync/background_activity_gate";
 import { nativeFetch, vaultDelete, dump, dumpError, setLogEnabled, logLevel } from "../helpers_obsidian_bypass";
 
 export { nativeFetch, vaultDelete, dump, dumpError, setLogEnabled, logLevel };
@@ -425,7 +426,7 @@ export const hashContent = function (content: string): string {
  * 对字符串内容进行异步哈希 (支持大字符串分段处理，防止 UI 挂起)
  * Async version of hashContent that yields the thread for large strings
  */
-export const hashContentAsync = async function (content: string): Promise<string> {
+export const hashContentAsync = async function (content: string, owner?: BackgroundActivityOwner): Promise<string> {
   let hash = 0
   const len = content.length
   // 每 256K 字符让出一次主线程
@@ -438,6 +439,7 @@ export const hashContentAsync = async function (content: string): Promise<string
 
     if (i > 0 && i % yieldSize === 0) {
       await new Promise((resolve) => window.setTimeout(resolve, 0))
+      if (owner) await requireForeground(owner)
     }
   }
   return String(hash)
@@ -491,7 +493,8 @@ export const hashArrayBuffer = async function (buffer: ArrayBuffer): Promise<str
 /**
  * 内部工具函数：使用 fetch + Range 协议读取文件的指定范围 (Internal helper: Read file range using fetch + Range)
  */
-async function readRange(app: App, path: string, offset: number, length: number): Promise<ArrayBuffer> {
+async function readRange(app: App, path: string, offset: number, length: number, owner?: BackgroundActivityOwner): Promise<ArrayBuffer> {
+  if (owner) await requireForeground(owner);
   const url = app.vault.adapter.getResourcePath(path)
 
   const controller = new AbortController()
@@ -506,6 +509,7 @@ async function readRange(app: App, path: string, offset: number, length: number)
     })
 
     if (response.status === 206 || response.status === 200) {
+      if (owner) await requireForeground(owner);
       let buffer = await response.arrayBuffer()
       // 如果服务器不支持 206 返回了 200 (全量)，或返回数据量超过预期，则进行截取以保持一致性
       // If server doesn't support 206 (returns 200) or returns more data than expected, slice to maintain consistency
@@ -529,7 +533,8 @@ async function readRange(app: App, path: string, offset: number, length: number)
  * 直接通过文件路径计算哈希 (优化：大文件仅读取头/中/尾，避免 OOM)
  * Calculate hash directly from file path (Optimization: read only head/tail for large files to avoid OOM)
  */
-export const hashFileAsync = async function (app: App, path: string): Promise<string> {
+export const hashFileAsync = async function (app: App, path: string, owner?: BackgroundActivityOwner): Promise<string> {
+  if (owner) await requireForeground(owner);
   const stat = await app.vault.adapter.stat(path)
   if (!stat) return "0"
 
@@ -538,16 +543,17 @@ export const hashFileAsync = async function (app: App, path: string): Promise<st
 
   if (size <= FILE_HASH_THRESHOLD) {
     // 小文件直接读取 (Read small files directly)
+    if (owner) await requireForeground(owner);
     const buffer = await app.vault.adapter.readBinary(path)
     view = new Uint8Array(buffer)
   } else {
     // 大文件优化：优先使用 fetch + Range 仅读取前 5MB、中间 5MB 和后 5MB (Large file optimization: try fetch head/middle/tail 5MB)
     const midOffset = computeMidSliceStart(size)
     try {
-      const head = await readRange(app, path, 0, FILE_HASH_SLICE_SIZE)
-      const mid = await readRange(app, path, midOffset, Math.min(FILE_HASH_SLICE_SIZE, size - midOffset))
+      const head = await readRange(app, path, 0, FILE_HASH_SLICE_SIZE, owner)
+      const mid = await readRange(app, path, midOffset, Math.min(FILE_HASH_SLICE_SIZE, size - midOffset), owner)
       const tailOffset = Math.max(0, size - FILE_HASH_SLICE_SIZE)
-      const tail = await readRange(app, path, tailOffset, FILE_HASH_SLICE_SIZE)
+      const tail = await readRange(app, path, tailOffset, FILE_HASH_SLICE_SIZE, owner)
 
       view = new Uint8Array(FILE_HASH_SLICE_SIZE * 3)
       const headUint8 = new Uint8Array(head)
@@ -561,6 +567,7 @@ export const hashFileAsync = async function (app: App, path: string): Promise<st
     } catch (e) {
       dump(`hashFileAsync: readRange failed or timeout, falling back to full read for ${path}: ${(e as Error).message}`);
       // 兜底方案：加载完整文件内容 (Fallback: read full file)
+      if (owner) await requireForeground(owner);
       const buffer = await app.vault.adapter.readBinary(path)
       const fullView = new Uint8Array(buffer)
       view = new Uint8Array(FILE_HASH_SLICE_SIZE * 3)
@@ -576,7 +583,8 @@ export const hashFileAsync = async function (app: App, path: string): Promise<st
     }
   }
 
-  const hash = await computeRollingHash(view)
+  if (owner) await requireForeground(owner);
+  const hash = await computeRollingHash(view, owner)
   dump(`[HashFile] [Calc] path=${path} size=${formatFileSize(size)} hash=${hash}`)
   return hash
 }
@@ -584,7 +592,7 @@ export const hashFileAsync = async function (app: App, path: string): Promise<st
 /**
  * 内部统一哈希计算逻辑 (Internal unified hashing logic)
  */
-async function computeRollingHash(view: Uint8Array | null): Promise<string> {
+async function computeRollingHash(view: Uint8Array | null, owner?: BackgroundActivityOwner): Promise<string> {
   if (!view) return "0"
   let hash = 0
   const len = view.length
@@ -597,6 +605,7 @@ async function computeRollingHash(view: Uint8Array | null): Promise<string> {
 
     if (i > 0 && i % yieldSize === 0) {
       await new Promise((resolve) => window.setTimeout(resolve, 0))
+      if (owner) await requireForeground(owner)
     }
   }
   const result = String(hash)
@@ -722,8 +731,10 @@ export class LocalStateFileMirror {
    */
   async read(): Promise<string | null> {
     try {
+      await requireForeground(this.plugin);
       const exists = await this.plugin.app.vault.adapter.exists(this.mirrorPath);
       if (!exists) return null;
+      await requireForeground(this.plugin);
       return await this.plugin.app.vault.adapter.read(this.mirrorPath);
     } catch (error) {
       dump(`LocalStateFileMirror: 读取镜像文件失败: ${this.mirrorPath}`, error);
@@ -753,21 +764,34 @@ export class LocalStateFileMirror {
       this.rerunAfterWrite = true;
       return this.activeWrite;
     }
-    this.pendingWrite = false;
-    const data = this.latestData;
-    const writePromise = Promise.resolve(this.plugin.app.vault.adapter.write(this.mirrorPath, data))
-      .catch((error) => {
-        dump(`LocalStateFileMirror: 写入镜像文件失败: ${this.mirrorPath}`, error);
-      })
-      .finally(() => {
-        this.activeWrite = null;
-        if (this.rerunAfterWrite || this.pendingWrite) {
-          this.rerunAfterWrite = false;
-          void this.doWrite();
-        }
-      });
+    const writePromise = this.writeLatest();
     this.activeWrite = writePromise;
     return writePromise;
+  }
+
+  private async writeLatest(): Promise<void> {
+    try {
+      const canWrite = await this.plugin.backgroundActivityGate?.waitUntilForeground() ?? true;
+      if (!canWrite) {
+        this.pendingWrite = false;
+        this.rerunAfterWrite = false;
+        return;
+      }
+      if (!this.pendingWrite || this.latestData === null) return;
+
+      this.pendingWrite = false;
+      const data = this.latestData;
+      await Promise.resolve(this.plugin.app.vault.adapter.write(this.mirrorPath, data))
+        .catch((error) => {
+          dump(`LocalStateFileMirror: 写入镜像文件失败: ${this.mirrorPath}`, error);
+        });
+    } finally {
+      this.activeWrite = null;
+      if (this.rerunAfterWrite || this.pendingWrite) {
+        this.rerunAfterWrite = false;
+        void this.doWrite();
+      }
+    }
   }
 
   /**
@@ -811,6 +835,7 @@ export const waitForFolderEmpty = async function (path: string, plugin: FastSync
   const normalizedPath = normalizePath(path)
 
   while (Date.now() - startTime < timeoutMs) {
+    if (!(await waitForForeground(plugin))) return false
     const folder = plugin.app.vault.getAbstractFileByPath(normalizedPath)
     if (!(folder instanceof TFolder)) {
       return true // 文件夹已经不存在了，也算成功

@@ -53,6 +53,8 @@ const requireStub = (id) => {
       return { SyncLogManager: { getInstance: () => ({ addOrUpdateLog: () => undefined, addLog: () => undefined }) } };
     case "../api/http_api_service":
       return { HttpApiService: class {} };
+    case "./background_activity_gate":
+      return { waitForForeground: async () => true };
     default:
       throw new Error(`Unexpected require: ${id}`);
   }

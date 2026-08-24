@@ -13,6 +13,7 @@ import { ConnectionSupervisor } from "./connection_supervisor";
 import { CLIENT_TYPE } from "../utils/types";
 import type FastSync from "../../main";
 import { $ } from "../../i18n/lang";
+import { waitForForeground } from "./background_activity_gate";
 
 
 // 冲突相关错误码
@@ -763,7 +764,9 @@ export class WebSocketManager {
       try {
         const adapter = this.plugin.app.vault.adapter;
         const conflictDir = `${getPluginDir(this.plugin)}/conflict-notes`;
+        if (!(await waitForForeground(this.plugin))) return;
         if (!(await adapter.exists(conflictDir))) {
+          if (!(await waitForForeground(this.plugin))) return;
           await adapter.mkdir(conflictDir);
         }
 
@@ -772,7 +775,9 @@ export class WebSocketManager {
         const baseBackupPath = `${conflictDir}/${safeName}_${pathHash}.base.md`;
         const remoteBackupPath = `${conflictDir}/${safeName}_${pathHash}.remote.md`;
 
+        if (!(await waitForForeground(this.plugin))) return;
         await adapter.write(baseBackupPath, baseContent);
+        if (!(await waitForForeground(this.plugin))) return;
         await adapter.write(remoteBackupPath, serverContent);
       } catch (e) {
         dump("Failed to create conflict-notes backup files:", e);

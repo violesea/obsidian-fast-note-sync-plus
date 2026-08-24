@@ -2,6 +2,7 @@ import { TFolder } from "obsidian";
 
 import { dump, isFolderSyncPathExcluded, debounce, LocalStateFileMirror } from "../utils/helpers";
 import type FastSync from "../../main";
+import { requireForeground, waitForForeground } from "../sync/background_activity_gate";
 
 // 对账延迟：初始化后等待若干秒再比对，避开插件刚加载时的启动开销高峰
 // Reconciliation delay: wait a few seconds after init to avoid the plugin's startup load spike
@@ -46,12 +47,22 @@ export class FolderSnapshotManager {
      * 立即将脏数据落盘（用于同步结束、插件卸载等需要保证持久化的时机）
      */
     flush(): void {
+        if (this.plugin.backgroundActivityGate?.isBackgrounded || this.plugin.backgroundActivityGate?.isClosed) return;
         if (this.isDirty) {
             this.isDirty = false;
             this.saveToStorage();
         }
         // 最后冲镜像：既包含 saveToStorage 刚安排的一份，也包含与 isDirty 无关的防抖中镜像写
         this.mirror.flush();
+    }
+
+    async flushAsync(): Promise<void> {
+        if (!(await waitForForeground(this.plugin))) return;
+        if (this.isDirty) {
+            this.isDirty = false;
+            this.saveToStorage();
+        }
+        await this.mirror.flushAsync();
     }
 
     /**
@@ -92,7 +103,7 @@ export class FolderSnapshotManager {
      */
     private scheduleReconciliation(): void {
         window.setTimeout(() => {
-            this.reconcileWithVault();
+            void this.reconcileWithVault();
         }, RECONCILE_DELAY_MS);
     }
 
@@ -105,8 +116,9 @@ export class FolderSnapshotManager {
      * local folder is gone. Batches the in-memory Map update then flushes once, instead of
      * triggering the debounced write per item.
      */
-    private reconcileWithVault(): void {
+    private async reconcileWithVault(): Promise<void> {
         try {
+            await requireForeground(this.plugin);
             const files = this.plugin.app.vault.getAllLoadedFiles();
             const vaultFolderPaths = new Set<string>();
             for (const file of files) {
@@ -140,7 +152,7 @@ export class FolderSnapshotManager {
             // Reconciliation is a low-frequency one-off event; mark dirty and flush immediately
             // rather than waiting for the debounce window
             this.isDirty = true;
-            this.flush();
+            await this.flushAsync();
         } catch (error) {
             dump("FolderSnapshotManager: [Reconcile] failed", error);
         }
@@ -155,6 +167,7 @@ export class FolderSnapshotManager {
      */
     private async buildSnapshot(): Promise<void> {
         try {
+            await requireForeground(this.plugin);
             const files = this.plugin.app.vault.getAllLoadedFiles();
             const now = Date.now();
             for (const file of files) {
@@ -165,6 +178,7 @@ export class FolderSnapshotManager {
                     this.snapshotMap.set(file.path, now);
                 }
             }
+            await requireForeground(this.plugin);
             this.saveToStorage();
         } catch (error) {
             dump("FolderSnapshotManager: 构建快照失败", error);

@@ -31,6 +31,7 @@ import {
   selectApplicableChanges,
 } from "./change_feed_logic";
 import type { ChangesResponse, RegisterResponse, SidecarChange } from "./change_feed_logic";
+import { requireForeground } from "./background_activity_gate";
 
 function platformKind(): string {
   if (Platform.isIosApp) return Platform.isTablet ? "ipados" : "ios";
@@ -55,6 +56,7 @@ export async function applyRemoteNote(
   note: { content: string; contentHash: string; mtime: number; ctime: number },
 ): Promise<void> {
   const normalized = normalizePath(path);
+  await requireForeground(plugin);
   plugin.addIgnoredFile(normalized);
   try {
     const options = {
@@ -63,19 +65,24 @@ export async function applyRemoteNote(
     };
     const existing = plugin.app.vault.getFileByPath(normalized);
     if (existing instanceof TFile) {
+      await requireForeground(plugin);
       await plugin.app.vault.modify(existing, note.content, options);
     } else {
       const folder = normalized.split("/").slice(0, -1).join("/");
       if (folder !== "" && plugin.app.vault.getFolderByPath(folder) == null) {
         try {
+          await requireForeground(plugin);
           await plugin.app.vault.createFolder(folder);
         } catch (e) {
           // 并发竞争时只有一方建目录成功（与 receiveNoteSyncModify 同款容忍）
+          await requireForeground(plugin);
           if (plugin.app.vault.getFolderByPath(folder) == null) throw e;
         }
       }
+      await requireForeground(plugin);
       await plugin.app.vault.create(normalized, note.content, options);
     }
+    await requireForeground(plugin);
     const written = plugin.app.vault.getFileByPath(normalized);
     plugin.fileHashManager.setFileHash(normalized, note.contentHash, note.mtime, written instanceof TFile ? written.stat.size : 0);
     plugin.lastSyncMtime.set(normalized, note.mtime);
@@ -94,6 +101,7 @@ export async function applyRemoteFile(
   change: SidecarChange,
 ): Promise<void> {
   const normalized = normalizePath(change.path);
+  await requireForeground(plugin);
   const buf = await plugin.api.getFileBinary(change.path, change.path_hash);
   if (!buf) throw new Error(`binary fetch failed: ${change.path}`);
   if ((change.size ?? 0) > 0 && buf.byteLength !== change.size) {
@@ -107,18 +115,23 @@ export async function applyRemoteFile(
     };
     const existing = plugin.app.vault.getFileByPath(normalized);
     if (existing instanceof TFile) {
+      await requireForeground(plugin);
       await plugin.app.vault.modifyBinary(existing, buf, options);
     } else {
       const folder = normalized.split("/").slice(0, -1).join("/");
       if (folder !== "" && plugin.app.vault.getFolderByPath(folder) == null) {
         try {
+          await requireForeground(plugin);
           await plugin.app.vault.createFolder(folder);
         } catch (e) {
+          await requireForeground(plugin);
           if (plugin.app.vault.getFolderByPath(folder) == null) throw e;
         }
       }
+      await requireForeground(plugin);
       await plugin.app.vault.createBinary(normalized, buf, options);
     }
+    await requireForeground(plugin);
     plugin.fileHashManager.setFileHash(normalized, change.content_hash ?? "", change.mtime ?? 0, buf.byteLength);
     plugin.lastSyncMtime.set(normalized, change.mtime ?? 0);
   } finally {
@@ -370,6 +383,8 @@ export async function runChangeFeedCatchUp(plugin: FastSync, context?: string): 
       const resp = await client.changes(vault, sinceRev);
       if (resp.changes.length === 0 && !resp.has_more) break;
 
+      await requireForeground(plugin);
+
       const probe = {
         trackedHash: (path: string) => plugin.fileHashManager.getPathHash(path),
         fileExists: (path: string) => plugin.app.vault.getAbstractFileByPath(path) != null,
@@ -382,6 +397,7 @@ export async function runChangeFeedCatchUp(plugin: FastSync, context?: string): 
       skipped += counts.skipped;
 
       for (const action of actions) {
+        await requireForeground(plugin);
         if (action.kind === "fetch") {
           // HTTP 直取物化（2.5.1）：同步、可验证、可复现，绕开 RePush 通道（ISSUE-023 疑云路径）。
           // 单条失败不中断追平：计数进 failures，游标照常推进，该路径由下一轮同路径变更或 M3 digest 修正。

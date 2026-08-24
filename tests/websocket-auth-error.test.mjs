@@ -68,6 +68,8 @@ const requireStub = (id) => {
       return { CLIENT_TYPE: "test" };
     case "../../i18n/lang":
       return { $: (key) => key };
+    case "./background_activity_gate":
+      return { waitForForeground: async () => true };
     default:
       throw new Error(`Unexpected require: ${id}`);
   }

@@ -4,12 +4,16 @@ import { ReceiveMessage, ReceiveMtimeMessage, ReceivePathMessage, SyncEndData } 
 import { hashContent, hashContentAsync, dump, dumpError, isPathExcluded, getSafeCtime, vaultDelete, checkAndNotifyCaseConflict, getPluginDir } from "../utils/helpers";
 import { SyncLogManager } from "./sync_log_manager";
 import type FastSync from "../../main";
+import { waitForForeground } from "./background_activity_gate";
+
+const waitForNoteActivity = async (plugin: FastSync): Promise<boolean> => waitForForeground(plugin);
 
 
 /**
  * 笔记修改事件处理
  */
 export const noteModify = async function (file: TAbstractFile, plugin: FastSync, eventEnter: boolean = false) {
+  if (!(await waitForNoteActivity(plugin))) return
   if (plugin.settings.syncEnabled == false || plugin.settings.readonlySyncEnabled) return
   if (!(file instanceof TFile)) return
   if (!file.path.endsWith(".md")) return
@@ -37,11 +41,15 @@ export const noteModify = async function (file: TAbstractFile, plugin: FastSync,
         }
       } else {
         // 缓存失效或不存在，计算新哈希
+        if (!(await waitForNoteActivity(plugin))) return
         content = await plugin.app.vault.read(file)
-        contentHash = await hashContentAsync(content)
+        contentHash = await hashContentAsync(content, plugin)
       }
 
-      if (content === null) content = await plugin.app.vault.read(file)
+      if (content === null) {
+        if (!(await waitForNoteActivity(plugin))) return
+        content = await plugin.app.vault.read(file)
+      }
 
       const data = {
         vault: plugin.settings.vault,
@@ -77,6 +85,7 @@ export const noteModify = async function (file: TAbstractFile, plugin: FastSync,
  * 笔记删除事件处理
  */
 export const noteDelete = async function (file: TAbstractFile, plugin: FastSync, eventEnter: boolean = false) {
+  if (!(await waitForNoteActivity(plugin))) return
   if (plugin.settings.syncEnabled == false || plugin.settings.readonlySyncEnabled) return
   if (!(file instanceof TFile)) return
   if (!file.path.endsWith(".md")) return
@@ -121,6 +130,7 @@ export const noteDelete = async function (file: TAbstractFile, plugin: FastSync,
  * Send note delete message by path string (for scenarios where TFile object is unavailable, e.g., old path after rename)
  */
 export const noteDeleteByPath = async function (filePath: string, plugin: FastSync) {
+  if (!(await waitForNoteActivity(plugin))) return
   if (plugin.settings.syncEnabled == false || plugin.settings.readonlySyncEnabled) return
   if (!filePath.endsWith(".md")) return
   if (isPathExcluded(filePath, plugin)) return
@@ -155,6 +165,7 @@ export const noteDeleteByPath = async function (filePath: string, plugin: FastSy
  * 笔记重命名事件处理
  */
 export const noteRename = async function (file: TAbstractFile, oldfile: string, plugin: FastSync, eventEnter: boolean = false) {
+  if (!(await waitForNoteActivity(plugin))) return
   if (plugin.settings.syncEnabled == false || plugin.settings.readonlySyncEnabled) return
   if (!(file instanceof TFile)) return
   if (!file.path.endsWith(".md")) return
@@ -195,7 +206,7 @@ export const noteRename = async function (file: TAbstractFile, oldfile: string, 
       let contentHash = plugin.fileHashManager.getPathHash(oldfile)
       if (contentHash == null) {
         const content: string = await plugin.app.vault.read(file)
-        contentHash = await hashContentAsync(content)
+        contentHash = await hashContentAsync(content, plugin)
       }
 
       const data = {
@@ -224,6 +235,7 @@ export const noteRename = async function (file: TAbstractFile, oldfile: string, 
  * 接收服务端笔记修改通知
  */
 export const receiveNoteSyncModify = async function (data: ReceiveMessage, plugin: FastSync) {
+  if (!(await waitForNoteActivity(plugin))) return
   if (plugin.settings.syncEnabled == false) return
   if (isPathExcluded(data.path, plugin)) {
     plugin.recordSyncCompleted('note', data.pageIndex)
@@ -255,7 +267,7 @@ export const receiveNoteSyncModify = async function (data: ReceiveMessage, plugi
               let localContentHash = plugin.fileHashManager.getValidHash(normalizedPath, file.stat.mtime, file.stat.size, file.stat.ctime)
               if (localContentHash === null) {
                 const localContent = await plugin.app.vault.read(file)
-                localContentHash = await hashContentAsync(localContent)
+                localContentHash = await hashContentAsync(localContent, plugin)
               }
               hasDivergedSinceLastSync = localContentHash !== knownBaseHash
             }
@@ -274,16 +286,22 @@ export const receiveNoteSyncModify = async function (data: ReceiveMessage, plugi
               const baseBackupPath = `${conflictDir}/${safeName}_${pathHash}.base.md`;
               const remoteBackupPath = `${conflictDir}/${safeName}_${pathHash}.remote.md`;
 
+              if (!(await waitForNoteActivity(plugin))) return
               if (!(await adapter.exists(conflictDir))) {
+                if (!(await waitForNoteActivity(plugin))) return
                 await adapter.mkdir(conflictDir);
               }
 
               // 写入服务端最新推送的内容至 remote 备份文件
+              if (!(await waitForNoteActivity(plugin))) return
               await adapter.write(remoteBackupPath, data.content || "");
 
               // 若 base 备份不存在，使用当前本地内容建立初始 base 备份
+              if (!(await waitForNoteActivity(plugin))) return
               if (!(await adapter.exists(baseBackupPath))) {
+                if (!(await waitForNoteActivity(plugin))) return
                 const localContent = await plugin.app.vault.read(file);
+                if (!(await waitForNoteActivity(plugin))) return
                 await adapter.write(baseBackupPath, localContent);
               }
 
@@ -302,6 +320,7 @@ export const receiveNoteSyncModify = async function (data: ReceiveMessage, plugi
             return
           }
 
+          if (!(await waitForNoteActivity(plugin))) return
           await plugin.app.vault.modify(file, data.content, { ...(data.ctime > 0 && { ctime: data.ctime }), ...(data.mtime > 0 && { mtime: data.mtime }) })
         } else {
           const folder = normalizedPath.split("/").slice(0, -1).join("/")
@@ -309,14 +328,17 @@ export const receiveNoteSyncModify = async function (data: ReceiveMessage, plugi
             const dirExists = plugin.app.vault.getFolderByPath(folder)
             if (dirExists == null) {
               try {
+                if (!(await waitForNoteActivity(plugin))) return
                 await plugin.app.vault.createFolder(folder)
               } catch (e) {
                 // 并发竞争时只有一个调用成功，另一方忽略"已存在"错误
                 // In concurrent race only one call succeeds; ignore "already exists" error
+                if (!(await waitForNoteActivity(plugin))) return
                 if (!plugin.app.vault.getFolderByPath(folder)) throw e
               }
             }
           }
+          if (!(await waitForNoteActivity(plugin))) return
           await plugin.app.vault.create(normalizedPath, data.content, { ...(data.ctime > 0 && { ctime: data.ctime }), ...(data.mtime > 0 && { mtime: data.mtime }) })
         }
         if (data.lastTime && data.lastTime > Number(plugin.localStorageManager.getMetadata("lastNoteSyncTime"))) {
@@ -357,6 +379,7 @@ export const receiveNoteSyncModify = async function (data: ReceiveMessage, plugi
  * 接收服务端请求上传笔记
  */
 export const receiveNoteUpload = async function (data: ReceivePathMessage, plugin: FastSync) {
+  if (!(await waitForNoteActivity(plugin))) return
   if (plugin.settings.syncEnabled == false) return
   if (plugin.settings.readonlySyncEnabled) {
     dump(`Read-only mode: Intercepted note upload request for ${data.path}`)
@@ -393,7 +416,7 @@ export const receiveNoteUpload = async function (data: ReceivePathMessage, plugi
   // 尝试从缓存获取 (Try to get from cache)
   let contentHash = plugin.fileHashManager.getValidHash(file.path, file.stat.mtime, file.stat.size, file.stat.ctime);
   const content = await plugin.app.vault.read(file);
-  if (contentHash === null) contentHash = await hashContentAsync(content);
+  if (contentHash === null) contentHash = await hashContentAsync(content, plugin);
 
   if (content.length === 0) {
     dump(`Empty note upload: ${data.path}`);
@@ -427,6 +450,7 @@ export const receiveNoteUpload = async function (data: ReceivePathMessage, plugi
  * 接收服务端笔记元数据(mtime)更新通知
  */
 export const receiveNoteSyncMtime = async function (data: ReceiveMtimeMessage, plugin: FastSync) {
+  if (!(await waitForNoteActivity(plugin))) return
   if (plugin.settings.syncEnabled == false) return
   if (isPathExcluded(data.path, plugin)) {
     plugin.recordSyncCompleted('note', data.pageIndex)
@@ -440,9 +464,11 @@ export const receiveNoteSyncMtime = async function (data: ReceiveMtimeMessage, p
     await plugin.lockManager.withLock(normalizedPath, async () => {
       const file = plugin.app.vault.getFileByPath(normalizedPath)
       if (file) {
+        if (!(await waitForNoteActivity(plugin))) return
         const content: string = await plugin.app.vault.read(file)
         plugin.addIgnoredFile(normalizedPath)
         try {
+          if (!(await waitForNoteActivity(plugin))) return
           await plugin.app.vault.modify(file, content, { ...(data.ctime > 0 && { ctime: data.ctime }), ...(data.mtime > 0 && { mtime: data.mtime }) })
           // 记录 mtime
           plugin.lastSyncMtime.set(data.path, data.mtime)
@@ -478,6 +504,7 @@ export const receiveNoteSyncMtime = async function (data: ReceiveMtimeMessage, p
  * 接收服务端笔记删除通知
  */
 export const receiveNoteSyncDelete = async function (data: ReceiveMessage, plugin: FastSync) {
+  if (!(await waitForNoteActivity(plugin))) return
   if (plugin.settings.syncEnabled == false) return
   if (isPathExcluded(data.path, plugin)) {
     plugin.recordSyncCompleted('note', data.pageIndex)
@@ -494,6 +521,7 @@ export const receiveNoteSyncDelete = async function (data: ReceiveMessage, plugi
         // 记录待删除路径，用于拦截本地删除事件
         plugin.lastSyncPathDeleted.add(normalizedPath)
         try {
+          if (!(await waitForNoteActivity(plugin))) return
           await vaultDelete(plugin.app.vault, file)
           // 服务端推送删除,从哈希表中移除
           plugin.fileHashManager.removeFileHash(normalizedPath)
@@ -528,6 +556,7 @@ export const receiveNoteSyncDelete = async function (data: ReceiveMessage, plugi
  * 接收笔记同步结束通知
  */
 export const receiveNoteSyncEnd = async function (data: unknown, plugin: FastSync) {
+  if (!(await waitForNoteActivity(plugin))) return
   if (plugin.settings.syncEnabled == false) return
   dump(`Receive note end:`, data)
 
@@ -548,6 +577,7 @@ export const receiveNoteSyncEnd = async function (data: unknown, plugin: FastSyn
  * 接收服务端笔记重命名通知
  */
 export const receiveNoteSyncRename = async function (data: { path: string, oldPath: string, contentHash: string, mtime?: number, ctime?: number, lastTime?: number, pathHash?: string, pageIndex?: number }, plugin: FastSync) {
+  if (!(await waitForNoteActivity(plugin))) return
   if (plugin.settings.syncEnabled == false) return
   if (isPathExcluded(data.path, plugin) || isPathExcluded(data.oldPath, plugin)) {
     plugin.recordSyncCompleted('note', data.pageIndex)
@@ -574,19 +604,23 @@ export const receiveNoteSyncRename = async function (data: { path: string, oldPa
           // 如果目标路径已存在文件，先尝试删除
           const targetFile = plugin.app.vault.getFileByPath(normalizedNewPath)
           if (targetFile) {
+            if (!(await waitForNoteActivity(plugin))) return
             await vaultDelete(plugin.app.vault, targetFile)
           }
 
+          if (!(await waitForNoteActivity(plugin))) return
           await plugin.app.vault.rename(file, normalizedNewPath)
 
           // 更新元数据
           if (data.mtime) {
             const renamedFile = plugin.app.vault.getFileByPath(normalizedNewPath)
             if (renamedFile instanceof TFile) {
+              if (!(await waitForNoteActivity(plugin))) return
               const content = await plugin.app.vault.read(renamedFile)
               const options: { ctime?: number; mtime?: number } = {};
               if (data.ctime && data.ctime > 0) options.ctime = data.ctime;
               if (data.mtime && data.mtime > 0) options.mtime = data.mtime;
+              if (!(await waitForNoteActivity(plugin))) return
               await plugin.app.vault.modify(renamedFile, content, options);
             }
           }
@@ -611,8 +645,9 @@ export const receiveNoteSyncRename = async function (data: { path: string, oldPa
         // 找不到旧文件...
         const targetFile = plugin.app.vault.getFileByPath(normalizedNewPath)
         if (targetFile instanceof TFile) {
+          if (!(await waitForNoteActivity(plugin))) return
           const content = await plugin.app.vault.read(targetFile)
-          const localContentHash = await hashContentAsync(content)
+          const localContentHash = await hashContentAsync(content, plugin)
           if (localContentHash === data.contentHash) {
             dump(`Target file already exists and matches hash, skipping rename: ${data.path}`)
             plugin.fileHashManager.setFileHash(data.path, data.contentHash)

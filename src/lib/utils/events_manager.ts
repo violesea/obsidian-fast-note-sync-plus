@@ -1,4 +1,4 @@
-import { TAbstractFile, TFile, TFolder, Menu, MenuItem, normalizePath } from "obsidian";
+import { Platform, TAbstractFile, TFile, TFolder, Menu, MenuItem, normalizePath } from "obsidian";
 
 import { noteModify, noteDelete, noteRename, noteDeleteByPath } from "../sync/operator_note";
 import { fileModify, fileDelete, fileRename, fileDeleteByPath } from "../sync/operator_file";
@@ -15,6 +15,9 @@ export class EventManager {
   private plugin: FastSync
   private rawEventTimers: Map<string, number> = new Map()
   private resumeTimer: number | null = null
+  private lifecycleEventsRegistered = false
+  private vaultEventsRegistered = false
+  private cleanupRegistered = false
   //保存待处理的重命名文件的路径，用于跳过同时触发的 modify 事件
   private pendingRenamePaths: Set<string> = new Set()
 
@@ -23,40 +26,46 @@ export class EventManager {
   }
 
   public registerEvents() {
-    // 添加哈希表就绪检查
-    if (!this.plugin.fileHashManager || !this.plugin.fileHashManager.isReady()) {
-      dump("EventManager: 文件哈希管理器未就绪,跳过事件注册")
-      return
-    }
-
     const { app } = this.plugin
 
-    // --- Vault Events ---
-    this.plugin.registerEvent(app.vault.on("create", this.watchModify))
-    this.plugin.registerEvent(app.vault.on("modify", this.watchModify))
-    this.plugin.registerEvent(app.vault.on("delete", this.watchDelete))
-    this.plugin.registerEvent(app.vault.on("rename", this.watchRename))
-    //@ts-ignore Internal RAW API
-    this.plugin.registerEvent(app.vault.on("raw", this.watchRaw))
-
-    // --- Workspace Events ---
-    this.plugin.registerEvent(app.workspace.on("file-menu", this.watchFileMenu))
-
     // --- Window Events ---
-    window.addEventListener("focus", this.onWindowFocus)
-    window.addEventListener("visibilitychange", this.onVisibilityChange)
-    window.addEventListener("online", this.onOnline)
-    window.addEventListener("offline", this.onOffline)
+    if (!this.lifecycleEventsRegistered) {
+      window.addEventListener("focus", this.onWindowFocus)
+      window.addEventListener("visibilitychange", this.onVisibilityChange)
+      window.addEventListener("online", this.onOnline)
+      window.addEventListener("offline", this.onOffline)
+      this.lifecycleEventsRegistered = true
+    }
+
+    // Add vault/workspace events only after hash state is ready. This method is
+    // called once before initialization and once after it, so keep both phases
+    // idempotent.
+    if (!this.plugin.fileHashManager || !this.plugin.fileHashManager.isReady()) {
+      dump("EventManager: lifecycle listeners ready; vault listeners deferred until hash state is ready")
+    } else if (!this.vaultEventsRegistered) {
+      this.plugin.registerEvent(app.vault.on("create", this.watchModify))
+      this.plugin.registerEvent(app.vault.on("modify", this.watchModify))
+      this.plugin.registerEvent(app.vault.on("delete", this.watchDelete))
+      this.plugin.registerEvent(app.vault.on("rename", this.watchRename))
+      //@ts-ignore Internal RAW API
+      this.plugin.registerEvent(app.vault.on("raw", this.watchRaw))
+      this.plugin.registerEvent(app.workspace.on("file-menu", this.watchFileMenu))
+      this.vaultEventsRegistered = true
+    }
 
     // 注册插件卸载时的清理逻辑
-    this.plugin.register(() => {
-      dump("EventManager: cleaning up")
-      this.stop() // 清除所有待处理任务定时器 (Clear all pending task timers)
-      window.removeEventListener("focus", this.onWindowFocus)
-      window.removeEventListener("visibilitychange", this.onVisibilityChange)
-      window.removeEventListener("online", this.onOnline)
-      window.removeEventListener("offline", this.onOffline)
-    })
+    if (!this.cleanupRegistered) {
+      this.plugin.register(() => {
+        dump("EventManager: cleaning up")
+        this.stop() // 清除所有待处理任务定时器 (Clear all pending task timers)
+        window.removeEventListener("focus", this.onWindowFocus)
+        window.removeEventListener("visibilitychange", this.onVisibilityChange)
+        window.removeEventListener("online", this.onOnline)
+        window.removeEventListener("offline", this.onOffline)
+        if (Platform.isMobile) this.plugin.backgroundActivityGate?.close()
+      })
+      this.cleanupRegistered = true
+    }
   }
 
   /**
@@ -143,11 +152,21 @@ export class EventManager {
     if (activeDocument.visibilityState === "hidden") {
       // Do not unregister here. Desktop WebViews can remain alive while minimized,
       // and mobile platforms may suspend the process independently of the plugin.
+      if (Platform.isMobile) this.plugin.backgroundActivityGate?.markBackgrounded()
       this.plugin.websocket?.noteBackgrounded()
-      dump("Obsidian backgrounded; keeping sync connection alive")
+      dump(`Obsidian backgrounded; keeping sync connection alive${Platform.isMobile ? " and deferring vault I/O" : ""}`)
     } else {
       // Foregrounding drains any durable changes queued while the process was
       // offline or suspended. Do not tear down a healthy sync session here.
+      if (Platform.isMobile) {
+        this.plugin.backgroundActivityGate?.markForegrounded()
+        void Promise.all([
+          this.plugin.fileHashManager?.flushAsync(),
+          this.plugin.configHashManager?.flushAsync(),
+          this.plugin.localStorageManager?.flushAsync(),
+          this.plugin.incrementalScanManager?.flushAsync(),
+        ])
+      }
       this.scheduleResume("visibilitychange")
       void this.plugin.shareIndicatorManager?.syncWithServer()
     }

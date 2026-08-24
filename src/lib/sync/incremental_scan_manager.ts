@@ -1,5 +1,6 @@
 import type FastSync from "../../main";
 import { LocalStateFileMirror, dump } from "../utils/helpers";
+import { waitForForeground } from "./background_activity_gate";
 
 export type DirtyKind = "note" | "file" | "folder" | "config";
 export type DirtyOperation = "modify" | "delete";
@@ -257,10 +258,12 @@ export class IncrementalScanManager {
   }
 
   flush(): void {
+    if (this.plugin.backgroundActivityGate?.isBackgrounded || this.plugin.backgroundActivityGate?.isClosed) return;
     this.mirror.flush();
   }
 
   async flushAsync(): Promise<void> {
+    if (!(await waitForForeground(this.plugin))) return;
     await this.mirror.flushAsync();
   }
 

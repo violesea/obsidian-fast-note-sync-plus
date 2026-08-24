@@ -5,6 +5,9 @@ import { SyncLogManager } from "./sync_log_manager";
 import { ReceiveMessage, ReceiveMtimeMessage, ReceivePathMessage, SyncEndData } from "../utils/types";
 import type FastSync from "../../main";
 import { $ } from "../../i18n/lang";
+import { waitForForeground } from "./background_activity_gate";
+
+const waitForConfigActivity = async (plugin: FastSync): Promise<boolean> => waitForForeground(plugin);
 
 
 /**
@@ -36,6 +39,7 @@ export const cleanupConfigReloadTimer = function (): void {
 }
 
 export const configModify = async function (path: string, plugin: FastSync, eventEnter: boolean = false, content?: string) {
+    if (!(await waitForConfigActivity(plugin))) return
     if (plugin.settings.configSyncEnabled == false || plugin.settings.readonlySyncEnabled) return
     if (!isPathInConfigSyncDirs(path, plugin)) return
     if (eventEnter && plugin.ignoredConfigFiles.has(path)) return
@@ -60,11 +64,23 @@ export const configModify = async function (path: string, plugin: FastSync, even
         // 从文件系统读取
         const filePath = normalizePath(path)
         try {
+            if (!(await waitForConfigActivity(plugin))) {
+                plugin.removeIgnoredConfigFile(path)
+                return
+            }
             const exists = await plugin.app.vault.adapter.exists(filePath)
             if (exists) {
+                if (!(await waitForConfigActivity(plugin))) {
+                    plugin.removeIgnoredConfigFile(path)
+                    return
+                }
                 const stat = await plugin.app.vault.adapter.stat(filePath)
                 if (stat) {
-                    contentHash = await hashFileAsync(plugin.app, filePath)
+                    contentHash = await hashFileAsync(plugin.app, filePath, plugin)
+                    if (!(await waitForConfigActivity(plugin))) {
+                        plugin.removeIgnoredConfigFile(path)
+                        return
+                    }
                     const contentBuf = await plugin.app.vault.adapter.readBinary(filePath)
                     contentStr = new TextDecoder().decode(contentBuf)
                     mtime = stat.mtime
@@ -121,6 +137,7 @@ export const configModify = async function (path: string, plugin: FastSync, even
 }
 
 export const configDelete = async function (path: string, plugin: FastSync, eventEnter: boolean = false) {
+    if (!(await waitForConfigActivity(plugin))) return
     if (plugin.settings.configSyncEnabled == false || plugin.settings.readonlySyncEnabled) return
     if (!isPathInConfigSyncDirs(path, plugin)) return
     if (eventEnter && plugin.ignoredConfigFiles.has(path)) return
@@ -149,6 +166,7 @@ export const configDelete = async function (path: string, plugin: FastSync, even
 }
 
 export const receiveConfigSyncModify = async function (data: ReceiveMessage, plugin: FastSync) {
+    if (!(await waitForConfigActivity(plugin))) return
     if (plugin.settings.configSyncEnabled == false) return
 
     if (!isPathInConfigSyncDirs(data.path, plugin)) {
@@ -186,7 +204,15 @@ export const receiveConfigSyncModify = async function (data: ReceiveMessage, plu
         const folder = data.path.split("/").slice(0, -1).join("/")
         if (folder !== "") {
             const fullFolderPath = normalizePath(folder)
+            if (!(await waitForConfigActivity(plugin))) {
+                plugin.removeIgnoredConfigFile(data.path)
+                return
+            }
             if (!(await plugin.app.vault.adapter.exists(fullFolderPath))) {
+                if (!(await waitForConfigActivity(plugin))) {
+                    plugin.removeIgnoredConfigFile(data.path)
+                    return
+                }
                 await plugin.app.vault.adapter.mkdir(fullFolderPath)
             }
         }
@@ -198,6 +224,10 @@ export const receiveConfigSyncModify = async function (data: ReceiveMessage, plu
         const hasPendingLocalEdit = plugin.pendingConfigModifies.has(data.path)
         let hasDivergedSinceLastSync = false
         if (!hasPendingLocalEdit) {
+            if (!(await waitForConfigActivity(plugin))) {
+                plugin.removeIgnoredConfigFile(data.path)
+                return
+            }
             const existingStat = await plugin.app.vault.adapter.stat(filePath)
             if (existingStat) {
                 const knownSyncMtime = plugin.lastSyncMtime.get(data.path)
@@ -209,7 +239,7 @@ export const receiveConfigSyncModify = async function (data: ReceiveMessage, plu
                     const knownBaseHash = plugin.configHashManager.getPathHash(data.path)
                     let localContentHash = plugin.configHashManager.getValidHash(data.path, existingStat.mtime, existingStat.size, existingStat.ctime)
                     if (localContentHash === null) {
-                        localContentHash = await hashFileAsync(plugin.app, filePath)
+                        localContentHash = await hashFileAsync(plugin.app, filePath, plugin)
                     }
                     hasDivergedSinceLastSync = localContentHash !== knownBaseHash
                 }
@@ -224,6 +254,10 @@ export const receiveConfigSyncModify = async function (data: ReceiveMessage, plu
             return
         }
 
+        if (!(await waitForConfigActivity(plugin))) {
+            plugin.removeIgnoredConfigFile(data.path)
+            return
+        }
         await plugin.app.vault.adapter.write(filePath, data.content, { ...(data.ctime > 0 && { ctime: data.ctime }), ...(data.mtime > 0 && { mtime: data.mtime }) })
     } catch (e) {
         dumpError("[writeConfigFile] error:", e)
@@ -249,7 +283,9 @@ export const receiveConfigSyncModify = async function (data: ReceiveMessage, plu
     // 更新配置哈希表
     if (plugin.configHashManager && plugin.configHashManager.isReady()) {
         const filePath = normalizePath(data.path);
-        const stat = isVirtual ? null : await plugin.app.vault.adapter.stat(filePath);
+        const stat = isVirtual
+            ? null
+            : (await waitForConfigActivity(plugin) ? await plugin.app.vault.adapter.stat(filePath) : null);
         // 如果是虚拟路径，mtime 使用推送过来的，size 使用内容长度
         // For virtual paths, use pushed mtime and content length as size
         const size = isVirtual ? (data.content?.length || 0) : (stat?.size || 0);
@@ -264,6 +300,7 @@ export const receiveConfigSyncModify = async function (data: ReceiveMessage, plu
 }
 
 export const receiveConfigUpload = async function (data: ReceivePathMessage, plugin: FastSync) {
+    if (!(await waitForConfigActivity(plugin))) return
     if (plugin.settings.configSyncEnabled == false) return;
 
     if (!isPathInConfigSyncDirs(data.path, plugin)) {
@@ -292,11 +329,23 @@ export const receiveConfigUpload = async function (data: ReceivePathMessage, plu
     let ctime = 0;
 
     try {
+        if (!(await waitForConfigActivity(plugin))) {
+            plugin.removeIgnoredConfigFile(data.path)
+            return
+        }
         const exists = await plugin.app.vault.adapter.exists(filePath);
         if (exists) {
+            if (!(await waitForConfigActivity(plugin))) {
+                plugin.removeIgnoredConfigFile(data.path)
+                return
+            }
             const stat = await plugin.app.vault.adapter.stat(filePath);
             if (stat) {
-                contentHash = await hashFileAsync(plugin.app, filePath);
+                contentHash = await hashFileAsync(plugin.app, filePath, plugin);
+                if (!(await waitForConfigActivity(plugin))) {
+                    plugin.removeIgnoredConfigFile(data.path)
+                    return
+                }
                 const contentBufRead = await plugin.app.vault.adapter.readBinary(filePath);
                 contentStr = new TextDecoder().decode(contentBufRead);
                 contentBuf = contentBufRead; // 保持兼容性逻辑
@@ -345,6 +394,7 @@ export const receiveConfigUpload = async function (data: ReceivePathMessage, plu
 };
 
 export const receiveConfigSyncMtime = async function (data: ReceiveMtimeMessage, plugin: FastSync) {
+    if (!(await waitForConfigActivity(plugin))) return
     if (plugin.settings.configSyncEnabled == false) return
 
     if (!isPathInConfigSyncDirs(data.path, plugin)) {
@@ -364,8 +414,11 @@ export const receiveConfigSyncMtime = async function (data: ReceiveMtimeMessage,
     plugin.addIgnoredConfigFile(data.path)
     const filePath = normalizePath(data.path)
     try {
+        if (!(await waitForConfigActivity(plugin))) return
         if (await plugin.app.vault.adapter.exists(filePath)) {
+            if (!(await waitForConfigActivity(plugin))) return
             const content = await plugin.app.vault.adapter.readBinary(filePath)
+            if (!(await waitForConfigActivity(plugin))) return
             await plugin.app.vault.adapter.writeBinary(filePath, content, { ...(data.ctime > 0 && { ctime: data.ctime }), ...(data.mtime > 0 && { mtime: data.mtime }) })
         }
     } catch (e) {
@@ -386,6 +439,7 @@ export const receiveConfigSyncMtime = async function (data: ReceiveMtimeMessage,
 }
 
 export const receiveConfigSyncDelete = async function (data: { path: string, lastTime?: number, pageIndex?: number }, plugin: FastSync) {
+    if (!(await waitForConfigActivity(plugin))) return
     if (plugin.settings.configSyncEnabled == false) return
 
     if (!isPathInConfigSyncDirs(data.path, plugin)) {
@@ -404,10 +458,12 @@ export const receiveConfigSyncDelete = async function (data: { path: string, las
 
     try {
         const fullPath = normalizePath(data.path)
+        if (!(await waitForConfigActivity(plugin))) return
         if (await plugin.app.vault.adapter.exists(fullPath)) {
             // 记录删除路径
             plugin.lastSyncPathDeleted.add(data.path)
             try {
+                if (!(await waitForConfigActivity(plugin))) return
                 await plugin.app.vault.adapter.remove(fullPath)
             } finally {
                 // 延时 500ms 清理
@@ -442,6 +498,7 @@ export const receiveConfigSyncDelete = async function (data: { path: string, las
 }
 
 export const receiveConfigSyncEnd = async function (data: unknown, plugin: FastSync) {
+    if (!(await waitForConfigActivity(plugin))) return
     if (plugin.settings.configSyncEnabled == false) return
     dump(`Receive config sync end:`, data)
 
@@ -460,6 +517,7 @@ export const receiveConfigSyncEnd = async function (data: unknown, plugin: FastS
 }
 
 export const receiveConfigSyncClear = async function (data: unknown, plugin: FastSync) {
+    if (!(await waitForConfigActivity(plugin))) return
     plugin.localStorageManager.setMetadata("lastConfigSyncTime", 0)
     showSyncNotice($("ui.status.clear_success"))
     plugin.configSyncTasks.completed++
@@ -476,6 +534,7 @@ export const receiveConfigSyncClear = async function (data: unknown, plugin: Fas
  * Receive SettingModifyAck, move pending hash to formal configHashManager and update lastConfigSyncTime
  */
 export const receiveConfigModifyAck = async function (data: { lastTime?: number; path?: string }, plugin: FastSync) {
+    if (!(await waitForConfigActivity(plugin))) return
     const journalResult = data.path
         ? plugin.incrementalScanManager?.acknowledge("config", data.path)
         : "untracked"
@@ -489,6 +548,7 @@ export const receiveConfigModifyAck = async function (data: { lastTime?: number;
                     mtime = Date.now() // LocalStorage 虚拟时间
                     size = plugin.localStorageManager.getItemValue(plugin.localStorageManager.pathToKey(data.path) || "")?.length || 0
                 } else {
+                    if (!(await waitForConfigActivity(plugin))) return
                     const stat = await plugin.app.vault.adapter.stat(normalizePath(data.path));
                     mtime = stat?.mtime || 0
                     size = stat?.size || 0
@@ -538,6 +598,7 @@ export const receiveConfigDeleteAck = function (data: { lastTime?: number; path?
  */
 
 export const configAllPaths = async function (configDirs: string[], plugin: FastSync): Promise<string[]> {
+    if (!(await waitForConfigActivity(plugin))) return []
     const paths: string[] = []
     const adapter = plugin.app.vault.adapter
     const isExcluded = (p: string) => configIsPathExcluded(p, plugin)
@@ -547,7 +608,9 @@ export const configAllPaths = async function (configDirs: string[], plugin: Fast
      */
     const scanDirRecursive = async (dirPath: string) => {
         try {
+            if (!(await waitForConfigActivity(plugin))) return
             if (!(await adapter.exists(normalizePath(dirPath)))) return
+            if (!(await waitForConfigActivity(plugin))) return
             const result = await adapter.list(normalizePath(dirPath))
             for (const file of result.files) {
                 if (isExcluded(file)) continue
@@ -564,11 +627,13 @@ export const configAllPaths = async function (configDirs: string[], plugin: Fast
 
     for (const configDir of configDirs) {
         try {
+            if (!(await waitForConfigActivity(plugin))) return paths
             // 解析目录名称，用于判断是否为自定义目录
             const normalizedConfigDir = configDir.replace(/\\/g, "/")
 
             // 特殊处理配置目录（为了向后兼容和针对插件/主题的特定扫描逻辑）
             if (normalizedConfigDir.endsWith(plugin.app.vault.configDir)) {
+                if (!(await waitForConfigActivity(plugin))) return paths
                 const rootItems = await adapter.list(normalizePath(configDir))
                 for (const file of rootItems.files) {
                     const fileName = file.split("/").pop() || ""
@@ -589,10 +654,13 @@ export const configAllPaths = async function (configDirs: string[], plugin: Fast
                     }
                 }
                 const pluginsPath = normalizePath(`${configDir}/plugins`)
+                if (!(await waitForConfigActivity(plugin))) return paths
                 if (await adapter.exists(pluginsPath)) {
+                    if (!(await waitForConfigActivity(plugin))) return paths
                     const result = await adapter.list(pluginsPath)
                     for (const folderPath of result.folders) {
                         const folderName = folderPath.split("/").pop()
+                        if (!(await waitForConfigActivity(plugin))) return paths
                         const folderItems = await adapter.list(folderPath)
                         for (const file of folderItems.files) {
                             const fileName = file.split("/").pop() || ""
@@ -604,10 +672,13 @@ export const configAllPaths = async function (configDirs: string[], plugin: Fast
                     }
                 }
                 const themesPath = normalizePath(`${configDir}/themes`)
+                if (!(await waitForConfigActivity(plugin))) return paths
                 if (await adapter.exists(themesPath)) {
+                    if (!(await waitForConfigActivity(plugin))) return paths
                     const result = await adapter.list(themesPath)
                     for (const folderPath of result.folders) {
                         const folderName = folderPath.split("/").pop()
+                        if (!(await waitForConfigActivity(plugin))) return paths
                         const folderItems = await adapter.list(folderPath)
                         for (const file of folderItems.files) {
                             const fileName = file.split("/").pop() || ""
@@ -619,7 +690,9 @@ export const configAllPaths = async function (configDirs: string[], plugin: Fast
                     }
                 }
                 const snippetsPath = normalizePath(`${configDir}/snippets`)
+                if (!(await waitForConfigActivity(plugin))) return paths
                 if (await adapter.exists(snippetsPath)) {
+                    if (!(await waitForConfigActivity(plugin))) return paths
                     const result = await adapter.list(snippetsPath)
                     for (const filePath of result.files) {
                         if (filePath.endsWith(".css")) {
@@ -640,15 +713,20 @@ export const configAllPaths = async function (configDirs: string[], plugin: Fast
 }
 
 export const configEmptyFoldersClean = async function (configDir: string, plugin: FastSync) {
+    if (!(await waitForConfigActivity(plugin))) return
     if (plugin.settings.configSyncEnabled == false) return
     const folders = [normalizePath(`${configDir}/plugins`), normalizePath(`${configDir}/themes`)]
     for (const root of folders) {
         try {
+            if (!(await waitForConfigActivity(plugin))) return
             if (!(await plugin.app.vault.adapter.exists(root))) continue
+            if (!(await waitForConfigActivity(plugin))) return
             const res = await plugin.app.vault.adapter.list(root)
             for (const folder of res.folders) {
+                if (!(await waitForConfigActivity(plugin))) return
                 const itemRes = await plugin.app.vault.adapter.list(folder)
                 if (itemRes.files.length === 0 && itemRes.folders.length === 0) {
+                    if (!(await waitForConfigActivity(plugin))) return
                     await plugin.app.vault.adapter.rmdir(normalizePath(folder), true)
                 }
             }
@@ -669,6 +747,7 @@ export const configReload = async function (path: string, plugin: FastSync, even
     // 设置新计时器，延迟 1 秒
 
     const checkAndReload = async () => {
+        if (!(await waitForConfigActivity(plugin))) return
         // 如果正在同步且配置同步尚未标记结束，或任务尚未全部完成，则继续等待
         // If syncing and config sync not marked as end, or tasks not all completed, continue waiting
         if (plugin.isSyncing) {

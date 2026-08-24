@@ -5,6 +5,7 @@ const safeMoment = moment as unknown as (inp?: unknown) => { format(format: stri
 import FastSync from "../../main";
 import { dumpError } from "../utils/helpers";
 import { $ } from "../../i18n/lang";
+import { waitForForeground } from "./background_activity_gate";
 
 
 // 常见错误码 -> i18n 人话文案键映射表（覆盖客户端已知的鉴权/冲突/上传会话等高频错误码，
@@ -454,6 +455,7 @@ export class SyncLogManager {
         // 同时清空日志文件
         if (this.plugin && this.logFilePath) {
             try {
+                if (!(await waitForForeground(this.plugin))) return;
                 await this.plugin.app.vault.adapter.write(this.logFilePath, "");
             } catch (e) {
                 dumpError("Failed to clear sync log file:", e);
@@ -508,6 +510,7 @@ export class SyncLogManager {
         if (!this.plugin || !this.logFilePath) return;
 
         try {
+            if (!(await waitForForeground(this.plugin))) return;
             const timeStr = safeMoment(log.timestamp).format("YYYY-MM-DD HH:mm:ss");
             const typeStr = log.type.toUpperCase().padEnd(7);
             const categoryStr = log.category.toUpperCase().padEnd(12);

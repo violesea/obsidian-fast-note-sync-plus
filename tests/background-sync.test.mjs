@@ -121,7 +121,17 @@ let shareRefreshCount = 0;
 let unload;
 
 const plugin = {
-  fileHashManager: { isReady: () => true },
+  backgroundActivityGate: {
+    state: "foreground",
+    markBackgrounded() { this.state = "background"; },
+    markForegrounded() { this.state = "foreground"; },
+    close() { this.state = "closed"; },
+    async waitUntilForeground() { return this.state !== "closed"; },
+  },
+  fileHashManager: { isReady: () => true, flushAsync: async () => undefined },
+  configHashManager: { flushAsync: async () => undefined },
+  localStorageManager: { flushAsync: async () => undefined },
+  incrementalScanManager: { flushAsync: async () => undefined },
   app: {
     vault: { on: () => ({}) },
     workspace: { on: () => ({}) },
@@ -178,6 +188,7 @@ assert.equal(unregisterCount, 0);
 assert.equal(reconnectCount, 0);
 assert.equal(timers.size, 0);
 assert.equal(backgroundedCount, 1);
+assert.equal(plugin.backgroundActivityGate.state, "background");
 
 // Contract: going offline does not unregister the socket or clear its retry lifecycle.
 listeners.get("offline")();
@@ -191,6 +202,7 @@ documentStub.visibilityState = "visible";
 listeners.get("visibilitychange")();
 assert.equal(reconnectCount, 0);
 assert.equal(shareRefreshCount, 1);
+assert.equal(plugin.backgroundActivityGate.state, "foreground");
 
 // Contract: focus, visibility, and online events in one resume transition are
 // debounced into one recovery decision.

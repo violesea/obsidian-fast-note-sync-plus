@@ -4,12 +4,16 @@ import { SyncEndData, FolderSyncRenameMessage } from "../utils/types";
 import { hashContent, dump, dumpError, isFolderSyncPathExcluded, waitForFolderEmpty, vaultDelete, checkAndNotifyCaseConflict } from "../utils/helpers";
 import { SyncLogManager } from "./sync_log_manager";
 import type FastSync from "../../main";
+import { waitForForeground } from "./background_activity_gate";
+
+const waitForFolderActivity = async (plugin: FastSync): Promise<boolean> => waitForForeground(plugin);
 
 
 /**
  * 文件夹修改/创建事件处理
  */
 export const folderModify = async function (folder: TFolder, plugin: FastSync, eventEnter: boolean = false) {
+    if (!(await waitForFolderActivity(plugin))) return
     if (plugin.settings.syncEnabled == false || plugin.settings.readonlySyncEnabled) return
     if (eventEnter && plugin.isIgnoredFile(folder.path)) return
     if (isFolderSyncPathExcluded(folder.path, plugin)) return
@@ -37,6 +41,7 @@ export const folderModify = async function (folder: TFolder, plugin: FastSync, e
  * 文件夹删除事件处理
  */
 export const folderDelete = async function (folder: TFolder, plugin: FastSync, eventEnter: boolean = false) {
+    if (!(await waitForFolderActivity(plugin))) return
     if (plugin.settings.syncEnabled == false || plugin.settings.readonlySyncEnabled) return
     if (eventEnter && plugin.isIgnoredFile(folder.path)) return
     if (isFolderSyncPathExcluded(folder.path, plugin)) return
@@ -70,6 +75,7 @@ export const folderDelete = async function (folder: TFolder, plugin: FastSync, e
  * Send folder delete message by path string (for scenarios where TFolder object is unavailable, e.g., old path after rename)
  */
 export const folderDeleteByPath = async function (folderPath: string, plugin: FastSync) {
+    if (!(await waitForFolderActivity(plugin))) return
     if (plugin.settings.syncEnabled == false || plugin.settings.readonlySyncEnabled) return
     if (isFolderSyncPathExcluded(folderPath, plugin)) return
     if (plugin.lastSyncPathDeleted.has(folderPath)) return
@@ -96,6 +102,7 @@ export const folderDeleteByPath = async function (folderPath: string, plugin: Fa
  * 文件夹重命名事件处理
  */
 export const folderRename = async function (folder: TFolder, oldPath: string, plugin: FastSync, eventEnter: boolean = false) {
+    if (!(await waitForFolderActivity(plugin))) return
     if (plugin.settings.syncEnabled == false || plugin.settings.readonlySyncEnabled) return
     if (eventEnter && plugin.isIgnoredFile(folder.path)) return
     const newExcluded = isFolderSyncPathExcluded(folder.path, plugin)
@@ -153,6 +160,7 @@ export const folderRename = async function (folder: TFolder, oldPath: string, pl
  * 接收服务端文件夹修改通知
  */
 export const receiveFolderSyncModify = async function (data: { path: string, mtime?: number, lastTime?: number, pathHash?: string, pageIndex?: number }, plugin: FastSync) {
+    if (!(await waitForFolderActivity(plugin))) return
     if (plugin.settings.syncEnabled == false) return
     if (isFolderSyncPathExcluded(data.path, plugin)) {
         plugin.recordSyncCompleted('folder', data.pageIndex)
@@ -166,10 +174,11 @@ export const receiveFolderSyncModify = async function (data: { path: string, mti
         await plugin.lockManager.withLock(normalizedPath, async () => {
             plugin.addIgnoredFile(normalizedPath)
             try {
-                const existingFolder = plugin.app.vault.getAbstractFileByPath(normalizedPath)
-                if (!existingFolder) {
-                    try {
-                        await plugin.app.vault.createFolder(normalizedPath)
+                    const existingFolder = plugin.app.vault.getAbstractFileByPath(normalizedPath)
+                    if (!existingFolder) {
+                        try {
+                            if (!(await waitForFolderActivity(plugin))) return
+                            await plugin.app.vault.createFolder(normalizedPath)
                     } catch (e) {
                         if (!checkAndNotifyCaseConflict(e, data.path, plugin, 'FolderModify')) {
                             // 文件夹可能因并发创建已存在（Linux 上会抛 "Folder already exists"），忽略此错误
@@ -205,6 +214,7 @@ export const receiveFolderSyncModify = async function (data: { path: string, mti
  * 接收服务端文件夹删除通知
  */
 export const receiveFolderSyncDelete = async function (data: { path: string, lastTime?: number, pathHash?: string, pageIndex?: number }, plugin: FastSync) {
+    if (!(await waitForFolderActivity(plugin))) return
     if (plugin.settings.syncEnabled == false) return
     if (isFolderSyncPathExcluded(data.path, plugin)) {
         plugin.recordSyncCompleted('folder', data.pageIndex)
@@ -233,6 +243,7 @@ export const receiveFolderSyncDelete = async function (data: { path: string, las
                     }
                     // 记录待删除路径
                     plugin.lastSyncPathDeleted.add(normalizedPath)
+                    if (!(await waitForFolderActivity(plugin))) return
                     await vaultDelete(plugin.app.vault, folder, true)
                     plugin.folderSnapshotManager.removeFolder(normalizedPath)
                 } finally {
@@ -261,6 +272,7 @@ export const receiveFolderSyncDelete = async function (data: { path: string, las
  * 接收服务端文件夹重命名通知
  */
 export const receiveFolderSyncRename = async function (data: FolderSyncRenameMessage, plugin: FastSync) {
+    if (!(await waitForFolderActivity(plugin))) return
     if (plugin.settings.syncEnabled == false) return
     if (isFolderSyncPathExcluded(data.path, plugin) || isFolderSyncPathExcluded(data.oldPath, plugin)) {
         plugin.recordSyncCompleted('folder', data.pageIndex)
@@ -285,9 +297,11 @@ export const receiveFolderSyncRename = async function (data: FolderSyncRenameMes
                 try {
                     const target = plugin.app.vault.getAbstractFileByPath(normalizedNewPath)
                     if (target) {
+                        if (!(await waitForFolderActivity(plugin))) return
                         await vaultDelete(plugin.app.vault, target, true)
                     }
 
+                    if (!(await waitForFolderActivity(plugin))) return
                     await plugin.app.vault.rename(folder, normalizedNewPath)
                     plugin.folderSnapshotManager.removeFolder(normalizedOldPath)
                     plugin.folderSnapshotManager.setFolderMtime(normalizedNewPath, data.mtime || Date.now())
@@ -300,9 +314,10 @@ export const receiveFolderSyncRename = async function (data: FolderSyncRenameMes
                 }
             } else {
                 const target = plugin.app.vault.getAbstractFileByPath(normalizedNewPath)
-                if (!target) {
-                    try {
-                        await plugin.app.vault.createFolder(normalizedNewPath)
+                    if (!target) {
+                        try {
+                            if (!(await waitForFolderActivity(plugin))) return
+                            await plugin.app.vault.createFolder(normalizedNewPath)
                     } catch (e) {
                         if (!checkAndNotifyCaseConflict(e, data.path, plugin, 'FolderRename')) {
                             dump(`Folder create ignored (may already exist): ${normalizedNewPath}`, e)
@@ -332,6 +347,7 @@ export const receiveFolderSyncRename = async function (data: FolderSyncRenameMes
  * 接收文件夹同步结束通知
  */
 export const receiveFolderSyncEnd = async function (data: unknown, plugin: FastSync) {
+    if (!(await waitForFolderActivity(plugin))) return
     if (plugin.settings.syncEnabled == false) return
     dump(`Receive folder end:`, data)
 

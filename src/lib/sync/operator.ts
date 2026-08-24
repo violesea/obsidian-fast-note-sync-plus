@@ -18,6 +18,7 @@ import type { DirtyEntry, DirtySnapshot } from "./incremental_scan_manager";
 import { getPostSendSyncPhase } from "./sync_state";
 import { planChangeFeedRound, changeFeedDecisionInput, runChangeFeedCatchUp } from "./change_feed";
 import type { CatchUpResult as ChangeFeedCatchUpResult } from "./change_feed";
+import { isBackgroundActivityClosedError, requireForeground } from "./background_activity_gate";
 
 // C9: 离线超墓碑期保护 — 默认与服务端 soft-delete-retention-time 默认值对应（90 天），
 // 先硬编码常量；服务端墓碑物理清除窗口过后，长期离线设备重连若检测到"本地有服务端无"的
@@ -159,6 +160,7 @@ const scanIncrementalVaultEntries = async (
 ): Promise<Set<string>> => {
   const processed = new Set<string>();
   for (const entry of entries) {
+    await requireForeground(plugin);
     stats.enumeratedEntries++;
     const key = incrementalEntryKey(entry.kind, entry.path);
     if (entry.kind === "config") continue;
@@ -214,8 +216,9 @@ const scanIncrementalVaultEntries = async (
       else if (contentHash !== null) stats.cacheHits++;
       if (contentHash === null) {
         try {
+          await requireForeground(plugin);
           contentHash = await Promise.race([
-            hashContentAsync(await plugin.app.vault.read(file)),
+            hashContentAsync(await plugin.app.vault.read(file), plugin),
             new Promise<never>((_, reject) => window.setTimeout(() => reject(new Error("Hash timeout")), 15000)),
           ]);
           stats.hashComputed++;
@@ -225,7 +228,8 @@ const scanIncrementalVaultEntries = async (
             size: file.stat.size,
             ctime: file.stat.ctime,
           });
-        } catch {
+        } catch (error) {
+          if (isBackgroundActivityClosedError(error)) throw error;
           continue;
         }
       }
@@ -263,7 +267,7 @@ const scanIncrementalVaultEntries = async (
     if (contentHash === null) {
       try {
         contentHash = await Promise.race([
-          hashFileAsync(plugin.app, file.path),
+          hashFileAsync(plugin.app, file.path, plugin),
           new Promise<never>((_, reject) => window.setTimeout(() => reject(new Error("Hash timeout")), 15000)),
         ]);
         stats.hashComputed++;
@@ -273,7 +277,8 @@ const scanIncrementalVaultEntries = async (
           size: file.stat.size,
           ctime: file.stat.ctime,
         });
-      } catch {
+      } catch (error) {
+        if (isBackgroundActivityClosedError(error)) throw error;
         continue;
       }
     }
@@ -305,6 +310,7 @@ const scanIncrementalConfigEntries = async (
   const storageByPath = new Map(storageConfigs.map((item) => [item.path, item]));
 
   for (const entry of entries) {
+    await requireForeground(plugin);
     stats.enumeratedEntries++;
     if (entry.kind !== "config") continue;
     const key = incrementalEntryKey(entry.kind, entry.path);
@@ -343,14 +349,15 @@ const scanIncrementalConfigEntries = async (
       : plugin.configHashManager.getValidHash(entry.path, stat.mtime, stat.size, stat.ctime);
     if (contentHash === null) {
       try {
-        contentHash = await hashFileAsync(plugin.app, path);
+        contentHash = await hashFileAsync(plugin.app, path, plugin);
         plugin.scannedConfigHashes.set(entry.path, {
           hash: contentHash,
           mtime: stat.mtime,
           size: stat.size,
           ctime: stat.ctime,
         });
-      } catch {
+      } catch (error) {
+        if (isBackgroundActivityClosedError(error)) throw error;
         continue;
       }
     }
@@ -878,6 +885,7 @@ async function receiveSyncEndWrapper(data: unknown, plugin: FastSync, type: "not
         const isVirtual = path.startsWith(plugin.localStorageManager.syncPathPrefix)
         if (isVirtual) return { mtime: Date.now(), size: plugin.localStorageManager.getItemValue(plugin.localStorageManager.pathToKey(path) || "")?.length || 0 }
         try {
+          await requireForeground(plugin)
           return await plugin.app.vault.adapter.stat(normalizePath(path))
         } catch {
           return null
@@ -964,11 +972,13 @@ export const handleSync = async function (plugin: FastSync, isLoadLastTime: bool
   const adapter = plugin.app.vault.adapter;
   const conflictDir = `${getPluginDir(plugin)}/conflict-notes`;
   try {
+    await requireForeground(plugin);
     if (await adapter.exists(conflictDir)) {
       const files = await adapter.list(conflictDir);
       const deletePromises: Promise<void>[] = [];
       if (files && files.files) {
         for (const f of files.files) {
+          await requireForeground(plugin);
           deletePromises.push(adapter.remove(f));
         }
       }
@@ -1182,6 +1192,7 @@ export const handleSync = async function (plugin: FastSync, isLoadLastTime: bool
         plugin.incrementalScanManager?.markProcessed(processed);
         dump(`[IncrementalScan] event paths=${incrementalEntries.filter((entry) => entry.kind !== "config").length}, notes=${notes.length}, files=${files.length}, folders=${folders.length}`);
       } else {
+      await requireForeground(plugin);
       const list = plugin.app.vault.getAllLoadedFiles();
       let processedCount = 0;
       const totalFiles = list.length;
@@ -1216,6 +1227,7 @@ export const handleSync = async function (plugin: FastSync, isLoadLastTime: bool
       };
 
       const commitScanCheckpoint = async (): Promise<void> => {
+        await requireForeground(plugin);
         if (hashInFlight.size > 0) {
           await Promise.all(Array.from(hashInFlight));
         }
@@ -1231,6 +1243,7 @@ export const handleSync = async function (plugin: FastSync, isLoadLastTime: bool
       let lastScanCheckpointAt = Date.now();
 
       for (const file of list) {
+        await requireForeground(plugin);
         if (++processedCount % 20 === 0) {
           await yieldToMain();
           if (isPluginUnloading) {
@@ -1329,8 +1342,9 @@ export const handleSync = async function (plugin: FastSync, isLoadLastTime: bool
                 const notePath = file.path, noteMtime = file.stat.mtime, noteCtime = file.stat.ctime, noteSize = file.stat.size;
                 await scheduleHashTask(async () => {
                   try {
+                    await requireForeground(plugin);
                     const contentHash = await Promise.race([
-                      hashContentAsync(await plugin.app.vault.read(file)),
+                      hashContentAsync(await plugin.app.vault.read(file), plugin),
                       new Promise<never>((_, reject) => window.setTimeout(() => reject(new Error(`Hash timeout`)), 15000))
                     ]);
                     plugin.scannedNoteHashes.set(notePath, {
@@ -1349,7 +1363,8 @@ export const handleSync = async function (plugin: FastSync, isLoadLastTime: bool
                       size: noteSize,
                       ...(baseHash !== null ? { baseHash } : { baseHashMissing: true }),
                     });
-                  } catch {
+                  } catch (error) {
+                    if (isBackgroundActivityClosedError(error)) throw error;
                     // 哈希失败或超时，跳过该文件，不计入本轮同步 / Skip file on hash failure or timeout
                   }
                 });
@@ -1400,7 +1415,7 @@ export const handleSync = async function (plugin: FastSync, isLoadLastTime: bool
                 await scheduleHashTask(async () => {
                   try {
                     const contentHash = await Promise.race([
-                      hashFileAsync(plugin.app, attPath),
+                      hashFileAsync(plugin.app, attPath, plugin),
                       new Promise<never>((_, reject) => window.setTimeout(() => reject(new Error(`Hash timeout`)), 15000))
                     ]);
                     plugin.scannedFileHashes.set(attPath, {
@@ -1419,7 +1434,8 @@ export const handleSync = async function (plugin: FastSync, isLoadLastTime: bool
                       size: attSize,
                       ...(baseHash !== null ? { baseHash } : { baseHashMissing: true }),
                     });
-                  } catch {
+                  } catch (error) {
+                    if (isBackgroundActivityClosedError(error)) throw error;
                     // 哈希失败或超时，跳过该文件，不计入本轮同步 / Skip file on hash failure or timeout
                   }
                 });
@@ -1438,6 +1454,7 @@ export const handleSync = async function (plugin: FastSync, isLoadLastTime: bool
       }
 
       // Persist any newly computed hashes (breaks the Catch-22)
+      await requireForeground(plugin);
       commitScannedHashes(plugin.scannedNoteHashes, (entries) => plugin.fileHashManager.bulkSetFromScanned(entries));
       commitScannedHashes(plugin.scannedFileHashes, (entries) => plugin.fileHashManager.bulkSetFromScanned(entries));
       plugin.fileHashManager.flush();
@@ -1529,6 +1546,7 @@ export const handleSync = async function (plugin: FastSync, isLoadLastTime: bool
     let lastConfigCheckpointAt = Date.now();
 
     for (const path of configPaths) {
+      await requireForeground(plugin);
       if (++configCount % 20 === 0) { // 已将 50 优化为 20
         await sleep(0);
         if (isPluginUnloading) {
@@ -1600,7 +1618,7 @@ export const handleSync = async function (plugin: FastSync, isLoadLastTime: bool
           scanStats.metadataChanged++;
           scanStats.hashComputed++;
           try {
-            contentHash = await hashFileAsync(plugin.app, path);
+            contentHash = await hashFileAsync(plugin.app, path, plugin);
             // 暂存哈希，待同步结束时统一存入 (Temporarily store hash, commit on sync end)
             plugin.scannedConfigHashes.set(path, {
               hash: contentHash,
@@ -1610,6 +1628,7 @@ export const handleSync = async function (plugin: FastSync, isLoadLastTime: bool
             });
             // 注意：hashFileAsync 内部已经带了 [Calc] 类型的 dump
           } catch (e) {
+            if (isBackgroundActivityClosedError(e)) throw e;
             console.warn(`[FastNoteSync] 哈希配置失败，跳过: ${path}`, e);
             continue;
           }
@@ -1627,12 +1646,14 @@ export const handleSync = async function (plugin: FastSync, isLoadLastTime: bool
           size: stat.size
         });
       } catch (e) {
+        if (isBackgroundActivityClosedError(e)) throw e;
         const errorMsg = e instanceof Error ? e.message : String(e);
         console.warn(`[FastNoteSync] 跳过异常配置文件 ${path}: ${errorMsg}`);
         dump(`Error processing config file ${path}:`, e);
       }
     }
 
+    await requireForeground(plugin);
     // Persist the final partial checkpoint as well; relying on SyncEnd would
     // lose the local cache when the transport dies after scanning.
     commitScannedHashes(plugin.scannedConfigHashes, (entries) => plugin.configHashManager.bulkSetFromScanned(entries));
@@ -1885,6 +1906,10 @@ export const handleSync = async function (plugin: FastSync, isLoadLastTime: bool
     }, 100);
     plugin.syncState.progressCheckIntervalId = progressCheckInterval;
   } catch (error) {
+    if (isBackgroundActivityClosedError(error)) {
+      dump("Sync abandoned because the plugin is unloading");
+      return;
+    }
     dump("Sync failed with error: " + (error instanceof Error ? error.message : String(error)));
     // 归属判断：只有当前活跃上下文仍是本次会话时才清空/重置，防止旧会话的迟到异常
     // （例如断线重连后旧会话 BatchAck 15s 超时才抛出）把已经在跑的新会话状态清掉

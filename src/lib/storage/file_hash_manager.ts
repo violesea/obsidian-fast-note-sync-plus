@@ -1,5 +1,6 @@
 import { hashContentAsync, dump, isPathExcluded, showSyncNotice, isLargeBinarySyncRisk, describeBinarySyncLimit, logMemorySnapshot, hashFileAsync, debounce, LocalStateFileMirror } from "../utils/helpers";
 import type FastSync from "../../main";
+import { isBackgroundActivityClosedError, requireForeground, waitForForeground } from "../sync/background_activity_gate";
 
 
 /**
@@ -101,6 +102,7 @@ export class FileHashManager {
    * 立即将脏数据落盘（用于同步结束、插件卸载等需要保证持久化的时机）
    */
   flush(): void {
+    if (this.plugin.backgroundActivityGate?.isBackgrounded || this.plugin.backgroundActivityGate?.isClosed) return;
     if (this.hashMapDirty) {
       this.hashMapDirty = false;
       this.saveHashMapToStorage();
@@ -116,6 +118,7 @@ export class FileHashManager {
   }
 
   async flushAsync(): Promise<void> {
+    if (!(await waitForForeground(this.plugin))) return;
     if (this.hashMapDirty) {
       this.hashMapDirty = false;
       this.saveHashMapToStorage();
@@ -302,6 +305,7 @@ export class FileHashManager {
     const notice = showSyncNotice("正在初始化文件哈希映射...", 0);
 
     try {
+      await requireForeground(this.plugin);
       const files = this.plugin.app.vault.getFiles();
 
       const totalFiles = files.length;
@@ -344,6 +348,7 @@ export class FileHashManager {
       let lastCheckpointProcessed = 0;
       let lastCheckpointAt = Date.now();
       const saveCheckpoint = async (): Promise<void> => {
+        await requireForeground(this.plugin);
         if (hashInFlight.size > 0) {
           await Promise.all(Array.from(hashInFlight));
         }
@@ -407,11 +412,13 @@ export class FileHashManager {
             // 根据文件类型选择不同的哈希计算方式
             if (file.extension === "md") {
               // md 文件使用文本内容计算哈希
+              await requireForeground(this.plugin);
               let content: string | null = await this.plugin.app.vault.read(file);
-              contentHash = await hashContentAsync(content);
+              await requireForeground(this.plugin);
+              contentHash = await hashContentAsync(content, this.plugin);
               content = null; // 显式释放引用 (Explicitly release reference)
             } else {
-              contentHash = await hashFileAsync(this.plugin.app, file.path);
+              contentHash = await hashFileAsync(this.plugin.app, file.path, this.plugin);
               logMemorySnapshot(`after hash ${file.path}`);
             }
 
@@ -423,6 +430,7 @@ export class FileHashManager {
             });
             hashMapChangedSinceCheckpoint = true;
           } catch (error) {
+            if (isBackgroundActivityClosedError(error)) throw error;
             // 单个文件哈希计算失败不应中断整个构建过程
             const msg = error instanceof Error ? error.message : String(error);
             dump(`FileHashManager: 计算哈希失败，跳过文件: ${file.path}`, error);
@@ -452,6 +460,7 @@ export class FileHashManager {
       for (const path of this.hashMap.keys()) {
         if (!seenPaths.has(path)) this.hashMap.delete(path);
       }
+      await requireForeground(this.plugin);
       this.saveHashMapToStorage();
       this.buildState = {
         ...this.buildState,
@@ -470,6 +479,11 @@ export class FileHashManager {
 
       dump(`[HashBuild] phase=ready generation=${this.buildState.generation} enumeratedEntries=${totalFiles} hashComputed=${hashComputed} cacheHits=${cacheHits}`);
     } catch (error) {
+      if (isBackgroundActivityClosedError(error)) {
+        notice.hide();
+        dump("FileHashManager: build abandoned because the plugin is unloading");
+        return;
+      }
       this.buildState = {
         ...this.buildState,
         phase: "building",

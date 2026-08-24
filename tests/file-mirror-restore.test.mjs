@@ -64,6 +64,8 @@ const helpersRequireStub = (id) => {
         setLogEnabled: () => undefined,
         logLevel: () => undefined,
       };
+    case "../sync/background_activity_gate":
+      return { requireForeground: async () => undefined };
     default:
       throw new Error(`Unexpected require in helpers: ${id}`);
   }
@@ -80,6 +82,12 @@ const fhmRequireStub = (id) => {
       return helpers;
     case "../../main":
       return {};
+    case "../sync/background_activity_gate":
+      return {
+        isBackgroundActivityClosedError: () => false,
+        requireForeground: async () => undefined,
+        waitForForeground: async () => true,
+      };
     default:
       throw new Error(`Unexpected require in file_hash_manager: ${id}`);
   }
@@ -124,6 +132,29 @@ function makeFakePlugin(localStorageMap, fileMap, { onGetFiles } = {}) {
 
 const MIRROR_PATH = ".obsidian/plugins/fast-note-sync/fileHashMap.json";
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+function makeActivityGate() {
+  return {
+    state: "foreground",
+    waiters: [],
+    markBackgrounded() { this.state = "background"; },
+    markForegrounded() {
+      this.state = "foreground";
+      const waiters = this.waiters.splice(0);
+      for (const resolve of waiters) resolve(true);
+    },
+    close() {
+      this.state = "closed";
+      const waiters = this.waiters.splice(0);
+      for (const resolve of waiters) resolve(false);
+    },
+    waitUntilForeground() {
+      if (this.state === "foreground") return Promise.resolve(true);
+      if (this.state === "closed") return Promise.resolve(false);
+      return new Promise((resolve) => this.waiters.push(resolve));
+    },
+  };
+}
 
 // === 场景 A：写入哈希 → flush → localStorage 与镜像文件都有数据 ===
 {
@@ -191,6 +222,27 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
   await mgr.initialize();
   assert.equal(rebuilt, true, "双空时应触发重建");
   assert.equal(mgr.isReady(), true);
+}
+
+// === 场景 F：移动端后台不启动新的镜像写入，回前台后继续落盘 ===
+{
+  const ls = new Map();
+  const files = new Map();
+  const plugin = makeFakePlugin(ls, files);
+  plugin.backgroundActivityGate = makeActivityGate();
+  const mgr = new FileHashManager(plugin);
+  await mgr.initialize();
+  files.clear();
+
+  plugin.backgroundActivityGate.markBackgrounded();
+  mgr.setFileHash("notes/background.md", "hash-background", 444, 40);
+  mgr.flush();
+  await Promise.resolve();
+  assert.equal(files.has(MIRROR_PATH), false, "后台 flush 不应启动镜像写入");
+
+  plugin.backgroundActivityGate.markForegrounded();
+  await mgr.flushAsync();
+  assert.equal(files.has(MIRROR_PATH), true, "回前台后应继续写入镜像");
 }
 
 // === 场景 D：旧版绑定库名的 key 迁移到稳定 key ===
