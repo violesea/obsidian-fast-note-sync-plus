@@ -42,6 +42,10 @@ const requireStub = (id) => {
   };
   if (id === "../../main") return {};
   if (id === "./background_activity_gate") return { waitForForeground: async () => true };
+  if (id === "./stable_capture") return {
+    captureStableSnapshot: async () => ({ value: "", hash: "0", stat: { size: 0, mtime: 0, ctime: 0 } }),
+    stableCaptureCoordinator: { capture: async (_key, task) => task() },
+  };
   throw new Error(`Unexpected require: ${id}`);
 };
 

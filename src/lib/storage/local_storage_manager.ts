@@ -8,7 +8,9 @@ type MirroredMetadataField =
     | 'lastConfigSyncTime'
     | 'lastFolderSyncTime'
     | 'lastSyncSuccessTime'
-    | 'isInitSync';
+    | 'isInitSync'
+    | 'cloudPreviewAttachmentCheckState'
+    | 'changeFeedHealth';
 
 const MIRRORED_METADATA_FIELDS: readonly MirroredMetadataField[] = [
     'lastNoteSyncTime',
@@ -17,6 +19,8 @@ const MIRRORED_METADATA_FIELDS: readonly MirroredMetadataField[] = [
     'lastFolderSyncTime',
     'lastSyncSuccessTime',
     'isInitSync',
+    'cloudPreviewAttachmentCheckState',
+    'changeFeedHealth',
 ];
 
 
@@ -57,7 +61,7 @@ export class LocalStorageManager {
         return `fns-${field}`;
     }
 
-    getMetadata(field: 'lastNoteSyncTime' | 'lastFileSyncTime' | 'lastConfigSyncTime' | 'lastFolderSyncTime' | 'lastSyncSuccessTime' | 'clientName' | 'isInitSync' | 'serverVersion' | 'serverChangelog' | 'serverVersionIsNew' | 'serverVersionNewName' | 'serverVersionNewLink' | 'serverVersionNewChangelogContent' | 'serverVersionChangelogContent' | 'pluginVersionIsNew' | 'pluginVersionNewName' | 'pluginVersionNewLink' | 'pluginVersionNewChangelogContent' | 'pluginVersionChangelogContent' | 'internalExcludes' | 'apiToken' | 'apiUrl' | 'vault' | 'autoRedirectEnabled' | 'wsPreProbeEnabled' | 'serverVersionHistory' | 'pluginVersionHistory'): unknown {
+    getMetadata(field: 'lastNoteSyncTime' | 'lastFileSyncTime' | 'lastConfigSyncTime' | 'lastFolderSyncTime' | 'lastSyncSuccessTime' | 'clientName' | 'isInitSync' | 'cloudPreviewAttachmentCheckState' | 'changeFeedHealth' | 'serverVersion' | 'serverChangelog' | 'serverVersionIsNew' | 'serverVersionNewName' | 'serverVersionNewLink' | 'serverVersionNewChangelogContent' | 'serverVersionChangelogContent' | 'pluginVersionIsNew' | 'pluginVersionNewName' | 'pluginVersionNewLink' | 'pluginVersionNewChangelogContent' | 'pluginVersionChangelogContent' | 'internalExcludes' | 'apiToken' | 'apiUrl' | 'vault' | 'autoRedirectEnabled' | 'wsPreProbeEnabled' | 'serverVersionHistory' | 'pluginVersionHistory'): unknown {
         const newKey = this.getInternalKey(field);
         let value = this.read(newKey);
 
@@ -100,7 +104,7 @@ export class LocalStorageManager {
     /**
      * 设置元数据项
      */
-    setMetadata(field: 'lastNoteSyncTime' | 'lastFileSyncTime' | 'lastConfigSyncTime' | 'lastFolderSyncTime' | 'lastSyncSuccessTime' | 'clientName' | 'isInitSync' | 'serverVersion' | 'serverChangelog' | 'serverVersionIsNew' | 'serverVersionNewName' | 'serverVersionNewLink' | 'serverVersionNewChangelogContent' | 'serverVersionChangelogContent' | 'pluginVersionIsNew' | 'pluginVersionNewName' | 'pluginVersionNewLink' | 'pluginVersionNewChangelogContent' | 'pluginVersionChangelogContent' | 'internalExcludes' | 'apiToken' | 'apiUrl' | 'vault' | 'autoRedirectEnabled' | 'wsPreProbeEnabled' | 'serverVersionHistory' | 'pluginVersionHistory', value: unknown): void {
+    setMetadata(field: 'lastNoteSyncTime' | 'lastFileSyncTime' | 'lastConfigSyncTime' | 'lastFolderSyncTime' | 'lastSyncSuccessTime' | 'clientName' | 'isInitSync' | 'cloudPreviewAttachmentCheckState' | 'changeFeedHealth' | 'serverVersion' | 'serverChangelog' | 'serverVersionIsNew' | 'serverVersionNewName' | 'serverVersionNewLink' | 'serverVersionNewChangelogContent' | 'serverVersionChangelogContent' | 'pluginVersionIsNew' | 'pluginVersionNewName' | 'pluginVersionNewLink' | 'pluginVersionNewChangelogContent' | 'pluginVersionChangelogContent' | 'internalExcludes' | 'apiToken' | 'apiUrl' | 'vault' | 'autoRedirectEnabled' | 'wsPreProbeEnabled' | 'serverVersionHistory' | 'pluginVersionHistory', value: unknown): void {
         const stringValue = String(value);
         this.write(this.getInternalKey(field), stringValue);
         if ((MIRRORED_METADATA_FIELDS as readonly string[]).includes(field)) {
@@ -182,6 +186,8 @@ export class LocalStorageManager {
         this.setMetadata('lastConfigSyncTime', 0);
         this.setMetadata('lastFolderSyncTime', 0);
         this.setMetadata('isInitSync', false);
+        this.setMetadata('cloudPreviewAttachmentCheckState', '');
+        this.setMetadata('changeFeedHealth', '');
         this.plugin.incrementalScanManager?.requestFullReconcile();
         // 同步清除持久化的冲突路径，避免重启后旧冲突记录在全新同步后误触发冲突列表弹窗
         // Also clear persisted conflicted paths so stale conflicts don't re-surface after a fresh sync

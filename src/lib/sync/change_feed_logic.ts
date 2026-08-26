@@ -60,6 +60,13 @@ export interface ChangeFeedDecisionInput {
 
 export type ChangeFeedPlan = "off" | "defer" | "adopt" | "poll";
 
+export interface ChangeFeedResumeInput {
+  enabled: boolean;
+  sidecarUrl: string;
+  syncEnabled: boolean;
+  syncMode: string;
+}
+
 /** 采纳游标的安全回溯窗口（条）。覆盖设备离线期间的变更缺口；
  * 重复应用是幂等的（哈希命中即跳过），更早的缺口由 M3 digest 兜底。 */
 export const ADOPTION_BACKTRACK_REVS = 5000;
@@ -102,6 +109,18 @@ export function planChangeFeedRound(input: ChangeFeedDecisionInput): ChangeFeedP
   }
   if (input.cursorRev <= 0) return "defer";
   return "poll";
+}
+
+/**
+ * A prepared v1 snapshot is stale after a transport interruption when the
+ * change-feed path is enabled. The next authenticated connection must start a
+ * new logical round so it re-evaluates the cursor and runs catch-up again.
+ */
+export function shouldRestartFreshRoundOnResume(input: ChangeFeedResumeInput): boolean {
+  return input.enabled
+    && input.syncEnabled
+    && input.syncMode === "auto"
+    && input.sidecarUrl.trim() !== "";
 }
 
 // ---------------------------------------------------------------- 分类 ---

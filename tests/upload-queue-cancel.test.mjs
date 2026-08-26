@@ -55,6 +55,18 @@ const requireStub = (id) => {
       return { HttpApiService: class {} };
     case "./background_activity_gate":
       return { waitForForeground: async () => true };
+    case "./cloud_preview_reconciliation":
+      return {
+        advanceCloudPreviewCheckState: (state, pathName) => ({ ...state, nextPath: pathName }),
+        completeCloudPreviewCheckState: (state) => ({ ...state, complete: true }),
+        parseCloudPreviewCheckState: (_raw, mode) => ({ schema: 1, mode, nextPath: "", complete: false, updatedAt: 0 }),
+        serializeCloudPreviewCheckState: (state) => JSON.stringify(state),
+      };
+    case "./stable_capture":
+      return {
+        captureStableSnapshot: async () => ({ hash: "hash", stat: { size: 1, mtime: 1, ctime: 1 } }),
+        stableCaptureCoordinator: { capture: async (_key, task) => task() },
+      };
     default:
       throw new Error(`Unexpected require: ${id}`);
   }

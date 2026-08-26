@@ -36,6 +36,7 @@ import {
   parseChangesResponse,
   parseRegisterResponse,
   planChangeFeedRound,
+  shouldRestartFreshRoundOnResume,
   selectApplicableChanges,
 } from "./change_feed_logic";
 import type { ChangesResponse, RegisterResponse, SidecarChange } from "./change_feed_logic";
@@ -554,4 +555,4 @@ export function changeFeedDecisionInput(plugin: FastSync, syncMode: string) {
   };
 }
 
-export { planChangeFeedRound };
+export { planChangeFeedRound, shouldRestartFreshRoundOnResume };

@@ -5,8 +5,19 @@ import { hashContent, hashContentAsync, dump, dumpError, isPathExcluded, getSafe
 import { SyncLogManager } from "./sync_log_manager";
 import type FastSync from "../../main";
 import { waitForForeground } from "./background_activity_gate";
+import { captureStableSnapshot, stableCaptureCoordinator } from "./stable_capture";
 
 const waitForNoteActivity = async (plugin: FastSync): Promise<boolean> => waitForForeground(plugin);
+
+const readStableStat = async (plugin: FastSync, path: string) => {
+  const stat = await plugin.app.vault.adapter.stat(path);
+  if (!stat) return null;
+  return { size: stat.size, mtime: stat.mtime, ctime: stat.ctime };
+};
+
+const stableCaptureKey = (plugin: FastSync, path: string): string => (
+  `${plugin.settings.vault}:${path}`
+);
 
 const EMPTY_NOTE_HASH = hashContent("");
 const MAX_EMPTY_NOTE_REPAIRS_PER_ROUND = 20;
@@ -61,41 +72,59 @@ export const noteModify = async function (file: TAbstractFile, plugin: FastSync,
   if (eventEnter && plugin.isIgnoredFile(file.path)) return
   if (isPathExcluded(file.path, plugin)) return
 
+  const initialBaseHash = plugin.fileHashManager.getPathHash(file.path)
+  const initialCachedHash = plugin.fileHashManager.getValidHash(file.path, file.stat.mtime, file.stat.size, file.stat.ctime)
+  const initialLastSyncMtime = plugin.lastSyncMtime.get(file.path)
+  if (initialCachedHash !== null
+    && ((initialCachedHash === initialBaseHash && initialLastSyncMtime !== undefined && initialLastSyncMtime === file.stat.mtime)
+      || plugin.pendingNoteModifies.get(file.path) === initialCachedHash)) {
+    dump(`Note modify intercepted (stable cache match): ${file.path}`)
+    plugin.incrementalScanManager?.markSent("note", file.path)
+    plugin.incrementalScanManager?.acknowledge("note", file.path)
+    return
+  }
+
+  const capture = await stableCaptureCoordinator.capture(
+    stableCaptureKey(plugin, file.path),
+    () => captureStableSnapshot({
+      stat: () => readStableStat(plugin, file.path),
+      read: () => plugin.app.vault.read(file),
+      hash: (content) => hashContentAsync(content ?? "", plugin),
+    }),
+  );
+  if (!capture || typeof capture.value !== "string") {
+    dump(`[StableCapture] Note changed during quiet window; discarded: ${file.path}`)
+    return;
+  }
+
   await plugin.lockManager.withLock(file.path, async () => {
     plugin.addIgnoredFile(file.path)
 
     try {
       const baseHash = plugin.fileHashManager.getPathHash(file.path)
       const lastSyncMtime = plugin.lastSyncMtime.get(file.path)
+      const content = capture.value;
+      const contentHash = capture.hash;
+      const stableStat = capture.stat;
 
-      // --- 优化：先尝试从缓存获取有效哈希 ---
-      let contentHash = plugin.fileHashManager.getValidHash(file.path, file.stat.mtime, file.stat.size, file.stat.ctime);
-      let content: string | null = null;
-
-      if (contentHash !== null) {
-        // 如果哈希有效，且与 baseHash 和最后同步时间一致，则拦截
-        if (contentHash === baseHash && (lastSyncMtime !== undefined && lastSyncMtime === file.stat.mtime)) {
-          dump(`Note modify intercepted (cache match): ${file.path}`)
-          plugin.incrementalScanManager?.markSent("note", file.path)
-          plugin.incrementalScanManager?.acknowledge("note", file.path)
-          return
-        }
-      } else {
-        // 缓存失效或不存在，计算新哈希
-        if (!(await waitForNoteActivity(plugin))) return
-        content = await plugin.app.vault.read(file)
-        contentHash = await hashContentAsync(content, plugin)
+      if (plugin.pendingNoteModifies.get(file.path) === contentHash) {
+        dump(`Note modify intercepted (pending hash match): ${file.path}`)
+        plugin.incrementalScanManager?.markSent("note", file.path)
+        plugin.incrementalScanManager?.acknowledge("note", file.path)
+        return
       }
 
-      if (content === null) {
-        if (!(await waitForNoteActivity(plugin))) return
-        content = await plugin.app.vault.read(file)
+      if (contentHash === baseHash && lastSyncMtime !== undefined && lastSyncMtime === stableStat.mtime) {
+        dump(`Note modify intercepted (stable capture matches baseline): ${file.path}`)
+        plugin.incrementalScanManager?.markSent("note", file.path)
+        plugin.incrementalScanManager?.acknowledge("note", file.path)
+        return
       }
 
       const data = {
         vault: plugin.settings.vault,
-        ctime: getSafeCtime(file.stat),
-        mtime: file.stat.mtime,
+        ctime: stableStat.ctime ?? getSafeCtime(file.stat),
+        mtime: stableStat.mtime,
         path: file.path,
         pathHash: hashContent(file.path),
         content: content,

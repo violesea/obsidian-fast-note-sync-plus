@@ -46,6 +46,28 @@ assert.equal(L.planChangeFeedRound({ ...base, cursorRev: null }), "adopt");
 assert.equal(L.planChangeFeedRound({ ...base, cursorRev: 457200 }), "poll");
 assert.equal(L.planChangeFeedRound({ ...base, cursorRev: 0 }), "defer");
 
+// Contract: a change-feed round does not resend a stale prepared snapshot
+// after reconnect; disabled, empty-sidecar, and partial-sync rounds retain the
+// legacy prepared-snapshot behavior.
+assert.equal(L.shouldRestartFreshRoundOnResume({
+  enabled: true,
+  sidecarUrl: base.sidecarUrl,
+  syncEnabled: true,
+  syncMode: "auto",
+}), true);
+assert.equal(L.shouldRestartFreshRoundOnResume({
+  enabled: true,
+  sidecarUrl: "",
+  syncEnabled: true,
+  syncMode: "auto",
+}), false);
+assert.equal(L.shouldRestartFreshRoundOnResume({
+  enabled: true,
+  sidecarUrl: base.sidecarUrl,
+  syncEnabled: true,
+  syncMode: "note",
+}), false);
+
 // ------------------------------------------------------------ classify ---
 const mk = (over) => ({ rev: 1, type: "note", action: "modify", path: "a/b.md", path_hash: "ph", content_hash: "ch", ...over });
 const noExcl = () => false;

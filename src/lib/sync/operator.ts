@@ -18,8 +18,16 @@ import type { DirtyEntry, DirtySnapshot } from "./incremental_scan_manager";
 import { collectIncrementalReconciliationEntries } from "./incremental_reconciliation";
 import type { ReconciliationLocalEntry } from "./incremental_reconciliation";
 import { getPostSendSyncPhase } from "./sync_state";
-import { planChangeFeedRound, changeFeedDecisionInput, runChangeFeedCatchUp } from "./change_feed";
+import { planChangeFeedRound, changeFeedDecisionInput, runChangeFeedCatchUp, shouldRestartFreshRoundOnResume } from "./change_feed";
 import type { CatchUpResult as ChangeFeedCatchUpResult } from "./change_feed";
+import {
+  markChangeFeedFallbackAlerted,
+  parseChangeFeedHealthState,
+  recordChangeFeedFallback,
+  recordChangeFeedSuccess,
+  serializeChangeFeedHealthState,
+  shouldAlertChangeFeedFallback,
+} from "./change_feed_health";
 import { isBackgroundActivityClosedError, requireForeground } from "./background_activity_gate";
 
 // C9: 离线超墓碑期保护 — 默认与服务端 soft-delete-retention-time 默认值对应（90 天），
@@ -1070,13 +1078,30 @@ export const handleSync = async function (plugin: FastSync, isLoadLastTime: bool
     // ─── FNS v2 变更流门（M2）：连接就绪后先按游标追平，成功则本轮强制增量路径 ───
     // 追平失败（sidecar 不可达/409 过期/未配置）一律回落 v1 原路径，绝不阻塞常规同步。
     let changeFeedResult: ChangeFeedCatchUpResult | null = null;
+    let changeFeedPlan = "off";
+    let changeFeedHealth = parseChangeFeedHealthState(
+      plugin.localStorageManager.getMetadata("changeFeedHealth"),
+    );
     if (plugin.settings.changeFeedEnabled && plugin.settings.syncEnabled && syncMode === "auto") {
       const plan = planChangeFeedRound(changeFeedDecisionInput(plugin, syncMode));
+      changeFeedPlan = plan;
       if (plan === "adopt" || plan === "poll") {
         changeFeedResult = await runChangeFeedCatchUp(plugin, context);
         if (!changeFeedResult.ok) {
+          const reason = changeFeedResult.reason ?? "unknown";
+          changeFeedHealth = recordChangeFeedFallback(changeFeedHealth, reason);
+          plugin.localStorageManager.setMetadata("changeFeedHealth", serializeChangeFeedHealthState(changeFeedHealth));
+          const fallbackMessage = `⚠ 变更流回落：${reason} · 连续 ${changeFeedHealth.consecutiveFallbacks} 轮`;
+          plugin.updateStatusBar(fallbackMessage);
+          if (shouldAlertChangeFeedFallback(changeFeedHealth)) {
+            changeFeedHealth = markChangeFeedFallbackAlerted(changeFeedHealth);
+            plugin.localStorageManager.setMetadata("changeFeedHealth", serializeChangeFeedHealthState(changeFeedHealth));
+            showSyncNotice(`变更流已连续 ${changeFeedHealth.consecutiveFallbacks} 轮回落，原因：${reason}`, 10000);
+          }
           dump(`[ChangeFeed] catch-up failed (${changeFeedResult.reason}); falling back to v1 path this round`);
         } else {
+          changeFeedHealth = recordChangeFeedSuccess(changeFeedHealth);
+          plugin.localStorageManager.setMetadata("changeFeedHealth", serializeChangeFeedHealthState(changeFeedHealth));
           dump(`[ChangeFeed] mode=${changeFeedResult.mode} cursor ${changeFeedResult.cursorFrom}->${changeFeedResult.cursorTo} fetched=${changeFeedResult.fetched} deleted=${changeFeedResult.deleted} skipped=${changeFeedResult.skipped}`);
         }
       }
@@ -1114,6 +1139,7 @@ export const handleSync = async function (plugin: FastSync, isLoadLastTime: bool
     };
     let scanMode = fastIncremental ? "incremental" : metadataReconciliation ? "metadata-reconcile" : "full";
     if (changeFeedResult?.ok) scanMode = "change-feed";
+    if (changeFeedResult && !changeFeedResult.ok) scanMode = "change-feed-fallback";
 
     const shouldSyncNotes = syncMode === "auto" || syncMode === "note";
     const shouldSyncConfigs = syncMode === "auto" || syncMode === "config";
@@ -1795,6 +1821,17 @@ export const handleSync = async function (plugin: FastSync, isLoadLastTime: bool
         dirtyJournalEntries: scanStats.dirtyJournalEntries,
         pendingJournalEntries: plugin.incrementalScanManager?.getPendingCount() ?? 0,
         baselineGeneration: buildStats.generation,
+        changeFeedPlan,
+        changeFeedStatus: changeFeedResult?.ok
+          ? "active"
+          : changeFeedResult
+            ? "fallback"
+            : changeFeedPlan === "defer"
+              ? "deferred"
+              : "off",
+        changeFeedFallbackConsecutive: changeFeedHealth.consecutiveFallbacks,
+        changeFeedFallbackTotal: changeFeedHealth.totalFallbacks,
+        changeFeedLastFallbackReason: changeFeedHealth.lastReason,
         // 变更流轮次（A-4 验收）：enumeratedEntries 必须为 0，游标区间可与服务端 sync_log 对账
         ...(changeFeedResult?.ok ? {
           changesRequested: changeFeedResult.fetched ?? 0,
@@ -1880,6 +1917,29 @@ export const handleSync = async function (plugin: FastSync, isLoadLastTime: bool
       void (async () => {
         try {
           if (!await waitForSyncConnection(plugin, context)) return;
+          if (shouldRestartFreshRoundOnResume({
+            enabled: plugin.settings.changeFeedEnabled === true,
+            sidecarUrl: plugin.settings.sidecarUrl ?? "",
+            syncEnabled: plugin.settings.syncEnabled !== false,
+            syncMode,
+          })) {
+            // A change-feed cursor must be re-evaluated after reconnect. The
+            // prepared snapshot belongs to the old transport and can hide
+            // changes that arrived while this round was suspended.
+            resetTransportAttempt();
+            plugin.incrementalScanManager?.abortSync();
+            plugin.syncState.clearScannedHashCaches();
+            plugin.clearSyncContext(context);
+            plugin.syncState.resumePendingSync = undefined;
+            plugin.syncState.activeSyncContext = null;
+            plugin.syncState.transportResetPending = false;
+            plugin.syncState.syncPhase = "idle";
+            plugin.isSyncRequesting = false;
+            plugin.isSyncing = false;
+            dump(`[ChangeFeed] transport resumed; abandoning prepared snapshot and starting a fresh round`);
+            void handleSync(plugin, true, syncMode);
+            return;
+          }
           // A service restart invalidates all server-side page/session state.
           // Keep the prepared local snapshot, but bind its retry to a fresh
           // context so no old page ACK or download session can be reused.

@@ -159,6 +159,8 @@ export interface FileInfoResponse {
 export interface ApiResponse<T = unknown> {
     code: number;
     message?: string;
+    details?: unknown;
+    status?: boolean;
     data: T;
 }
 
@@ -480,7 +482,7 @@ export class HttpApiService {
      * 获取服务端文件信息
      * 用于在删除本地文件前核对状态
      */
-    async getFileInfo(path: string): Promise<FileInfoResponse> {
+    async getFileInfo(path: string): Promise<FileInfoResponse | null> {
         const params = new URLSearchParams({
             vault: this.plugin.settings.vault,
             path: path,
@@ -494,13 +496,23 @@ export class HttpApiService {
             method: "GET"
         });
 
-        if (status !== 200 || !this.isSuccess(json)) {
-            const res = json as ApiResponse<unknown>;
+        const res = json as ApiResponse<unknown>;
+        // The file-info endpoint uses HTTP 200 with a business-level
+        // "record not found" envelope for a missing remote attachment. That
+        // is an expected reconciliation result, not a transport failure.
+        // Keep all other non-success responses exceptional so callers do not
+        // accidentally treat auth/network/server failures as missing files.
+        if (res?.code === 0
+            && typeof res.details === "string"
+            && res.details.trim().toLowerCase() === "record not found") {
+            return null;
+        }
+
+        if (status !== 200 || !this.isSuccess(res)) {
             throw new Error(res?.message || `HTTP ${status}: Failed to fetch file info`);
         }
 
-        const res = json as ApiResponse<FileInfoResponse>;
-        return res.data;
+        return (res as ApiResponse<FileInfoResponse>).data;
     }
 
     /**

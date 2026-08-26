@@ -7,8 +7,25 @@ import { SyncLogManager } from "./sync_log_manager";
 import { HttpApiService } from "../api/http_api_service";
 import type FastSync from "../../main";
 import { waitForForeground } from "./background_activity_gate";
+import {
+  advanceCloudPreviewCheckState,
+  completeCloudPreviewCheckState,
+  parseCloudPreviewCheckState,
+  serializeCloudPreviewCheckState,
+} from "./cloud_preview_reconciliation";
+import { captureStableSnapshot, stableCaptureCoordinator } from "./stable_capture";
 
 const waitForFileActivity = async (plugin: FastSync): Promise<boolean> => waitForForeground(plugin);
+
+const readStableStat = async (plugin: FastSync, path: string) => {
+  const stat = await plugin.app.vault.adapter.stat(path);
+  if (!stat) return null;
+  return { size: stat.size, mtime: stat.mtime, ctime: stat.ctime };
+};
+
+const stableCaptureKey = (plugin: FastSync, path: string): string => (
+  `${plugin.settings.vault}:${path}`
+);
 
 
 // 下载内存缓冲控制 (20MB 阈值防止 OOM)
@@ -27,6 +44,9 @@ type ActiveUpload = {
 }
 const activeUploadsMap = new Map<string, ActiveUpload>()
 let uploadQueueGeneration = 0
+
+const CLOUD_PREVIEW_CHECK_STATE = "cloudPreviewAttachmentCheckState" as const;
+let cloudPreviewCheckPromise: Promise<void> | null = null;
 
 // 全局中止信号，用于插件卸载时
 export let isPluginUnloading = false;
@@ -295,25 +315,50 @@ export const fileModify = async function (file: TAbstractFile, plugin: FastSync,
     return
   }
 
+  const initialBaseHash = plugin.fileHashManager.getPathHash(file.path)
+  const initialCachedHash = plugin.fileHashManager.getValidHash(file.path, file.stat.mtime, file.stat.size, file.stat.ctime)
+  const initialLastSyncMtime = plugin.lastSyncMtime.get(file.path)
+  if (initialCachedHash !== null
+    && ((initialCachedHash === initialBaseHash && initialLastSyncMtime !== undefined && initialLastSyncMtime === file.stat.mtime)
+      || plugin.pendingUploadHashes.get(file.path) === initialCachedHash)) {
+    dump(`File modify intercepted (stable cache match): ${file.path}`)
+    plugin.incrementalScanManager?.markSent("file", file.path)
+    plugin.incrementalScanManager?.acknowledge("file", file.path)
+    return
+  }
+
+  const capture = await stableCaptureCoordinator.capture(
+    stableCaptureKey(plugin, file.path),
+    () => captureStableSnapshot({
+      stat: () => readStableStat(plugin, file.path),
+      hash: async () => hashFileAsync(plugin.app, file.path, plugin),
+    }),
+  );
+  if (!capture) {
+    dump(`[StableCapture] File changed during quiet window; discarded: ${file.path}`)
+    return;
+  }
+
   await plugin.lockManager.withLock(file.path, async () => {
     plugin.addIgnoredFile(file.path)
     try {
       const baseHash = plugin.fileHashManager.getPathHash(file.path)
       const lastSyncMtime = plugin.lastSyncMtime.get(file.path)
+      const contentHash = capture.hash;
+      const stableStat = capture.stat;
 
-      // --- 优化：先尝试从缓存获取有效哈希 ---
-      let contentHash = plugin.fileHashManager.getValidHash(file.path, file.stat.mtime, file.stat.size, file.stat.ctime);
+      if (plugin.pendingUploadHashes.get(file.path) === contentHash) {
+        dump(`File modify intercepted (pending hash match): ${file.path}`)
+        plugin.incrementalScanManager?.markSent("file", file.path)
+        plugin.incrementalScanManager?.acknowledge("file", file.path)
+        return
+      }
 
-      if (contentHash !== null) {
-        if (contentHash === baseHash && (lastSyncMtime !== undefined && lastSyncMtime === file.stat.mtime)) {
-          dump(`File modify intercepted (cache match): ${file.path}`)
-          plugin.incrementalScanManager?.markSent("file", file.path)
-          plugin.incrementalScanManager?.acknowledge("file", file.path)
-          return
-        }
-      } else {
-        contentHash = await hashFileAsync(plugin.app, file.path, plugin);
-        logMemorySnapshot(`after modify hash ${file.path}`)
+      if (contentHash === baseHash && lastSyncMtime !== undefined && lastSyncMtime === stableStat.mtime) {
+        dump(`File modify intercepted (stable capture matches baseline): ${file.path}`)
+        plugin.incrementalScanManager?.markSent("file", file.path)
+        plugin.incrementalScanManager?.acknowledge("file", file.path)
+        return
       }
 
       const data = {
@@ -321,9 +366,9 @@ export const fileModify = async function (file: TAbstractFile, plugin: FastSync,
         path: file.path,
         pathHash: hashContent(file.path),
         contentHash: contentHash,
-        mtime: file.stat.mtime,
-        ctime: getSafeCtime(file.stat),
-        size: file.stat.size,
+        mtime: stableStat.mtime,
+        ctime: stableStat.ctime ?? getSafeCtime(file.stat),
+        size: stableStat.size,
         // 始终传递 baseHash 信息，如果不可用则标记 baseHashMissing
         ...(baseHash !== null ? { baseHash } : { baseHashMissing: true }),
       }
@@ -1199,45 +1244,76 @@ export const receiveFileSyncEnd = async function (data: unknown, plugin: FastSyn
 }
 
 /**
- * 检查并上传附件 (用于开启云预览后的首次同步后)
+ * Reconcile attachments once after cloud preview is enabled.
+ *
+ * Normal attachment create/modify events already go through fileModify. This
+ * pass is only a bounded repair for attachments that predate cloud preview.
+ * Its cursor is persisted after every successful check so an iOS process
+ * termination resumes from the last confirmed path instead of restarting the
+ * whole vault scan. A process-local promise prevents overlapping repair passes
+ * when several sync rounds finish close together.
  */
 export const checkAndUploadAttachments = async function (plugin: FastSync) {
-  if (!(await waitForFileActivity(plugin))) return
   if (!plugin.settings.cloudPreviewEnabled || plugin.settings.readonlySyncEnabled) return;
+  if (cloudPreviewCheckPromise) return cloudPreviewCheckPromise;
 
-  const apiService = new HttpApiService(plugin);
-  const files = plugin.app.vault.getFiles();
+  const run = async () => {
+    if (!(await waitForFileActivity(plugin))) return;
 
-  dump(`Cloud Preview: Start checking ${files.length} files for server status...`);
+    const mode = plugin.settings.cloudPreviewTypeRestricted ? "restricted" : "all";
+    let state = parseCloudPreviewCheckState(
+      plugin.localStorageManager.getMetadata(CLOUD_PREVIEW_CHECK_STATE),
+      mode,
+    );
+    if (state.complete) return;
 
-  let checkedCount = 0;
-  let uploadCount = 0;
+    const files = plugin.app.vault.getFiles()
+      .filter((file) => {
+        if (file.extension === "md" || isPathExcluded(file.path, plugin)) return false;
+        return mode === "all" || FileCloudPreview.isRestrictedType(`.${file.extension}`);
+      })
+      .sort((left, right) => left.path.localeCompare(right.path));
+    const remainingFiles = files.filter((file) => file.path > state.nextPath);
 
-  for (const file of files) {
-    if (file.extension === "md") continue;
-    if (isPathExcluded(file.path, plugin)) continue;
+    dump(`Cloud Preview: Resuming attachment reconciliation at ${state.nextPath || "<start>"}; ${remainingFiles.length} candidates remain`);
 
-    checkedCount++;
-    try {
-      const res = await apiService.getFileInfo(file.path);
+    const apiService = new HttpApiService(plugin);
+    let checkedCount = 0;
+    let uploadCount = 0;
 
-      // 如果没有数据，说明服务端不存在
-      if (!res) {
-        dump(`Cloud Preview: File missing on server, starting upload: ${file.path}`);
-        await fileModify(file, plugin, false);
-        uploadCount++;
+    for (const file of remainingFiles) {
+      if (!(await waitForFileActivity(plugin))) return;
+
+      try {
+        const res = await apiService.getFileInfo(file.path);
+        if (!res) {
+          dump(`Cloud Preview: File missing on server, starting upload: ${file.path}`);
+          await fileModify(file, plugin, false);
+          uploadCount++;
+        }
+      } catch (error) {
+        dump(`Cloud Preview: Pausing attachment reconciliation at ${file.path}`, error);
+        return;
       }
-    } catch (e) {
-      dump(`Cloud Preview: Failed to check file status for ${file.path}`, e);
+
+      state = advanceCloudPreviewCheckState(state, file.path);
+      plugin.localStorageManager.setMetadata(CLOUD_PREVIEW_CHECK_STATE, serializeCloudPreviewCheckState(state));
+      checkedCount++;
+
+      if (checkedCount % 10 === 0) await sleep(50);
     }
 
-    // 适当延迟，避免接口频率过高
-    if (checkedCount % 10 === 0) {
-      await sleep(50);
-    }
+    state = completeCloudPreviewCheckState(state);
+    plugin.localStorageManager.setMetadata(CLOUD_PREVIEW_CHECK_STATE, serializeCloudPreviewCheckState(state));
+    dump(`Cloud Preview: Attachment reconciliation complete. Checked: ${checkedCount}, Uploaded: ${uploadCount}`);
+  };
+
+  cloudPreviewCheckPromise = run();
+  try {
+    await cloudPreviewCheckPromise;
+  } finally {
+    cloudPreviewCheckPromise = null;
   }
-
-  dump(`Cloud Preview: Check complete. Total attachment files: ${checkedCount}, Uploaded: ${uploadCount}`);
 }
 
 /**
