@@ -214,6 +214,27 @@ export class SyncLogManager {
     }
 
     /**
+     * Close a pending operation only if it is still pending.
+     *
+     * A sync round can be cancelled after its hash log has already succeeded,
+     * so callers must not blindly overwrite a terminal success with cancelled
+     * or error. This guard also prevents stale round cleanup from rewriting a
+     * newer terminal state.
+     */
+    public finishPendingLog(id: string, status: 'success' | 'error' | 'cancelled', message?: string): void {
+        const existingLog = this.logs.get(id);
+        if (!existingLog || existingLog.status !== 'pending') return;
+        this.addOrUpdateLog({
+            id,
+            type: existingLog.type,
+            action: existingLog.action,
+            status,
+            progress: existingLog.progress,
+            message: message ?? existingLog.message,
+        });
+    }
+
+    /**
      * 淘汰迭代序中最早的一条非失败（status !== 'error'）记录。
      * Evict the oldest record (by insertion order) whose status is not 'error'.
      */

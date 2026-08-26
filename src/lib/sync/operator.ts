@@ -18,6 +18,7 @@ import type { DirtyEntry, DirtySnapshot } from "./incremental_scan_manager";
 import { collectIncrementalReconciliationEntries } from "./incremental_reconciliation";
 import type { ReconciliationLocalEntry } from "./incremental_reconciliation";
 import { getPostSendSyncPhase } from "./sync_state";
+import { createIncrementalScanProgress } from "./incremental_scan_progress";
 import { planChangeFeedRound, changeFeedDecisionInput, runChangeFeedCatchUp, shouldRestartFreshRoundOnResume } from "./change_feed";
 import type { CatchUpResult as ChangeFeedCatchUpResult } from "./change_feed";
 import {
@@ -83,6 +84,17 @@ interface ScanStats {
   cacheHits: number;
   dirtyJournalEntries: number;
 }
+
+type ScanProgressReporter = () => void;
+
+const finishPendingHashLog = (
+  context: string | null | undefined,
+  status: "error" | "cancelled",
+  message: string,
+): void => {
+  if (!context) return;
+  SyncLogManager.getInstance().finishPendingLog(`hashing-${context}`, status, message);
+};
 
 // Progress rendering remains frequent, but complete hash-map serialization is
 // intentionally coarse-grained because a large vault can make each write block
@@ -214,58 +226,110 @@ const scanIncrementalVaultEntries = async (
   entries: DirtyEntry[],
   buckets: IncrementalScanBuckets,
   stats: ScanStats,
+  reportProgress?: ScanProgressReporter,
 ): Promise<Set<string>> => {
   const processed = new Set<string>();
   for (const entry of entries) {
     await requireForeground(plugin);
-    stats.enumeratedEntries++;
-    const key = incrementalEntryKey(entry.kind, entry.path);
-    if (entry.kind === "config") continue;
+    try {
+      stats.enumeratedEntries++;
+      const key = incrementalEntryKey(entry.kind, entry.path);
+      if (entry.kind === "config") continue;
 
-    const excluded = entry.kind === "folder"
-      ? isFolderSyncPathExcluded(entry.path, plugin)
-      : isPathExcluded(entry.path, plugin);
-    if (excluded) {
-      processed.add(key);
-      continue;
-    }
-
-    if (entry.operation === "delete") {
-      addDeletedPath(plugin, entry, buckets);
-      processed.add(key);
-      continue;
-    }
-
-    const abstractFile = plugin.app.vault.getAbstractFileByPath(normalizePath(entry.path));
-    if (!abstractFile) {
-      addDeletedPath(plugin, { ...entry, operation: "delete" }, buckets);
-      processed.add(key);
-      continue;
-    }
-
-    if (abstractFile instanceof TFolder) {
-      if (abstractFile.path !== "/" && !isFolderSyncPathExcluded(abstractFile.path, plugin)) {
-        buckets.folders.push({ path: abstractFile.path, pathHash: hashContent(abstractFile.path) });
-      }
-      processed.add(key);
-      continue;
-    }
-    if (!(abstractFile instanceof TFile)) {
-      processed.add(key);
-      continue;
-    }
-
-    const file = abstractFile;
-    if (file.extension === "md") {
-      const noteLimit = (plugin.settings.noteSyncLimit ?? 20) * 1024 * 1024;
-      if (file.stat.size > noteLimit) {
+      const excluded = entry.kind === "folder"
+        ? isFolderSyncPathExcluded(entry.path, plugin)
+        : isPathExcluded(entry.path, plugin);
+      if (excluded) {
         processed.add(key);
         continue;
       }
 
-      // A queued modify event is the source of truth that the file changed. Do not
-      // reuse a cache entry when mtime/size happen to have the same filesystem
-      // precision; that would turn a real edit into a silent no-op.
+      if (entry.operation === "delete") {
+        addDeletedPath(plugin, entry, buckets);
+        processed.add(key);
+        continue;
+      }
+
+      const abstractFile = plugin.app.vault.getAbstractFileByPath(normalizePath(entry.path));
+      if (!abstractFile) {
+        addDeletedPath(plugin, { ...entry, operation: "delete" }, buckets);
+        processed.add(key);
+        continue;
+      }
+
+      if (abstractFile instanceof TFolder) {
+        if (abstractFile.path !== "/" && !isFolderSyncPathExcluded(abstractFile.path, plugin)) {
+          buckets.folders.push({ path: abstractFile.path, pathHash: hashContent(abstractFile.path) });
+        }
+        processed.add(key);
+        continue;
+      }
+      if (!(abstractFile instanceof TFile)) {
+        processed.add(key);
+        continue;
+      }
+
+      const file = abstractFile;
+      if (file.extension === "md") {
+        const noteLimit = (plugin.settings.noteSyncLimit ?? 20) * 1024 * 1024;
+        if (file.stat.size > noteLimit) {
+          processed.add(key);
+          continue;
+        }
+
+        // A queued modify event is the source of truth that the file changed. Do not
+        // reuse a cache entry when mtime/size happen to have the same filesystem
+        // precision; that would turn a real edit into a silent no-op.
+        let contentHash = entry.operation === "modify" && entry.forceHash !== false
+          ? null
+          : plugin.fileHashManager.getValidHash(file.path, file.stat.mtime, file.stat.size, file.stat.ctime);
+        if (entry.operation === "modify") stats.metadataChanged++;
+        else if (contentHash !== null) stats.cacheHits++;
+        if (contentHash === null) {
+          try {
+            await requireForeground(plugin);
+            contentHash = await Promise.race([
+              hashContentAsync(await plugin.app.vault.read(file), plugin),
+              new Promise<never>((_, reject) => window.setTimeout(() => reject(new Error("Hash timeout")), 15000)),
+            ]);
+            stats.hashComputed++;
+            plugin.scannedNoteHashes.set(file.path, {
+              hash: contentHash,
+              mtime: file.stat.mtime,
+              size: file.stat.size,
+              ctime: file.stat.ctime,
+            });
+          } catch (error) {
+            if (isBackgroundActivityClosedError(error)) throw error;
+            continue;
+          }
+        }
+        const baseHash = plugin.fileHashManager.getPathHash(file.path);
+        buckets.notes.push({
+          path: file.path,
+          pathHash: hashContent(file.path),
+          contentHash,
+          mtime: file.stat.mtime,
+          ctime: file.stat.ctime,
+          size: file.stat.size,
+          ...(baseHash !== null ? { baseHash } : { baseHashMissing: true }),
+        });
+        processed.add(key);
+        continue;
+      }
+
+      const attachmentLimit = (plugin.settings.attachmentSyncLimit ?? 50) * 1024 * 1024;
+      if (isLargeBinarySyncRisk(file.stat.size, plugin) || file.stat.size > attachmentLimit) {
+        processed.add(key);
+        continue;
+      }
+      const skipSync = plugin.settings.cloudPreviewEnabled
+        && (!plugin.settings.cloudPreviewTypeRestricted || FileCloudPreview.isRestrictedType("." + file.extension));
+      if (skipSync) {
+        processed.add(key);
+        continue;
+      }
+
       let contentHash = entry.operation === "modify" && entry.forceHash !== false
         ? null
         : plugin.fileHashManager.getValidHash(file.path, file.stat.mtime, file.stat.size, file.stat.ctime);
@@ -273,13 +337,12 @@ const scanIncrementalVaultEntries = async (
       else if (contentHash !== null) stats.cacheHits++;
       if (contentHash === null) {
         try {
-          await requireForeground(plugin);
           contentHash = await Promise.race([
-            hashContentAsync(await plugin.app.vault.read(file), plugin),
+            hashFileAsync(plugin.app, file.path, plugin),
             new Promise<never>((_, reject) => window.setTimeout(() => reject(new Error("Hash timeout")), 15000)),
           ]);
           stats.hashComputed++;
-          plugin.scannedNoteHashes.set(file.path, {
+          plugin.scannedFileHashes.set(file.path, {
             hash: contentHash,
             mtime: file.stat.mtime,
             size: file.stat.size,
@@ -291,7 +354,7 @@ const scanIncrementalVaultEntries = async (
         }
       }
       const baseHash = plugin.fileHashManager.getPathHash(file.path);
-      buckets.notes.push({
+      buckets.files.push({
         path: file.path,
         pathHash: hashContent(file.path),
         contentHash,
@@ -301,55 +364,9 @@ const scanIncrementalVaultEntries = async (
         ...(baseHash !== null ? { baseHash } : { baseHashMissing: true }),
       });
       processed.add(key);
-      continue;
+    } finally {
+      reportProgress?.();
     }
-
-    const attachmentLimit = (plugin.settings.attachmentSyncLimit ?? 50) * 1024 * 1024;
-    if (isLargeBinarySyncRisk(file.stat.size, plugin) || file.stat.size > attachmentLimit) {
-      processed.add(key);
-      continue;
-    }
-    const skipSync = plugin.settings.cloudPreviewEnabled
-      && (!plugin.settings.cloudPreviewTypeRestricted || FileCloudPreview.isRestrictedType("." + file.extension));
-    if (skipSync) {
-      processed.add(key);
-      continue;
-    }
-
-    let contentHash = entry.operation === "modify" && entry.forceHash !== false
-      ? null
-      : plugin.fileHashManager.getValidHash(file.path, file.stat.mtime, file.stat.size, file.stat.ctime);
-    if (entry.operation === "modify") stats.metadataChanged++;
-    else if (contentHash !== null) stats.cacheHits++;
-    if (contentHash === null) {
-      try {
-        contentHash = await Promise.race([
-          hashFileAsync(plugin.app, file.path, plugin),
-          new Promise<never>((_, reject) => window.setTimeout(() => reject(new Error("Hash timeout")), 15000)),
-        ]);
-        stats.hashComputed++;
-        plugin.scannedFileHashes.set(file.path, {
-          hash: contentHash,
-          mtime: file.stat.mtime,
-          size: file.stat.size,
-          ctime: file.stat.ctime,
-        });
-      } catch (error) {
-        if (isBackgroundActivityClosedError(error)) throw error;
-        continue;
-      }
-    }
-    const baseHash = plugin.fileHashManager.getPathHash(file.path);
-    buckets.files.push({
-      path: file.path,
-      pathHash: hashContent(file.path),
-      contentHash,
-      mtime: file.stat.mtime,
-      ctime: file.stat.ctime,
-      size: file.stat.size,
-      ...(baseHash !== null ? { baseHash } : { baseHashMissing: true }),
-    });
-    processed.add(key);
   }
   return processed;
 };
@@ -359,6 +376,7 @@ const scanIncrementalConfigEntries = async (
   entries: DirtyEntry[],
   buckets: IncrementalScanBuckets,
   stats: ScanStats,
+  reportProgress?: ScanProgressReporter,
 ): Promise<Set<string>> => {
   const processed = new Set<string>();
   if (!plugin.settings.configSyncEnabled || !plugin.configHashManager?.isReady()) return processed;
@@ -368,65 +386,69 @@ const scanIncrementalConfigEntries = async (
 
   for (const entry of entries) {
     await requireForeground(plugin);
-    stats.enumeratedEntries++;
-    if (entry.kind !== "config") continue;
-    const key = incrementalEntryKey(entry.kind, entry.path);
-    if (configIsPathExcluded(entry.path, plugin)) {
-      processed.add(key);
-      continue;
-    }
-    if (entry.operation === "delete") {
-      addDeletedPath(plugin, entry, buckets);
-      processed.add(key);
-      continue;
-    }
-
-    const virtual = storageByPath.get(entry.path);
-    if (virtual) {
-      buckets.configs.push(virtual);
-      processed.add(key);
-      continue;
-    }
-
-    const path = normalizePath(entry.path);
-    let stat: { mtime: number; ctime?: number; size: number } | null = null;
     try {
-      stat = await plugin.app.vault.adapter.stat(path);
-    } catch {
-      stat = null;
-    }
-    if (!stat || isLargeBinarySyncRisk(stat.size, plugin)) {
-      if (!stat) addDeletedPath(plugin, { ...entry, operation: "delete" }, buckets);
-      processed.add(key);
-      continue;
-    }
-
-    let contentHash = entry.operation === "modify"
-      ? null
-      : plugin.configHashManager.getValidHash(entry.path, stat.mtime, stat.size, stat.ctime);
-    if (contentHash === null) {
-      try {
-        contentHash = await hashFileAsync(plugin.app, path, plugin);
-        plugin.scannedConfigHashes.set(entry.path, {
-          hash: contentHash,
-          mtime: stat.mtime,
-          size: stat.size,
-          ctime: stat.ctime,
-        });
-      } catch (error) {
-        if (isBackgroundActivityClosedError(error)) throw error;
+      stats.enumeratedEntries++;
+      if (entry.kind !== "config") continue;
+      const key = incrementalEntryKey(entry.kind, entry.path);
+      if (configIsPathExcluded(entry.path, plugin)) {
+        processed.add(key);
         continue;
       }
+      if (entry.operation === "delete") {
+        addDeletedPath(plugin, entry, buckets);
+        processed.add(key);
+        continue;
+      }
+
+      const virtual = storageByPath.get(entry.path);
+      if (virtual) {
+        buckets.configs.push(virtual);
+        processed.add(key);
+        continue;
+      }
+
+      const path = normalizePath(entry.path);
+      let stat: { mtime: number; ctime?: number; size: number } | null = null;
+      try {
+        stat = await plugin.app.vault.adapter.stat(path);
+      } catch {
+        stat = null;
+      }
+      if (!stat || isLargeBinarySyncRisk(stat.size, plugin)) {
+        if (!stat) addDeletedPath(plugin, { ...entry, operation: "delete" }, buckets);
+        processed.add(key);
+        continue;
+      }
+
+      let contentHash = entry.operation === "modify"
+        ? null
+        : plugin.configHashManager.getValidHash(entry.path, stat.mtime, stat.size, stat.ctime);
+      if (contentHash === null) {
+        try {
+          contentHash = await hashFileAsync(plugin.app, path, plugin);
+          plugin.scannedConfigHashes.set(entry.path, {
+            hash: contentHash,
+            mtime: stat.mtime,
+            size: stat.size,
+            ctime: stat.ctime,
+          });
+        } catch (error) {
+          if (isBackgroundActivityClosedError(error)) throw error;
+          continue;
+        }
+      }
+      buckets.configs.push({
+        path: entry.path,
+        pathHash: hashContent(entry.path),
+        contentHash,
+        mtime: stat.mtime,
+        ctime: stat.ctime ?? stat.mtime,
+        size: stat.size,
+      });
+      processed.add(key);
+    } finally {
+      reportProgress?.();
     }
-    buckets.configs.push({
-      path: entry.path,
-      pathHash: hashContent(entry.path),
-      contentHash,
-      mtime: stat.mtime,
-      ctime: stat.ctime ?? stat.mtime,
-      size: stat.size,
-    });
-    processed.add(key);
   }
   return processed;
 };
@@ -1143,6 +1165,16 @@ export const handleSync = async function (plugin: FastSync, isLoadLastTime: bool
 
     const shouldSyncNotes = syncMode === "auto" || syncMode === "note";
     const shouldSyncConfigs = syncMode === "auto" || syncMode === "config";
+    const incrementalVaultEntries = fastIncremental && plugin.settings.syncEnabled && shouldSyncNotes
+      ? incrementalEntries.filter((entry) => entry.kind !== "config")
+      : [];
+    const incrementalConfigEntries = fastIncremental
+      && plugin.settings.configSyncEnabled
+      && shouldSyncConfigs
+      && plugin.configHashManager?.isReady()
+      ? incrementalEntries.filter((entry) => entry.kind === "config")
+      : [];
+    const incrementalScanTotal = incrementalVaultEntries.length + incrementalConfigEntries.length;
 
     const activeTypes: SyncType[] = [];
     let scannedVaultEntryCount = 0;
@@ -1222,7 +1254,7 @@ export const handleSync = async function (plugin: FastSync, isLoadLastTime: bool
     }
     plugin.updateStatusBar($("ui.status.syncing"), 0, 1);
 
-    // --- 新增：初始化哈希扫描日志 ---
+    // --- 初始化哈希扫描日志 / Initialize hash-scan log ---
     const hashingLogId = `hashing-${context}`;
     if (plugin.settings.syncEnabled || plugin.settings.configSyncEnabled) {
       SyncLogManager.getInstance().addOrUpdateLog({
@@ -1234,6 +1266,28 @@ export const handleSync = async function (plugin: FastSync, isLoadLastTime: bool
         message: `syncMode=${scanMode} | ${scanMode === 'full' ? '正在进行全量哈希计算...' : scanMode === 'metadata-reconcile' ? '正在进行可恢复元数据对账...' : '正在进行增量哈希计算...'}`
       });
     }
+
+    // The full path already reports every 20 entries. The incremental path used
+    // to leave this log at its initial 0 until the entire preparation phase
+    // ended, which made a long reconciliation look permanently stuck.
+    let lastIncrementalLogProgress = -1;
+    const incrementalScanProgress = createIncrementalScanProgress(
+      incrementalScanTotal,
+      ({ processed, total, percent: pct }) => {
+        plugin.progressTracker.recordHashProgress(pct);
+        if (!(plugin.settings.syncEnabled || plugin.settings.configSyncEnabled)) return;
+        if (pct === lastIncrementalLogProgress && processed !== incrementalScanTotal) return;
+        lastIncrementalLogProgress = pct;
+        SyncLogManager.getInstance().addOrUpdateLog({
+          id: hashingLogId,
+          type: 'info',
+          action: `VaultScanning_${plugin.currentSyncType}`,
+          status: 'pending',
+          progress: pct,
+          message: `🔍 正在增量扫描... (${processed}/${total})`
+        });
+      },
+    );
 
     const notes: SnapFile[] = [], files: SnapFile[] = [], configs: SnapFile[] = [], folders: SnapFolder[] = [];
     const delNotes: PathHashFile[] = [], delFiles: PathHashFile[] = [], delConfigs: PathHashFile[] = [], delFolders: PathHashFile[] = [];
@@ -1268,9 +1322,15 @@ export const handleSync = async function (plugin: FastSync, isLoadLastTime: bool
 
     if (plugin.settings.syncEnabled && shouldSyncNotes) {
       if (fastIncremental) {
-        const processed = await scanIncrementalVaultEntries(plugin, incrementalEntries, scanBuckets, scanStats);
+        const processed = await scanIncrementalVaultEntries(
+          plugin,
+          incrementalVaultEntries,
+          scanBuckets,
+          scanStats,
+          () => incrementalScanProgress.step(),
+        );
         plugin.incrementalScanManager?.markProcessed(processed);
-        dump(`[IncrementalScan] event paths=${incrementalEntries.filter((entry) => entry.kind !== "config").length}, notes=${notes.length}, files=${files.length}, folders=${folders.length}`);
+        dump(`[IncrementalScan] event paths=${incrementalVaultEntries.length}, notes=${notes.length}, files=${files.length}, folders=${folders.length}`);
       } else {
       await requireForeground(plugin);
       const list = plugin.app.vault.getAllLoadedFiles();
@@ -1603,17 +1663,27 @@ export const handleSync = async function (plugin: FastSync, isLoadLastTime: bool
           }
         }
       }
-    }
       }
+    }
 
     const configDirs = [plugin.app.vault.configDir, ...getConfigSyncCustomDirs(plugin)]
     const configPaths = plugin.settings.configSyncEnabled && shouldSyncConfigs && !fastIncremental
       ? await configAllPaths(configDirs, plugin)
       : [];
     if (fastIncremental && shouldSyncConfigs) {
-      const processed = await scanIncrementalConfigEntries(plugin, incrementalEntries, scanBuckets, scanStats);
+      const processed = await scanIncrementalConfigEntries(
+        plugin,
+        incrementalConfigEntries,
+        scanBuckets,
+        scanStats,
+        () => incrementalScanProgress.step(),
+      );
       plugin.incrementalScanManager?.markProcessed(processed);
-      dump(`[IncrementalScan] config paths=${incrementalEntries.filter((entry) => entry.kind === "config").length}, configs=${configs.length}`);
+      dump(`[IncrementalScan] config paths=${incrementalConfigEntries.length}, configs=${configs.length}`);
+    }
+
+    if (fastIncremental && incrementalScanTotal === 0) {
+      incrementalScanProgress.completeEmpty();
     }
 
     let configCount = 0;
@@ -2021,6 +2091,7 @@ export const handleSync = async function (plugin: FastSync, isLoadLastTime: bool
     plugin.syncState.progressCheckIntervalId = progressCheckInterval;
   } catch (error) {
     if (isBackgroundActivityClosedError(error)) {
+      finishPendingHashLog(context, "cancelled", "⏹ 插件退出，哈希扫描已取消");
       dump("Sync abandoned because the plugin is unloading");
       return;
     }
@@ -2031,6 +2102,7 @@ export const handleSync = async function (plugin: FastSync, isLoadLastTime: bool
     // invocation, so a late exception from a superseded (stale) sync session cannot
     // clobber a newer session that has already taken over.
     if (plugin.syncState.activeSyncContext === context) {
+      finishPendingHashLog(context, "error", `❌ 哈希扫描/同步失败：${error instanceof Error ? error.message : String(error)}`);
       plugin.incrementalScanManager?.abortSync();
       plugin.syncState.clearScannedHashCaches();
       plugin.syncState.activeSyncContext = null; // 同步失败，清空上下文 / Sync failed, reset the context
@@ -2058,6 +2130,7 @@ export const handleSync = async function (plugin: FastSync, isLoadLastTime: bool
  * Cancel the current sync and reset all runtime states.
  */
 export function cancelSync(plugin: FastSync): void {
+  const cancelledContext = plugin.syncState.activeSyncContext;
   clearUploadQueue(plugin);
   plugin.incrementalScanManager?.abortSync();
   plugin.syncState.clearScannedHashCaches();
@@ -2101,6 +2174,7 @@ export function cancelSync(plugin: FastSync): void {
   plugin.localStorageManager.clearPending('pendingUploadHashes');
 
   plugin.progressTracker.forceComplete();
+  finishPendingHashLog(cancelledContext, "cancelled", "⏹ 同步已取消，哈希扫描未完成");
   plugin.updateStatusBar($("ui.status.cancelled") || "Sync Cancelled");
   window.setTimeout(() => plugin.updateStatusBar(""), 10000);
 
