@@ -87,6 +87,10 @@ interface ScanStats {
 
 type ScanProgressReporter = () => void;
 
+interface SyncStartOptions {
+  transportRecovery?: boolean;
+}
+
 const finishPendingHashLog = (
   context: string | null | undefined,
   status: "error" | "cancelled",
@@ -1028,7 +1032,13 @@ async function receiveSyncEndWrapper(data: unknown, plugin: FastSync, type: "not
 /**
  * 启动全量/增量同步
  */
-export const handleSync = async function (plugin: FastSync, isLoadLastTime: boolean = true, syncMode: SyncMode = "auto") {
+export const handleSync = async function (
+  plugin: FastSync,
+  isLoadLastTime: boolean = true,
+  syncMode: SyncMode = "auto",
+  options: SyncStartOptions = {},
+) {
+  const isTransportRecovery = options.transportRecovery === true;
   // Claim the logical round before the first await. Mobile reconnects can
   // arrive while the conflict-directory cleanup is still in flight; a late
   // transport callback must see this context and cannot clear ownership.
@@ -1187,7 +1197,11 @@ export const handleSync = async function (plugin: FastSync, isLoadLastTime: bool
     if (plugin.settings.configSyncEnabled && shouldSyncConfigs) {
       activeTypes.push('setting');
     }
-    plugin.progressTracker.reset(activeTypes);
+    if (isTransportRecovery) {
+      plugin.progressTracker.resetForRecoveredRound(activeTypes);
+    } else {
+      plugin.progressTracker.reset(activeTypes);
+    }
     const repairedEmptyNotes = await repairSuspiciousEmptyNotes(plugin);
     if (repairedEmptyNotes > 0) {
       dump(`[FastSync] Repaired ${repairedEmptyNotes} suspicious empty note(s) before sync scan`);
@@ -1263,7 +1277,7 @@ export const handleSync = async function (plugin: FastSync, isLoadLastTime: bool
         action: `VaultScanning_${plugin.currentSyncType}`,
         status: 'pending',
         progress: 0,
-        message: `syncMode=${scanMode} | ${scanMode === 'full' ? '正在进行全量哈希计算...' : scanMode === 'metadata-reconcile' ? '正在进行可恢复元数据对账...' : '正在进行增量哈希计算...'}`
+        message: `${isTransportRecovery ? 'transportRecovery=true | 断线恢复：重新追平后准备同步 | ' : ''}syncMode=${scanMode} | ${scanMode === 'full' ? '正在进行全量哈希计算...' : scanMode === 'metadata-reconcile' ? '正在进行可恢复元数据对账...' : '正在进行增量哈希计算...'}`
       });
     }
 
@@ -1284,7 +1298,7 @@ export const handleSync = async function (plugin: FastSync, isLoadLastTime: bool
           action: `VaultScanning_${plugin.currentSyncType}`,
           status: 'pending',
           progress: pct,
-          message: `🔍 正在增量扫描... (${processed}/${total})`
+          message: `${isTransportRecovery ? '↻ 断线恢复：' : ''}🔍 正在增量扫描... (${processed}/${total})`
         });
       },
     );
@@ -1902,6 +1916,7 @@ export const handleSync = async function (plugin: FastSync, isLoadLastTime: bool
         changeFeedFallbackConsecutive: changeFeedHealth.consecutiveFallbacks,
         changeFeedFallbackTotal: changeFeedHealth.totalFallbacks,
         changeFeedLastFallbackReason: changeFeedHealth.lastReason,
+        transportRecovery: isTransportRecovery,
         // 变更流轮次（A-4 验收）：enumeratedEntries 必须为 0，游标区间可与服务端 sync_log 对账
         ...(changeFeedResult?.ok ? {
           changesRequested: changeFeedResult.fetched ?? 0,
@@ -1949,7 +1964,7 @@ export const handleSync = async function (plugin: FastSync, isLoadLastTime: bool
       plugin.pendingDeleteConfigPaths.clear();
       plugin.pendingFileRenames = [];
       plugin.pendingNoteRenames = new Map();
-      plugin.progressTracker.reset(activeTypes);
+      plugin.progressTracker.resetForTransportRetry(activeTypes);
       plugin.totalFilesToDownload = 0;
       plugin.downloadedFilesCount = 0;
       plugin.totalChunksToDownload = 0;
@@ -2007,7 +2022,7 @@ export const handleSync = async function (plugin: FastSync, isLoadLastTime: bool
             plugin.isSyncRequesting = false;
             plugin.isSyncing = false;
             dump(`[ChangeFeed] transport resumed; abandoning prepared snapshot and starting a fresh round`);
-            void handleSync(plugin, true, syncMode);
+            void handleSync(plugin, true, syncMode, { transportRecovery: true });
             return;
           }
           // A service restart invalidates all server-side page/session state.

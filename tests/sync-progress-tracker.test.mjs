@@ -52,4 +52,45 @@ tracker.clearStagnationTimers();
 staleTimer.callback();
 assert.deepEqual(pageAcks, [0]);
 
+// Contract: replacing the physical transport must discard old page/ACK state
+// without erasing the hash phase or allowing the visible percentage to move
+// backwards.
+tracker.reset(["note"]);
+tracker.recordHashProgress(100);
+tracker.recordUploadComplete("note");
+tracker.setDownloadTotal("note", 100);
+tracker.recordPageProgress("note", 0, 100, false);
+tracker.setInitialAckSent("note", true);
+for (let i = 0; i < 60; i++) tracker.recordCompleted("note", 0);
+const beforeTransportRetry = tracker.getOverallPct();
+tracker.resetForTransportRetry(["note"]);
+assert.equal(tracker.getPhase(), "upload");
+assert.equal(tracker.getDetailText().includes("哈希计算"), false);
+assert.ok(
+  tracker.getOverallPct() >= beforeTransportRetry,
+  "transport retry must not move visible progress backwards",
+);
+assert.equal(tracker.isInitialAckSent("note"), false);
+assert.equal(tracker.getTypeTaskTotal("note"), 0);
+
+// Contract: a safety-required recovery round keeps the logical progress floor
+// while exposing a new hash phase for the re-preparation work.
+tracker.recordHashProgress(100);
+tracker.recordUploadComplete("note");
+tracker.setDownloadTotal("note", 100);
+tracker.recordPageProgress("note", 0, 100, false);
+for (let i = 0; i < 60; i++) tracker.recordCompleted("note", 0);
+const beforeRecoveryRound = tracker.getOverallPct();
+tracker.resetForRecoveredRound(["note"]);
+assert.equal(tracker.getPhase(), "hash");
+assert.ok(
+  tracker.getOverallPct() >= beforeRecoveryRound,
+  "recovery preparation must keep the logical progress floor",
+);
+
+// Contract: a genuinely new logical sync round still starts from zero.
+tracker.reset(["note"]);
+assert.equal(tracker.getPhase(), "hash");
+assert.equal(tracker.getOverallPct(), 0);
+
 console.log("sync-progress-tracker.test.mjs: all scenarios passed");

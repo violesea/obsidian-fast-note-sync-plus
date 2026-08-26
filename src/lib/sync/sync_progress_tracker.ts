@@ -120,20 +120,8 @@ export class SyncProgressTracker {
     }
   }
 
-  /**
-   * Reset the tracker for a new sync session.
-   * 重置追踪器以开始新的同步会话。
-   */
-  reset(activeTypes: SyncType[]): void {
-    this.activeTypes = new Set(activeTypes);
+  private initializeTypeProgress(activeTypes: SyncType[]): void {
     this.progressMap.clear();
-    this.lastReportedPct = 0;
-    this.hashProgress = 0;
-    this.isForcedComplete = false;
-
-    // New sync round starting; clear any stagnation-resend timers left from the previous round.
-    this.clearStagnationTimers();
-
     for (const type of activeTypes) {
       this.progressMap.set(type, {
         uploadComplete: false,
@@ -152,6 +140,51 @@ export class SyncProgressTracker {
         ackWatermark: 0
       });
     }
+  }
+
+  /**
+   * Reset the tracker for a new sync session.
+   * 重置追踪器以开始新的同步会话。
+   */
+  reset(activeTypes: SyncType[]): void {
+    this.activeTypes = new Set(activeTypes);
+    this.lastReportedPct = 0;
+    this.hashProgress = 0;
+    this.isForcedComplete = false;
+
+    // New sync round starting; clear any stagnation-resend timers left from the previous round.
+    this.clearStagnationTimers();
+
+    this.initializeTypeProgress(activeTypes);
+
+    this.notify();
+  }
+
+  /**
+   * Reset only physical-transport state while keeping logical-round progress.
+   * A reconnect must not reuse page ACK/session state, but it also must not
+   * erase hash work already completed by the current logical sync round.
+   */
+  resetForTransportRetry(activeTypes: SyncType[] = this.getActiveTypes()): void {
+    this.activeTypes = new Set(activeTypes);
+    this.isForcedComplete = false;
+    this.clearStagnationTimers();
+    this.initializeTypeProgress(activeTypes);
+
+    this.notify();
+  }
+
+  /**
+   * Start a safety-required recovery preparation round without moving the
+   * visible logical-round percentage backwards. The new scan still reports
+   * its own hash phase from zero; only the aggregate progress guard survives.
+   */
+  resetForRecoveredRound(activeTypes: SyncType[]): void {
+    this.activeTypes = new Set(activeTypes);
+    this.hashProgress = 0;
+    this.isForcedComplete = false;
+    this.clearStagnationTimers();
+    this.initializeTypeProgress(activeTypes);
 
     this.notify();
   }
