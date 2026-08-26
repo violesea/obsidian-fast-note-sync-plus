@@ -37,6 +37,7 @@ import { SyncProgressTracker } from "./lib/sync/sync_progress_tracker";
 import { LifecycleGeneration } from "./lib/sync/lifecycle_generation";
 import { SyncPageAckOutbox, type SyncPageAckType } from "./lib/sync/sync_page_ack_outbox";
 import { BackgroundActivityGate } from "./lib/sync/background_activity_gate";
+import { applyStableSyncPolicy } from "./lib/sync/sync_feature_policy";
 
 
 
@@ -756,6 +757,16 @@ export default class FastSync extends Plugin {
 
     let hasMigration = false
 
+    // Keep released clients on the verified v1 WebSocket sync path. Older
+    // configs may have enabled the unfinished sidecar/cloud projection
+    // features; normalize those switches before any manager is constructed.
+    const stablePolicy = applyStableSyncPolicy(this.settings)
+    if (stablePolicy.disabledFeatures.length > 0) {
+      this.settings = stablePolicy.settings
+      dump(`[StableSync] disabled experimental features: ${stablePolicy.disabledFeatures.join(",")}`)
+      hasMigration = true
+    }
+
     // Remove legacy pause switches. Background sync is now always enabled;
     // retaining old values would make an upgraded mobile client pause again.
     const settingsWithLegacyFields = this.settings as PluginSettings & Record<string, unknown>
@@ -927,6 +938,13 @@ export default class FastSync extends Plugin {
   }
 
   async saveSettings() {
+    // Also enforce the release policy on external settings/config-sync writes;
+    // a stale data.json must not re-enable an experimental sync path in memory.
+    const stablePolicy = applyStableSyncPolicy(this.settings)
+    if (stablePolicy.disabledFeatures.length > 0) {
+      this.settings = stablePolicy.settings
+      dump(`[StableSync] blocked experimental features during save: ${stablePolicy.disabledFeatures.join(",")}`)
+    }
     if (this.settings.api && this.settings.apiToken) {
       this.settings.api = this.settings.api.replace(/\/+$/, "") // 去除尾部斜杠
     }

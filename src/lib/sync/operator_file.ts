@@ -14,6 +14,7 @@ import {
   serializeCloudPreviewCheckState,
 } from "./cloud_preview_reconciliation";
 import { captureStableSnapshot, stableCaptureCoordinator } from "./stable_capture";
+import { isCloudPreviewRuntimeEnabled } from "./sync_feature_policy";
 
 const waitForFileActivity = async (plugin: FastSync): Promise<boolean> => waitForForeground(plugin);
 
@@ -1051,7 +1052,7 @@ async function runUpload(plugin: FastSync, state: ActiveUpload): Promise<void> {
     state.chunksSent = true;
 
     // 上传完成后，如果开启了附件云预览 - 上传后删除，则删除本地附件
-    if (plugin.settings.cloudPreviewEnabled && plugin.settings.cloudPreviewAutoDeleteLocal) {
+    if (isCloudPreviewRuntimeEnabled(plugin.settings) && plugin.settings.cloudPreviewAutoDeleteLocal) {
       const ext = file.path.substring(file.path.lastIndexOf(".")).toLowerCase();
       const isRestricted = FileCloudPreview.isRestrictedType(ext);
       if (!(plugin.settings.cloudPreviewTypeRestricted && !isRestricted)) {
@@ -1218,7 +1219,7 @@ export const receiveFileSyncUpdate = async function (data: ReceiveFileSyncUpdate
   }
 
   // 如果开启了云预览，且是初始化同步阶段，由于云预览可以按需加载，跳过所有附件下载
-  if (plugin.localStorageManager.getMetadata("isInitSync") && plugin.settings.cloudPreviewEnabled) {
+  if (plugin.localStorageManager.getMetadata("isInitSync") && isCloudPreviewRuntimeEnabled(plugin.settings)) {
     if (plugin.settings.cloudPreviewTypeRestricted) {
       // 开启了类型限制：仅跳过受限类型 (图片、视频、音频、PDF)
       const ext = data.path.substring(data.path.lastIndexOf(".")).toLowerCase();
@@ -1293,7 +1294,7 @@ export const receiveFileSyncDelete = async function (data: ReceivePathMessage, p
     return
   }
 
-  if (plugin.localStorageManager.getMetadata("isInitSync") && plugin.settings.cloudPreviewEnabled) {
+  if (plugin.localStorageManager.getMetadata("isInitSync") && isCloudPreviewRuntimeEnabled(plugin.settings)) {
     if (plugin.settings.cloudPreviewTypeRestricted) {
       const ext = data.path.substring(data.path.lastIndexOf(".")).toLowerCase();
       if (FileCloudPreview.isRestrictedType(ext)) {
@@ -1356,7 +1357,7 @@ export const receiveFileSyncMtime = async function (data: ReceiveMtimeMessage, p
     return
   }
 
-  if (plugin.localStorageManager.getMetadata("isInitSync") && plugin.settings.cloudPreviewEnabled) {
+  if (plugin.localStorageManager.getMetadata("isInitSync") && isCloudPreviewRuntimeEnabled(plugin.settings)) {
     if (plugin.settings.cloudPreviewTypeRestricted) {
       const ext = data.path.substring(data.path.lastIndexOf(".")).toLowerCase();
       if (FileCloudPreview.isRestrictedType(ext)) {
@@ -1563,7 +1564,7 @@ export const receiveFileSyncEnd = async function (data: unknown, plugin: FastSyn
  * when several sync rounds finish close together.
  */
 export const checkAndUploadAttachments = async function (plugin: FastSync) {
-  if (!plugin.settings.cloudPreviewEnabled || plugin.settings.readonlySyncEnabled) return;
+  if (!isCloudPreviewRuntimeEnabled(plugin.settings) || plugin.settings.readonlySyncEnabled) return;
   if (cloudPreviewCheckPromise) return cloudPreviewCheckPromise;
 
   const run = async () => {

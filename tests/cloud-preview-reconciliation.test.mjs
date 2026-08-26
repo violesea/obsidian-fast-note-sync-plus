@@ -88,6 +88,9 @@ const requireStub = (id) => {
     captureStableSnapshot: async () => ({ hash: "file-hash", stat: { size: 10, mtime: 1, ctime: 1 } }),
     stableCaptureCoordinator: { capture: async () => ({ hash: "file-hash", stat: { size: 10, mtime: 1, ctime: 1 } }) },
   };
+  if (id === "./sync_feature_policy") return {
+    isCloudPreviewRuntimeEnabled: (settings) => settings.cloudPreviewEnabled === true,
+  };
   if (id === "./cloud_preview_reconciliation") return loadOperatorDependency(id);
   throw new Error(`Unexpected dependency: ${id}`);
 };

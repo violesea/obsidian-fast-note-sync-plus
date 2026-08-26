@@ -42,6 +42,7 @@ import {
 } from "./change_feed_logic";
 import type { ChangesResponse, RegisterResponse, SidecarChange } from "./change_feed_logic";
 import { requireForeground } from "./background_activity_gate";
+import { isChangeFeedRuntimeEnabled, isCloudPreviewRuntimeEnabled } from "./sync_feature_policy";
 
 function platformKind(): string {
   if (Platform.isIosApp) return Platform.isTablet ? "ipados" : "ios";
@@ -52,7 +53,7 @@ function platformKind(): string {
 
 /** 附件是否属于本设备的同步面（与 operator activeTypes 同口径：云端预览全开时不落地附件） */
 function filesInSyncScope(plugin: FastSync): boolean {
-  return !plugin.settings.cloudPreviewEnabled || plugin.settings.cloudPreviewTypeRestricted;
+  return !isCloudPreviewRuntimeEnabled(plugin.settings) || plugin.settings.cloudPreviewTypeRestricted;
 }
 
 /**
@@ -730,7 +731,7 @@ export function changeFeedDecisionInput(plugin: FastSync, syncMode: string) {
   const cursor = plugin.changeFeedCursor?.get();
   const inc = plugin.incrementalScanManager;
   return {
-    enabled: plugin.settings.changeFeedEnabled === true,
+    enabled: isChangeFeedRuntimeEnabled(plugin.settings),
     sidecarUrl: plugin.settings.sidecarUrl ?? "",
     deviceId: plugin.changeFeedDeviceId,
     cursorRev: cursor ? cursor.rev : null,

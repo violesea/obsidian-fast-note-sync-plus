@@ -66,6 +66,10 @@ vm.runInNewContext(transpiled, {
     if (id === "./operator_note") return { receiveNoteSyncDelete: async () => undefined };
     if (id === "./operator_file") return { receiveFileSyncDelete: async () => undefined };
     if (id === "./background_activity_gate") return { requireForeground: async () => undefined };
+    if (id === "./sync_feature_policy") return {
+      isChangeFeedRuntimeEnabled: () => false,
+      isCloudPreviewRuntimeEnabled: () => false,
+    };
     if (id === "./change_feed_logic") {
       const logicPath = path.join(root, "src", "lib", "sync", "change_feed_logic.ts");
       const logicSource = fs.readFileSync(logicPath, "utf8");

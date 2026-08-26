@@ -4,6 +4,7 @@ import { ViewPlugin, ViewUpdate, EditorView } from "@codemirror/view";
 import { hashContent, showSyncNotice, dumpError } from "../utils/helpers";
 import { CLIENT_TYPE } from "../utils/types";
 import type FastSync from "../../main";
+import { isCloudPreviewRuntimeEnabled } from "../sync/sync_feature_policy";
 
 
 /**
@@ -84,7 +85,7 @@ export class FileCloudPreview {
    * 注册 Markdown 后处理器 (阅读模式)
    */
   private registerMarkdownPostProcessor() {
-    if (!this.plugin.settings.cloudPreviewEnabled) return;
+    if (!isCloudPreviewRuntimeEnabled(this.plugin.settings)) return;
     this.plugin.registerMarkdownPostProcessor(
       async (element: HTMLElement, context: MarkdownPostProcessorContext) => {
         const embeds = element.querySelectorAll(".internal-embed");
@@ -100,7 +101,7 @@ export class FileCloudPreview {
    * 注册 Live Preview 处理器 (编辑模式)
    */
   private registerLivePreviewProcessor() {
-    if (!this.plugin.settings.cloudPreviewEnabled) return;
+    if (!isCloudPreviewRuntimeEnabled(this.plugin.settings)) return;
     const handleUpdate = (view: EditorView) => this.handleLivePreviewUpdate(view);
     this.plugin.registerEditorExtension([
       ViewPlugin.fromClass(class {
@@ -122,7 +123,7 @@ export class FileCloudPreview {
    * 处理实时预览更新
    */
   private handleLivePreviewUpdate(view: EditorView) {
-    if (!this.plugin.settings.cloudPreviewEnabled) return;
+    if (!isCloudPreviewRuntimeEnabled(this.plugin.settings)) return;
     // 使用 requestAnimationFrame 或 setTimeout 避免频繁触发时的冲突
     window.setTimeout(() => {
       const embeds = view.dom.querySelectorAll(".mod-empty-attachment");
@@ -546,7 +547,8 @@ export class FileCloudPreview {
   }
 
   private async getCloudUrl(filePath: string, sourcePath: string, subpath: string): Promise<string | null> {
-    const { api, vault, apiToken, cloudPreviewEnabled, cloudPreviewTypeRestricted, cloudPreviewRemoteUrl } = this.plugin.settings;
+    const { api, vault, apiToken, cloudPreviewTypeRestricted, cloudPreviewRemoteUrl } = this.plugin.settings;
+    const cloudPreviewEnabled = isCloudPreviewRuntimeEnabled(this.plugin.settings);
     if (!cloudPreviewEnabled || !api || !apiToken) return null;
 
     // Use the link path as written in the markdown. processEmbed() has already
@@ -568,7 +570,7 @@ export class FileCloudPreview {
     }
     const rawConfig = ((this.plugin.app.vault as unknown) as VaultWithConfig).getConfig?.("attachmentFolderPath");
     const attachmentFolderPath = typeof rawConfig === "string" ? rawConfig : "";
-    if (this.plugin.settings.cloudPreviewDynamicAttachment) {
+    if (cloudPreviewEnabled && this.plugin.settings.cloudPreviewDynamicAttachment) {
       if (attachmentFolderPath) {
         const prefix = attachmentFolderPath.endsWith("/") ? attachmentFolderPath : attachmentFolderPath + "/";
         const suffix = vaultPath.startsWith("/") ? vaultPath.substring(1) : vaultPath;

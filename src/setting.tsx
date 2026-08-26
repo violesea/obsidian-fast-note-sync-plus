@@ -17,6 +17,7 @@ import FastSync from "./main";
 import { updateVaultName } from "./lib/settings/vault_name";
 import { saveDeviceDisplayName } from "./lib/sync/device_identity";
 import { PLUGIN_RELEASE_REPOSITORY } from "./lib/utils/version_manager";
+import { EXPERIMENTAL_SYNC_FEATURES_ENABLED } from "./lib/sync/sync_feature_policy";
 
 
 export interface PluginSettings {
@@ -1411,22 +1412,28 @@ export class SettingTab extends PluginSettingTab {
       $("setting.remote.client_name_desc") + "\n*(隐私提示：若不配置将默认回退为操作系统通用标识，如需自定义建议使用不包含您真实全名或设备隐私特征的代号)*"
     )
 
-    // ─── FNS v2 变更流（change-feed）：默认关闭，关闭后重启即回 v1 路径 ───
-    new Setting(set).setName($("setting.remote.change_feed") || "变更流同步（v2 实验性）").setClass("fns-setting-item-checkbox").addToggle((toggle) =>
-      toggle.setValue(this.plugin.settings.changeFeedEnabled).onChange(async (value) => {
-        this.plugin.settings.changeFeedEnabled = value
-        await this.plugin.saveSettings()
-        if (value) {
-          showSyncNotice($("setting.remote.change_feed_enabled_notice") || "已启用变更流：重启 Obsidian 后生效；关闭并重启即可回滚")
-        }
-      }),
-    )
+    // ─── FNS v2 变更流：稳定版暂不放行，避免旁路状态机影响基础同步 ───
+    new Setting(set).setName($("setting.remote.change_feed") || "变更流同步（暂缓）").setClass("fns-setting-item-checkbox").addToggle((toggle) => {
+      toggle.setValue(EXPERIMENTAL_SYNC_FEATURES_ENABLED && this.plugin.settings.changeFeedEnabled)
+        .setDisabled(!EXPERIMENTAL_SYNC_FEATURES_ENABLED)
+      if (EXPERIMENTAL_SYNC_FEATURES_ENABLED) {
+        toggle.onChange(async (value) => {
+          this.plugin.settings.changeFeedEnabled = value
+          await this.plugin.saveSettings()
+          if (value) {
+            showSyncNotice($("setting.remote.change_feed_enabled_notice") || "已启用变更流：重启 Obsidian 后生效；关闭并重启即可回滚")
+          }
+        })
+      }
+    })
     this.setDescWithBreaks(
       set.lastElementChild as HTMLElement,
-      $("setting.remote.change_feed_desc") || "启用后常规同步按游标只拉增量（跳过全库枚举与文件夹通告）。首次启用需本地与服务端基线就绪，之后新设备/游标过期会自动回落一次全量对账。"
+      EXPERIMENTAL_SYNC_FEATURES_ENABLED
+        ? $("setting.remote.change_feed_desc") || "启用后常规同步按游标只拉增量（跳过全库枚举与文件夹通告）。首次启用需本地与服务端基线就绪，之后新设备/游标过期会自动回落一次全量对账。"
+        : "稳定同步模式暂不启用变更流和挎斗服务；当前只走基础 WebSocket 同步，待端到端内容完整性和断线恢复验收通过后再开放。"
     )
 
-    if (this.plugin.settings.changeFeedEnabled) {
+    if (EXPERIMENTAL_SYNC_FEATURES_ENABLED && this.plugin.settings.changeFeedEnabled) {
       new Setting(set).setName($("setting.remote.sidecar_url") || "挎斗服务地址").addText((text) =>
         text
           .setPlaceholder("http://127.0.0.1:9100")
@@ -1889,18 +1896,27 @@ export class SettingTab extends PluginSettingTab {
   }
 
   private renderCloudSettings(set: HTMLElement) {
-    new Setting(set).setName($("setting.cloud.title")).setClass("fns-setting-item-checkbox").addToggle((toggle) =>
-      toggle.setValue(this.plugin.settings.cloudPreviewEnabled).onChange(async (value) => {
-        if (value != this.plugin.settings.cloudPreviewEnabled) {
-          this.plugin.settings.cloudPreviewEnabled = value
-          await this.plugin.saveAndReloadServices()
-          this.refresh()
-        }
-      }),
+    new Setting(set).setName(EXPERIMENTAL_SYNC_FEATURES_ENABLED ? $("setting.cloud.title") : "云端投影（暂缓）").setClass("fns-setting-item-checkbox").addToggle((toggle) => {
+      toggle.setValue(EXPERIMENTAL_SYNC_FEATURES_ENABLED && this.plugin.settings.cloudPreviewEnabled)
+        .setDisabled(!EXPERIMENTAL_SYNC_FEATURES_ENABLED)
+      if (EXPERIMENTAL_SYNC_FEATURES_ENABLED) {
+        toggle.onChange(async (value) => {
+          if (value != this.plugin.settings.cloudPreviewEnabled) {
+            this.plugin.settings.cloudPreviewEnabled = value
+            await this.plugin.saveAndReloadServices()
+            this.refresh()
+          }
+        })
+      }
+    })
+    this.setDescWithBreaks(
+      set.lastElementChild as HTMLElement,
+      EXPERIMENTAL_SYNC_FEATURES_ENABLED
+        ? $("setting.cloud.desc")
+        : "稳定同步模式暂不启用云端投影、自动删本地附件或动态附件映射；附件始终走基础同步。"
     )
-    this.setDescWithBreaks(set.lastElementChild as HTMLElement, $("setting.cloud.desc"))
 
-    if (this.plugin.settings.cloudPreviewEnabled) {
+    if (EXPERIMENTAL_SYNC_FEATURES_ENABLED && this.plugin.settings.cloudPreviewEnabled) {
       new Setting(set).setName($("setting.cloud.type_limit")).setClass("fns-setting-item-checkbox").addToggle((toggle) =>
         toggle.setValue(this.plugin.settings.cloudPreviewTypeRestricted).onChange(async (value) => {
           if (value != this.plugin.settings.cloudPreviewTypeRestricted) {

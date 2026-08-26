@@ -73,6 +73,10 @@ function loadChangeFeed(requestUrl) {
       if (id === "./operator_note") return { receiveNoteSyncDelete: async () => undefined };
       if (id === "./operator_file") return { receiveFileSyncDelete: async () => undefined };
       if (id === "./background_activity_gate") return { requireForeground: async () => undefined };
+      if (id === "./sync_feature_policy") return {
+        isChangeFeedRuntimeEnabled: () => false,
+        isCloudPreviewRuntimeEnabled: () => false,
+      };
       if (id === "./change_feed_logic") {
         const logicModule = { exports: {} };
         vm.runInNewContext(logicTranspiled, {

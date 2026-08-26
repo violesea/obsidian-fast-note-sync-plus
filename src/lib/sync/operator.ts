@@ -34,6 +34,7 @@ import {
   shouldAlertChangeFeedFallback,
 } from "./change_feed_health";
 import { isBackgroundActivityClosedError, requireForeground } from "./background_activity_gate";
+import { isChangeFeedRuntimeEnabled, isCloudPreviewRuntimeEnabled } from "./sync_feature_policy";
 
 // C9: 离线超墓碑期保护 — 默认与服务端 soft-delete-retention-time 默认值对应（90 天），
 // 先硬编码常量；服务端墓碑物理清除窗口过后，长期离线设备重连若检测到"本地有服务端无"的
@@ -284,7 +285,7 @@ const scanIncrementalVaultEntries = async (
         processed.add(key);
         continue;
       }
-      const skipSync = plugin.settings.cloudPreviewEnabled
+      const skipSync = isCloudPreviewRuntimeEnabled(plugin.settings)
         && (!plugin.settings.cloudPreviewTypeRestricted || FileCloudPreview.isRestrictedType("." + file.extension));
       if (skipSync) {
         processed.add(key);
@@ -829,7 +830,7 @@ export function checkSyncCompletion(plugin: FastSync, intervalId?: number, syncS
     }
 
     // 如果开启了云预览，在首次同步后检查所有附件在服务端的状态
-    if (plugin.settings.cloudPreviewEnabled) {
+    if (isCloudPreviewRuntimeEnabled(plugin.settings)) {
       void checkAndUploadAttachments(plugin);
     }
 
@@ -1190,7 +1191,7 @@ export const handleSync = async function (
     let changeFeedHealth = parseChangeFeedHealthState(
       plugin.localStorageManager.getMetadata("changeFeedHealth"),
     );
-    if (plugin.settings.changeFeedEnabled && plugin.settings.syncEnabled && syncMode === "auto") {
+    if (isChangeFeedRuntimeEnabled(plugin.settings) && plugin.settings.syncEnabled && syncMode === "auto") {
       const plan = planChangeFeedRound(changeFeedDecisionInput(plugin, syncMode));
       changeFeedPlan = plan;
       if (plan === "adopt" || plan === "poll") {
@@ -1285,7 +1286,7 @@ export const handleSync = async function (
     let scannedVaultEntryCount = 0;
     if (plugin.settings.syncEnabled && shouldSyncNotes) {
       activeTypes.push('note', 'folder');
-      if (!plugin.settings.cloudPreviewEnabled || plugin.settings.cloudPreviewTypeRestricted) {
+      if (!isCloudPreviewRuntimeEnabled(plugin.settings) || plugin.settings.cloudPreviewTypeRestricted) {
         activeTypes.push('file');
       }
     }
@@ -1342,7 +1343,7 @@ export const handleSync = async function (
     if (plugin.settings.syncEnabled && shouldSyncNotes) {
       expectedCount += 1; // NoteSync
       expectedCount += 1; // FolderSync
-      if (!plugin.settings.cloudPreviewEnabled || plugin.settings.cloudPreviewTypeRestricted) {
+      if (!isCloudPreviewRuntimeEnabled(plugin.settings) || plugin.settings.cloudPreviewTypeRestricted) {
         expectedCount += 1; // FileSync
       }
     }
@@ -1422,7 +1423,7 @@ export const handleSync = async function (
       plugin.noteSyncEnd = true;
       plugin.fileSyncEnd = true;
       plugin.folderSyncEnd = true;
-    } else if (plugin.settings.cloudPreviewEnabled && !plugin.settings.cloudPreviewTypeRestricted) {
+    } else if (isCloudPreviewRuntimeEnabled(plugin.settings) && !plugin.settings.cloudPreviewTypeRestricted) {
       plugin.fileSyncEnd = true;
     }
     if (!(plugin.settings.configSyncEnabled && shouldSyncConfigs)) {
@@ -1622,7 +1623,8 @@ export const handleSync = async function (
               if (isLargeBinarySyncRisk(file.stat.size, plugin)) continue;
               const attachmentLimit = (plugin.settings.attachmentSyncLimit ?? 50) * 1024 * 1024;
               if (file.stat.size > attachmentLimit) continue;
-              const skipSync = plugin.settings.cloudPreviewEnabled && (!plugin.settings.cloudPreviewTypeRestricted || FileCloudPreview.isRestrictedType("." + file.extension));
+              const skipSync = isCloudPreviewRuntimeEnabled(plugin.settings)
+                && (!plugin.settings.cloudPreviewTypeRestricted || FileCloudPreview.isRestrictedType("." + file.extension));
               if (skipSync) continue;
 
               const baseHash = plugin.fileHashManager.getPathHash(file.path);
@@ -2099,7 +2101,7 @@ export const handleSync = async function (
         try {
           if (!await waitForSyncConnection(plugin, context)) return;
           if (shouldRestartFreshRoundOnResume({
-            enabled: plugin.settings.changeFeedEnabled === true,
+            enabled: isChangeFeedRuntimeEnabled(plugin.settings),
             sidecarUrl: plugin.settings.sidecarUrl ?? "",
             syncEnabled: plugin.settings.syncEnabled !== false,
             syncMode,
@@ -2728,7 +2730,7 @@ export const handleRequestSend = async function (plugin: FastSync, syncMode: Syn
 
     // 云预览模式且未开启类型限制时跳过 FileSync
     // Skip FileSync when cloud-preview is on without type restriction
-    if (!plugin.settings.cloudPreviewEnabled || plugin.settings.cloudPreviewTypeRestricted) {
+    if (!isCloudPreviewRuntimeEnabled(plugin.settings) || plugin.settings.cloudPreviewTypeRestricted) {
       jobs.push(sendSyncInBatches(
         plugin,
         "FileSync",

@@ -100,6 +100,8 @@ const requireStub = (id) => {
         captureStableSnapshot: async () => ({ hash: "hash", stat: { size: 1, mtime: 1, ctime: 1 } }),
         stableCaptureCoordinator: { capture: async (_key, task) => task() },
       };
+    case "./sync_feature_policy":
+      return { isCloudPreviewRuntimeEnabled: () => false };
     default:
       throw new Error(`Unexpected require: ${id}`);
   }
