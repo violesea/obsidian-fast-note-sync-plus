@@ -29,7 +29,7 @@ import { SyncState } from "./lib/sync/sync_state";
 import { RuntimeConfig } from "./lib/sync/runtime_config";
 import { IncrementalScanManager } from "./lib/sync/incremental_scan_manager";
 import { loadOrCreateDeviceId } from "./lib/sync/device_identity";
-import { ChangeFeedCursorStore, buildChangeFeedClient } from "./lib/sync/change_feed";
+import { ChangeFeedCursorStore } from "./lib/sync/change_feed";
 import { $ } from "./i18n/lang";
 import { SsoImportModal } from "./views/sso-import-modal";
 import { StatusBarManager } from "./lib/ui/status_bar_manager";
@@ -124,6 +124,18 @@ export default class FastSync extends Plugin {
   setupProgressTracker() {
     this.progressTracker.onPageComplete = (type, pageIndex) => {
       this.sendSyncPageAck(type, pageIndex);
+    };
+    this.progressTracker.onPageAckStalled = (type, pageIndex, retries) => {
+      const context = this.syncState.activeSyncContext;
+      if (!context) return;
+      dump(`[SyncSession] page ACK stalled after ${retries} retries: type=${type}, pageIndex=${pageIndex}; forcing a new transport/context`);
+      // A server-side "entry not found" or a suspended socket can make a
+      // locally successful Send() ineffective. Stop feeding the old context
+      // and let the reconnect path rotate it before resending the snapshot.
+      this.syncState.transportResetPending = true;
+      this.syncState.syncPhase = "waiting-connection";
+      this.clearSyncContext(context);
+      this.websocket?.requestForceReconnect();
     };
     this.progressTracker.onChange = (pct, detail, phase) => {
       this.statusBarManager?.render(pct, detail, phase);
@@ -622,22 +634,6 @@ export default class FastSync extends Plugin {
         this.deviceDisplayName = identity.displayName
         this.changeFeedCursor = new ChangeFeedCursorStore(this)
         await this.changeFeedCursor.initialize()
-        if (this.settings.changeFeedEnabled && (this.settings.sidecarUrl ?? "").trim() !== "") {
-          const cfClient = buildChangeFeedClient(this)
-          if (cfClient && this.changeFeedDeviceId) {
-            const platform = Platform.isIosApp ? (Platform.isTablet ? "ipados" : "ios")
-              : Platform.isAndroidApp ? "android"
-              : Platform.isDesktopApp ? "desktop" : "web"
-            void cfClient.register(
-              this.changeFeedDeviceId,
-              this.settings.vault,
-              this.getClientName(),
-              platform,
-              this.manifest.version ?? "",
-            ).then((r) => dump(`[ChangeFeed] registered device_id=${this.changeFeedDeviceId} cursor_rev=${r.cursor_rev} safe_rev=${r.safe_rev}`))
-              .catch((e) => dump(`[ChangeFeed] register failed (non-fatal): ${e instanceof Error ? e.message : String(e)}`))
-          }
-        }
       } catch (e) {
         dump("[ChangeFeed] identity init failed (non-fatal):", e)
       }

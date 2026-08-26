@@ -31,6 +31,18 @@ const L = module.exports;
 // ---------------------------------------------------------------- plan ---
 const base = { enabled: true, sidecarUrl: "http://127.0.0.1:9100", deviceId: "u", cursorRev: null, baselinesReady: true, syncEnabled: true, syncMode: "auto" };
 
+// Contract: only a stale cursor may enter one bounded full repair. Every other
+// catch-up failure is retried or surfaced as incomplete, never silently scanned.
+assert.equal(L.changeFeedFailureDisposition("stale_cursor"), "repair");
+assert.equal(L.changeFeedFailureDisposition("materialization_failed"), "retry");
+assert.equal(L.changeFeedFailureDisposition("page_limit"), "retry");
+assert.equal(L.changeFeedFailureDisposition("network_error"), "retry");
+assert.equal(L.changeFeedFailureDisposition("round_superseded"), "abort");
+assert.deepEqual(
+  [1, 2, 3, 4].map((retry) => L.changeFeedRetryDelay(retry)),
+  [1000, 3000, 10000, 10000],
+);
+
 // 契约：未启用/无URL/非auto轮 → off（v1 原路径，默认关闭即无行为变化）
 assert.equal(L.planChangeFeedRound({ ...base, enabled: false }), "off");
 assert.equal(L.planChangeFeedRound({ ...base, sidecarUrl: "  " }), "off");

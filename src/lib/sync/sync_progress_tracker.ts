@@ -72,7 +72,11 @@ export class SyncProgressTracker {
   // can uniformly clear it on sync end/cancel.
   private stagnationTimers: Map<SyncType, number> = new Map();
   private lastAckedPage: Map<SyncType, number> = new Map();
+  private stagnationRetries: Map<SyncType, number> = new Map();
   private stagnationGeneration = 0;
+
+  /** Maximum number of timer-driven page ACK retries before transport recovery. */
+  static readonly MAX_STAGNATION_RETRIES = 3;
 
   // notify() 节流：整数百分比/阶段未变化时最多每 NOTIFY_THROTTLE_MS 触发一次，
   // 变化时（含阶段切换）立即触发，避免每完成一个文件就刷一次状态栏 + workspace 事件
@@ -88,6 +92,9 @@ export class SyncProgressTracker {
    * 页完成回调，用于触发 sendSyncPageAck，使协议与 UI 渲染解耦。
    */
   onPageComplete?: (type: SyncType, pageIndex: number) => void;
+
+  /** Called when a page ACK remains ineffective after the retry budget. */
+  onPageAckStalled?: (type: SyncType, pageIndex: number, retries: number) => void;
 
   /**
    * Progress change callback, triggers status bar render.
@@ -197,6 +204,7 @@ export class SyncProgressTracker {
     }
     this.stagnationTimers.clear();
     this.lastAckedPage.clear();
+    this.stagnationRetries.clear();
   }
 
   /**
@@ -309,6 +317,7 @@ export class SyncProgressTracker {
 
     // 15s 无明细停滞重发 timer：每次真正入账一条明细就重置倒计时
     // Stagnation-resend timer: reset the countdown on every genuine detail accounting
+    this.stagnationRetries.set(type, 0);
     this.scheduleStagnationRecheck(type);
 
     this.tryAdvanceAckWatermark(type, prog);
@@ -342,6 +351,7 @@ export class SyncProgressTracker {
 
     if (highestNewlyConfirmed >= 0) {
       this.lastAckedPage.set(type, highestNewlyConfirmed);
+      this.stagnationRetries.set(type, 0);
       if (this.onPageComplete) {
         dump(`[SyncProgressTracker] [onPageComplete] ack watermark advanced, type: ${type}, highest confirmed pageIndex: ${highestNewlyConfirmed}`);
         this.onPageComplete(type, highestNewlyConfirmed);
@@ -361,7 +371,9 @@ export class SyncProgressTracker {
     const prog = this.progressMap.get(type);
     if (!prog) return;
     if (!prog.pages.has(pageIndex)) return;
+    const previousAck = this.lastAckedPage.get(type);
     this.tryAdvanceAckWatermark(type, prog);
+    if (this.lastAckedPage.get(type) !== previousAck) this.scheduleStagnationRecheck(type);
   }
 
   private scheduleStagnationRecheck(type: SyncType): void {
@@ -380,7 +392,15 @@ export class SyncProgressTracker {
     if (this.isForcedComplete) return;
     const highest = this.lastAckedPage.get(type);
     if (highest === undefined) return;
-    dump(`[SyncProgressTracker] [Stagnation] 15s with no new detail for type ${type}, resending ack for highest confirmed pageIndex ${highest}`);
+    const retries = (this.stagnationRetries.get(type) ?? 0) + 1;
+    if (retries > SyncProgressTracker.MAX_STAGNATION_RETRIES) {
+      dump(`[SyncProgressTracker] [Stagnation] ACK retry budget exhausted for type ${type}, pageIndex ${highest}`);
+      this.stagnationRetries.delete(type);
+      this.onPageAckStalled?.(type, highest, SyncProgressTracker.MAX_STAGNATION_RETRIES);
+      return;
+    }
+    this.stagnationRetries.set(type, retries);
+    dump(`[SyncProgressTracker] [Stagnation] 15s with no new detail for type ${type}, retry ${retries}/${SyncProgressTracker.MAX_STAGNATION_RETRIES} for pageIndex ${highest}`);
     this.onPageComplete?.(type, highest);
     // 继续排下一次检查，连续多次丢包场景下每 15s 补发一次，直到有新明细到达或同步结束
     // Reschedule so repeated packet loss gets re-nudged every 15s until new detail arrives or sync ends
@@ -466,6 +486,19 @@ export class SyncProgressTracker {
     if (this.onProgressChange) {
       this.onProgressChange(100, this.getDetailText(), 'idle');
     }
+  }
+
+  /**
+   * End a round that could not be proven complete without emitting 100%.
+   * Timeout and change-feed failure paths use this instead of forceComplete().
+   */
+  markIncomplete(): void {
+    this.isForcedComplete = false;
+    this.clearStagnationTimers();
+    this.lastReportedPct = Math.min(99, this.lastReportedPct);
+    const detail = this.getDetailText();
+    this.onChange?.(this.lastReportedPct, detail, 'idle');
+    this.onProgressChange?.(this.lastReportedPct, detail, 'idle');
   }
 
   /**

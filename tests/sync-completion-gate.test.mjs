@@ -22,6 +22,17 @@ vm.runInNewContext(transpiled, {
 }, { filename: sourcePath });
 
 const { canCompleteSync } = module.exports;
+const operatorSource = fs.readFileSync(path.join(root, "src", "lib", "sync", "operator.ts"), "utf8");
+const timeoutStart = operatorSource.indexOf("if (syncStartTime && Date.now() - syncStartTime > SYNC_TIMEOUT_MS)");
+const timeoutEnd = operatorSource.indexOf("const ws = plugin.websocket.ws", timeoutStart);
+assert.ok(timeoutStart >= 0 && timeoutEnd > timeoutStart);
+const timeoutPath = operatorSource.slice(timeoutStart, timeoutEnd);
+
+// Contract: a timeout is an incomplete outcome, never a forced 100% success.
+assert.match(timeoutPath, /progressTracker\.markIncomplete\(\)/);
+assert.doesNotMatch(timeoutPath, /progressTracker\.forceComplete\(\)/);
+assert.match(timeoutPath, /ui\.status\.timeout_partial/);
+
 const ready = {
   allSyncDone: true,
   allDownloadsComplete: true,

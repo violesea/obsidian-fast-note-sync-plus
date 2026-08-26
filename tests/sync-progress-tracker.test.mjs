@@ -43,6 +43,41 @@ tracker.recordPageProgress("note", 0, 1, false);
 tracker.recordCompleted("note", 0);
 assert.deepEqual(pageAcks, [0]);
 
+// Contract: a stalled page ACK is retried at most three times, then the
+// transport-recovery callback is raised instead of resending forever.
+const stalledTracker = new SyncProgressTracker();
+const stalledAcks = [];
+const stalledEvents = [];
+stalledTracker.onPageComplete = (_type, pageIndex) => stalledAcks.push(pageIndex);
+stalledTracker.onPageAckStalled = (type, pageIndex, retries) => stalledEvents.push({ type, pageIndex, retries });
+stalledTracker.reset(["note"]);
+stalledTracker.recordHashProgress(100);
+stalledTracker.recordUploadComplete("note");
+stalledTracker.setDownloadTotal("note", 1);
+stalledTracker.recordPageProgress("note", 0, 1, false);
+stalledTracker.recordCompleted("note", 0);
+assert.deepEqual(stalledAcks, [0]);
+for (let retry = 0; retry < 3; retry++) {
+  const latestTimer = Array.from(timers.values()).filter((timer) => timer.delay === 15000).at(-1);
+  assert.ok(latestTimer, "each ACK retry should schedule the next stagnation check");
+  latestTimer.callback();
+}
+assert.equal(stalledAcks.length, 4, "initial ACK plus three bounded retries");
+const exhaustedTimer = Array.from(timers.values()).filter((timer) => timer.delay === 15000).at(-1);
+assert.ok(exhaustedTimer, "the exhausted retry should still have a final timer callback");
+exhaustedTimer.callback();
+assert.deepEqual(stalledEvents, [{ type: "note", pageIndex: 0, retries: 3 }]);
+assert.equal(stalledAcks.length, 4, "no ACK is sent after the retry budget is exhausted");
+
+// Contract: an incomplete round never emits a 100% progress signal.
+const incompleteTracker = new SyncProgressTracker();
+const incompleteProgress = [];
+incompleteTracker.onProgressChange = (pct) => incompleteProgress.push(pct);
+incompleteTracker.reset(["note"]);
+incompleteTracker.recordHashProgress(50);
+incompleteTracker.markIncomplete();
+assert.ok(incompleteProgress.at(-1) < 100);
+
 const staleTimer = Array.from(timers.values()).find((timer) => timer.delay === 15000);
 assert.ok(staleTimer, "a stagnation timer should be scheduled after a page ACK");
 

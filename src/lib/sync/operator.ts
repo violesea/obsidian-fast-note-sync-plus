@@ -21,6 +21,11 @@ import { createIncrementalScanProgress } from "./incremental_scan_progress";
 import { planChangeFeedRound, changeFeedDecisionInput, runChangeFeedCatchUp, shouldRestartFreshRoundOnResume } from "./change_feed";
 import type { CatchUpResult as ChangeFeedCatchUpResult } from "./change_feed";
 import {
+  CHANGE_FEED_MAX_RETRIES,
+  changeFeedFailureDisposition,
+  changeFeedRetryDelay,
+} from "./change_feed_logic";
+import {
   markChangeFeedFallbackAlerted,
   parseChangeFeedHealthState,
   recordChangeFeedFallback,
@@ -483,6 +488,111 @@ async function waitForSyncConnection(plugin: FastSync, context: string): Promise
   return false;
 }
 
+/**
+ * Change-feed catch-up runs before the WebSocket page session exists. If the
+ * socket disappears here, wait for one bounded reconnect window and retry the
+ * same cursor; never turn the interruption into a vault-wide scan.
+ */
+async function waitForChangeFeedConnection(plugin: FastSync, context: string, timeoutMs = 30000): Promise<boolean> {
+  const startedAt = Date.now();
+  while (plugin.syncState.activeSyncContext === context) {
+    if (isSyncConnectionReady(plugin)) return true;
+    if (Date.now() - startedAt >= timeoutMs) return false;
+    plugin.syncState.syncPhase = "waiting-connection";
+    await sleep(250);
+  }
+  return false;
+}
+
+interface ChangeFeedRetryResult {
+  result: ChangeFeedCatchUpResult;
+  attempts: number;
+}
+
+/** Run catch-up with explicit bounded retries for transient failures. */
+async function runChangeFeedWithRetries(plugin: FastSync, context: string): Promise<ChangeFeedRetryResult> {
+  let attempts = 0;
+  while (plugin.syncState.activeSyncContext === context) {
+    attempts++;
+    const result = await runChangeFeedCatchUp(plugin, context);
+    const disposition = changeFeedFailureDisposition(result.reason);
+    if (result.ok || disposition !== "retry" || attempts > CHANGE_FEED_MAX_RETRIES) {
+      return { result, attempts };
+    }
+
+    const retryNumber = attempts;
+    const delayMs = changeFeedRetryDelay(retryNumber);
+    dump(`[ChangeFeed] catch-up retry ${retryNumber}/${CHANGE_FEED_MAX_RETRIES} in ${delayMs}ms: ${result.reason}${result.detail ? ` — ${result.detail}` : ""}`);
+
+    if (result.reason === "transport_reset") {
+      if (!await waitForChangeFeedConnection(plugin, context)) return { result, attempts };
+      // No WebSocket page has been sent yet, so the same logical context is
+      // safe for the HTTP cursor retry. Reinitialize page-owned state before
+      // the first request on the replacement transport.
+      plugin.syncState.transportResetPending = false;
+      plugin.beginSyncContext(context);
+    } else {
+      await sleep(delayMs);
+    }
+  }
+
+  return {
+    result: { ok: false, reason: "round_superseded" },
+    attempts,
+  };
+}
+
+/**
+ * Stop a blocked change-feed round without running the legacy full scanner.
+ * The durable cursor remains at its last acknowledged page, so a later round
+ * can retry the exact gap.
+ */
+function stopIncompleteChangeFeedRound(
+  plugin: FastSync,
+  context: string,
+  result: ChangeFeedCatchUpResult,
+  attempts: number,
+): void {
+  if (plugin.syncState.activeSyncContext !== context) return;
+
+  const reason = result.reason ?? "unknown";
+  const retries = Math.max(0, attempts - 1);
+  const message = `⚠ 变更流未完成：${reason}（已重试 ${retries} 次），本轮未执行全量扫描`;
+  dump(`[ChangeFeed] ${message}${result.detail ? ` — ${result.detail}` : ""}`);
+
+  plugin.clearSyncContext(context);
+  plugin.syncState.activeSyncContext = null;
+  plugin.syncState.resumePendingSync = undefined;
+  plugin.syncState.transportResetPending = false;
+  plugin.syncState.syncPhase = "idle";
+  plugin.syncState.isSyncing = false;
+  plugin.isSyncRequesting = false;
+  plugin.resetSyncTasks();
+  plugin.progressTracker.markIncomplete();
+
+  SyncLogManager.getInstance().addOrUpdateLog({
+    id: `change-feed-${context}`,
+    type: "error",
+    action: "ChangeFeedCatchUp",
+    status: "error",
+    message: JSON.stringify({
+      status: "incomplete",
+      reason,
+      detail: result.detail,
+      attempts,
+      retries,
+      fullScanStarted: false,
+    }),
+    timestamp: Date.now(),
+  });
+
+  if (plugin.settings.isShowNotice) showSyncNotice(message, 10000);
+  plugin.updateStatusBar(message);
+  window.setTimeout(() => {
+    if (plugin.syncState.activeSyncContext === null) plugin.updateStatusBar("");
+  }, 10000);
+}
+
 async function sendSyncMessage(
   plugin: FastSync,
   action: string,
@@ -547,16 +657,12 @@ export function checkSyncCompletion(plugin: FastSync, intervalId?: number, syncS
     plugin.downloadedChunksCount = 0;
     plugin.totalChunksToUpload = 0;
     plugin.uploadedChunksCount = 0;
-    plugin.progressTracker.forceComplete();
-    // 超时保底不代表真正完成：仍有下载会话未结束时，如实提示"部分未完成"，而非静默上报成功
-    // A safety timeout does not mean genuine completion: if download sessions are still pending,
-    // surface "partially incomplete" instead of silently reporting success
-    if (plugin.fileDownloadSessions.size > 0) {
-      dump(`Sync completion timeout with ${plugin.fileDownloadSessions.size} unfinished file download session(s), reporting partial completion.`);
-      plugin.updateStatusBar($("ui.status.timeout_partial"));
-    } else {
-      plugin.updateStatusBar($("ui.status.completed"));
-    }
+    // 超时保底不代表真正完成：无论是否仍有文件下载会话，都必须保持未完成态。
+    // A safety timeout is never proof of completion; keep the visible progress
+    // below 100% and report partial completion in every timeout case.
+    plugin.progressTracker.markIncomplete();
+    dump(`Sync completion timeout with ${plugin.fileDownloadSessions.size} unfinished file download session(s), reporting partial completion.`);
+    plugin.updateStatusBar($("ui.status.timeout_partial"));
     window.setTimeout(() => plugin.updateStatusBar(""), 10000);
     return;
   }
@@ -1076,8 +1182,10 @@ export const handleSync = async function (
     }
 
     // ─── FNS v2 变更流门（M2）：连接就绪后先按游标追平，成功则本轮强制增量路径 ───
-    // 追平失败（sidecar 不可达/409 过期/未配置）一律回落 v1 原路径，绝不阻塞常规同步。
+    // 只有 stale_cursor 允许一次 v1 repair；其它失败经过有限重试后停在未完成态，
+    // 不得静默降级为全库扫描。
     let changeFeedResult: ChangeFeedCatchUpResult | null = null;
+    let changeFeedRetryAttempts = 0;
     let changeFeedPlan = "off";
     let changeFeedHealth = parseChangeFeedHealthState(
       plugin.localStorageManager.getMetadata("changeFeedHealth"),
@@ -1086,23 +1194,41 @@ export const handleSync = async function (
       const plan = planChangeFeedRound(changeFeedDecisionInput(plugin, syncMode));
       changeFeedPlan = plan;
       if (plan === "adopt" || plan === "poll") {
-        changeFeedResult = await runChangeFeedCatchUp(plugin, context);
+        const retryRun = await runChangeFeedWithRetries(plugin, context);
+        changeFeedResult = retryRun.result;
+        changeFeedRetryAttempts = retryRun.attempts;
         if (!changeFeedResult.ok) {
+          if (plugin.syncState.activeSyncContext !== context) return;
           const reason = changeFeedResult.reason ?? "unknown";
+          const disposition = changeFeedFailureDisposition(reason);
+          if (disposition === "abort") return;
           changeFeedHealth = recordChangeFeedFallback(changeFeedHealth, reason);
           plugin.localStorageManager.setMetadata("changeFeedHealth", serializeChangeFeedHealthState(changeFeedHealth));
-          const fallbackMessage = `⚠ 变更流回落：${reason} · 连续 ${changeFeedHealth.consecutiveFallbacks} 轮`;
+          const fallbackMessage = disposition === "repair"
+            ? `⚠ 变更流游标失效：本轮执行一次全量修复 · ${reason}`
+            : `⚠ 变更流未完成：${reason} · 本轮不执行全量扫描`;
           plugin.updateStatusBar(fallbackMessage);
           if (shouldAlertChangeFeedFallback(changeFeedHealth)) {
             changeFeedHealth = markChangeFeedFallbackAlerted(changeFeedHealth);
             plugin.localStorageManager.setMetadata("changeFeedHealth", serializeChangeFeedHealthState(changeFeedHealth));
             showSyncNotice(`变更流已连续 ${changeFeedHealth.consecutiveFallbacks} 轮回落，原因：${reason}`, 10000);
           }
-          dump(`[ChangeFeed] catch-up failed (${changeFeedResult.reason}); falling back to v1 path this round`);
+          if (disposition === "repair") {
+            // stale_cursor is the only failure that permits one bounded v1
+            // repair. invalidate() already removed the stale cursor; the full
+            // scan re-establishes the local baseline for the next poll.
+            fastIncremental = false;
+            metadataReconciliation = false;
+            isLoadLastTime = false;
+            dump(`[ChangeFeed] stale cursor; starting one bounded v1 repair (attempts=${changeFeedRetryAttempts})`);
+          } else {
+            stopIncompleteChangeFeedRound(plugin, context, changeFeedResult, changeFeedRetryAttempts);
+            return;
+          }
         } else {
           changeFeedHealth = recordChangeFeedSuccess(changeFeedHealth);
           plugin.localStorageManager.setMetadata("changeFeedHealth", serializeChangeFeedHealthState(changeFeedHealth));
-          dump(`[ChangeFeed] mode=${changeFeedResult.mode} cursor ${changeFeedResult.cursorFrom}->${changeFeedResult.cursorTo} fetched=${changeFeedResult.fetched} deleted=${changeFeedResult.deleted} skipped=${changeFeedResult.skipped}`);
+          dump(`[ChangeFeed] mode=${changeFeedResult.mode} cursor ${changeFeedResult.cursorFrom}->${changeFeedResult.cursorTo} fetched=${changeFeedResult.fetched} deleted=${changeFeedResult.deleted} skipped=${changeFeedResult.skipped} attempts=${changeFeedRetryAttempts}`);
         }
       }
     }
@@ -1885,6 +2011,7 @@ export const handleSync = async function (
         changeFeedFallbackConsecutive: changeFeedHealth.consecutiveFallbacks,
         changeFeedFallbackTotal: changeFeedHealth.totalFallbacks,
         changeFeedLastFallbackReason: changeFeedHealth.lastReason,
+        changeFeedRetryAttempts,
         transportRecovery: isTransportRecovery,
         // 变更流轮次（A-4 验收）：enumeratedEntries 必须为 0，游标区间可与服务端 sync_log 对账
         ...(changeFeedResult?.ok ? {

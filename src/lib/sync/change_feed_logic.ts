@@ -78,6 +78,28 @@ export const CHANGE_FEED_PAGE_LIMIT = 500;
 /** 单轮最多翻 40 页，防止一次轮次吞掉超长积压导致移动端卡死 */
 export const CHANGE_FEED_MAX_PAGES = 40;
 
+/**
+ * A failed change-feed round must not silently become a vault-wide repair.
+ * Retry transient failures a small, explicit number of times; only a stale
+ * cursor is allowed to take the bounded v1 repair path.
+ */
+export const CHANGE_FEED_MAX_RETRIES = 3;
+export const CHANGE_FEED_RETRY_BACKOFF_MS = [1000, 3000, 10000] as const;
+
+export type ChangeFeedFailureDisposition = "retry" | "repair" | "abort";
+
+export function changeFeedFailureDisposition(reason: string | undefined): ChangeFeedFailureDisposition {
+  if (reason === "stale_cursor") return "repair";
+  if (reason === "round_superseded") return "abort";
+  return "retry";
+}
+
+/** Return the delay before retryNumber (1-based) in milliseconds. */
+export function changeFeedRetryDelay(retryNumber: number): number {
+  const index = Math.max(0, Math.min(CHANGE_FEED_RETRY_BACKOFF_MS.length - 1, Math.floor(retryNumber) - 1));
+  return CHANGE_FEED_RETRY_BACKOFF_MS[index] ?? CHANGE_FEED_RETRY_BACKOFF_MS[0];
+}
+
 export interface ChangeFeedCursorStateRecord {
   schema: 2;
   deviceId: string;
