@@ -148,6 +148,36 @@ export class IncrementalScanManager {
     return Object.keys(this.state.entries).length;
   }
 
+  /**
+   * Return incremental snapshot entries that were neither processed nor
+   * acknowledged during the active logical round.
+   *
+   * A full reconciliation deliberately returns zero here: its vault-wide
+   * scan is the coverage proof for the captured snapshot. For an event-only
+   * round, however, an unprocessed entry means the client must not report a
+   * successful sync and discard the session context.
+   */
+  getActiveUnprocessedCount(): number {
+    if (!this.activeSnapshot || this.activeFullReconcile) return 0;
+
+    let count = 0;
+    for (const entry of this.activeSnapshot.entries) {
+      const key = incrementalEntryKey(entry.kind, entry.path);
+      const current = this.state.entries[key];
+
+      // An ACK may have removed the entry without the scanner marking it
+      // processed. That is still a safe terminal state.
+      if (!current) continue;
+
+      // A newer event must survive this round even if the older snapshot
+      // entry was already processed.
+      if (current.version > entry.version || !this.activeProcessedKeys.has(key)) {
+        count++;
+      }
+    }
+    return count;
+  }
+
   markInitialSyncComplete(): void {
     this.state.completedInitialSync = true;
     this.state.localBaselineReady = true;

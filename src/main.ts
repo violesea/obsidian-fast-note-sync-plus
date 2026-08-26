@@ -730,7 +730,7 @@ export default class FastSync extends Plugin {
     // 取消当前正在进行的同步，重置运行时状态
     cancelSync(this)
     void this.websocket?.unRegister(true)
-    abortAllFileOperations()
+    abortAllFileOperations(this)
     this.localStorageManager?.stopWatch()
     this.localStorageManager?.flush()
     this.incrementalScanManager?.flush()

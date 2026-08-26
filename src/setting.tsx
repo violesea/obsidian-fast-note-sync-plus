@@ -16,6 +16,7 @@ import { $ } from "./i18n/lang";
 import FastSync from "./main";
 import { updateVaultName } from "./lib/settings/vault_name";
 import { saveDeviceDisplayName } from "./lib/sync/device_identity";
+import { PLUGIN_RELEASE_REPOSITORY } from "./lib/utils/version_manager";
 
 
 export interface PluginSettings {
@@ -65,6 +66,8 @@ export interface PluginSettings {
   readonlySyncEnabled: boolean
   /** FNS v2 变更流：启用后常规轮次按游标拉增量，跳过全量枚举（默认关闭，回滚=关闭重启） */
   changeFeedEnabled: boolean
+  /** M7 写入乐观锁：上传前核对服务端是否自本设备上次 ACK 后变过，冲突则不覆盖（默认开启） */
+  writePreconditionEnabled: boolean
   /** 变更流挎斗服务地址（fns-sidecar，如 http://127.0.0.1:9100） */
   sidecarUrl: string
   /** 挎斗服务令牌（X-Sidecar-Token） */
@@ -156,6 +159,7 @@ export const DEFAULT_SETTINGS: PluginSettings = {
   manualSyncEnabled: false,
   readonlySyncEnabled: false,
   changeFeedEnabled: false,
+  writePreconditionEnabled: true,
   sidecarUrl: "",
   sidecarToken: "",
   debugRemoteUrls: "",
@@ -1027,19 +1031,18 @@ export class SettingTab extends PluginSettingTab {
           btn.textContent = $("setting.debug.version_installing") || "正在安装...";
 
           try {
-            const source = this.plugin.settings.updateSource || "github";
+            const configuredSource = this.plugin.settings.updateSource || "github";
             const zipFileName = `fast-note-sync-v${latest}.zip`;
             const pluginDir = getPluginDir(this.plugin);
 
-            let url = "";
-            if (source === "github") {
-              url = `https://github.com/haierkeys/obsidian-fast-note-sync/releases/download/${latest}/${zipFileName}`;
-            } else {
-              // CNB 链接格式：releases/download/{version}/fast-note-sync-v{version}.zip
-              url = `https://cnb.cool/haierkeys/obsidian-fast-note-sync/-/releases/download/${latest}/${zipFileName}`;
+            // Fork releases are authoritative. A legacy CNB preference may
+            // remain in data.json, but must never redirect to upstream code.
+            if (configuredSource === "cnb") {
+              dump("Legacy CNB plugin source ignored; using the fork GitHub Release");
             }
+            const url = `https://github.com/${PLUGIN_RELEASE_REPOSITORY}/releases/download/${latest}/${zipFileName}`;
 
-            dump(`[fast-note-sync] preparing download. Source: ${source}, Tag: ${tag}, Zip: ${zipFileName}, Dir: ${pluginDir}, URL: ${url}`);
+            dump(`[fast-note-sync] preparing download. Source: ${configuredSource}, Tag: ${tag}, Zip: ${zipFileName}, Dir: ${pluginDir}, URL: ${url}`);
             showSyncNotice($("ui.version.downloading_file", { file: zipFileName }) || `正在下载 ${zipFileName}...`);
 
             // 3. 跨域下载 Zip 包 / Download zip with requestUrl to bypass CORS and gain speed
@@ -2139,4 +2142,3 @@ export class VaultNameModal extends Modal {
     this.contentEl.empty();
   }
 }
-

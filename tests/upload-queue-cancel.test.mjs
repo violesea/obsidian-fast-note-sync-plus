@@ -7,6 +7,39 @@ import ts from "typescript";
 const root = path.resolve(import.meta.dirname, "..");
 const sourcePath = path.join(root, "src", "lib", "sync", "operator_file.ts");
 const source = fs.readFileSync(sourcePath, "utf8");
+
+// operator_file uses window timers for retry/backoff. Keep these tests
+// deterministic while retaining Node's real timers for microtask yielding.
+let fakeNow = 0;
+let nextTimerId = 1;
+const fakeTimers = new Map();
+const fakeSetTimeout = (callback, delay = 0) => {
+  const id = nextTimerId++;
+  fakeTimers.set(id, { callback, due: fakeNow + Math.max(0, delay) });
+  return id;
+};
+const fakeClearTimeout = (id) => {
+  fakeTimers.delete(id);
+};
+const flushMicrotasks = async () => {
+  await Promise.resolve();
+  await Promise.resolve();
+};
+const advanceTimers = async (milliseconds) => {
+  fakeNow += milliseconds;
+  while (true) {
+    const due = [...fakeTimers.entries()]
+      .filter(([, timer]) => timer.due <= fakeNow)
+      .sort(([, left], [, right]) => left.due - right.due);
+    if (due.length === 0) break;
+    for (const [id, timer] of due) {
+      if (!fakeTimers.delete(id)) continue;
+      timer.callback();
+      await flushMicrotasks();
+    }
+  }
+};
+
 const transpiled = ts.transpileModule(source, {
   compilerOptions: {
     module: ts.ModuleKind.CommonJS,
@@ -82,16 +115,20 @@ vm.runInNewContext(transpiled, {
   DataView,
   TextDecoder,
   TextEncoder,
-  window: { setTimeout, clearTimeout },
+  window: { setTimeout: fakeSetTimeout, clearTimeout: fakeClearTimeout },
   setTimeout,
   clearTimeout,
 }, { filename: sourcePath });
 
 const {
   clearUploadQueue,
+  abortAllFileOperations,
+  resetFileOperations,
+  getActiveUploadCount,
   receiveFileUpload,
   receiveFileUploadAck,
   receiveFileUploadSessionNotFound,
+  fileDeleteByPath,
   resetFileDownloadSessions,
 } = module.exports;
 const file = new TFile();
@@ -138,6 +175,7 @@ const plugin = {
   pendingUploadHashes: new Map(),
   localStorageManager: { savePending: () => undefined },
   fileHashManager: { setFileHash: () => undefined, setLocalFileHash: () => undefined },
+  lockManager: { withLock: async (_path, task) => task() },
   recordSyncCompleted: () => undefined,
   websocket: { SendBinary: async () => "closed" },
 };
@@ -289,9 +327,11 @@ const uploadPlugin = {
   uploadedChunksCount: 0,
   pendingUploadHashes: new Map(),
   localStorageManager: { savePending: () => undefined },
+  lockManager: { withLock: async (_path, task) => task() },
   fileHashManager: {
     setLocalFileHash: () => { localHashCalls++; },
     setFileHash: () => { serverHashCalls++; },
+    removeFileHash: () => undefined,
   },
   fileSyncTasks: { failed: 0 },
   recordSyncCompleted: () => undefined,
@@ -312,20 +352,42 @@ assert.equal(localHashCalls, 1);
 assert.equal(serverHashCalls, 0);
 assert.equal(closedReleaseCalls, 1);
 
-// Contract: a repeated 463 for the same upload session is idempotent. It must
-// release the slot and count the failed task only once.
+// Contract: a 463 invalidates only the current binary session. The logical
+// upload remains pending, reissues FileUploadCheck with bounded retry, and
+// does not count a failure before the replacement session is acknowledged.
 let release463Calls = 0;
-let completed463 = 0;
-const pendingSlotResolvers = [];
+let completed463 = [];
+let binarySendCalls = 0;
+let resolveFirstBinarySend;
+const retryChecks = [];
 const sessionPlugin = {
   ...uploadPlugin,
   concurrencyLimiter: {
-    waitForSlot: () => new Promise((resolve) => pendingSlotResolvers.push(resolve)),
+    waitForSlot: async () => undefined,
     releaseSlot: () => { release463Calls++; },
   },
+  localStorageManager: {
+    savePending: () => undefined,
+    getMetadata: () => 0,
+    setMetadata: () => undefined,
+  },
   fileSyncTasks: { failed: 0 },
-  recordSyncCompleted: () => { completed463++; },
-  websocket: { SendBinary: async () => "closed" },
+  recordSyncCompleted: (_type, pageIndex) => { completed463.push(pageIndex); },
+  websocket: {
+    SendMessage: async (action, payload) => {
+      retryChecks.push({ action, payload });
+      return "sent";
+    },
+    SendBinary: async (_frame, _prefix, before, after) => {
+      if (before?.()) return "cancelled";
+      binarySendCalls++;
+      if (binarySendCalls === 1) {
+        return new Promise((resolve) => { resolveFirstBinarySend = resolve; });
+      }
+      after?.();
+      return "sent";
+    },
+  },
 };
 
 await receiveFileUpload({
@@ -337,13 +399,185 @@ await receiveFileUpload({
   chunkSize: 1,
   pageIndex: 0,
 }, sessionPlugin);
-assert.equal(pendingSlotResolvers.length, 1);
+await new Promise((resolve) => setTimeout(resolve, 0));
+assert.equal(binarySendCalls, 1);
 receiveFileUploadSessionNotFound("session-463", sessionPlugin);
 receiveFileUploadSessionNotFound("session-463", sessionPlugin);
 assert.equal(release463Calls, 1);
-assert.equal(sessionPlugin.fileSyncTasks.failed, 1);
-assert.equal(completed463, 1);
-pendingSlotResolvers[0]();
+assert.equal(sessionPlugin.fileSyncTasks.failed, 0);
+assert.deepEqual(completed463, []);
+resolveFirstBinarySend("cancelled");
 await new Promise((resolve) => setTimeout(resolve, 0));
+await advanceTimers(500);
+assert.equal(retryChecks.length, 1);
+assert.equal(retryChecks[0].action, "FileUploadCheck");
+
+await receiveFileUpload({
+  path: file.path,
+  pathHash: "hash-463",
+  ctime: 1,
+  mtime: 1,
+  sessionId: "session-463-new",
+  chunkSize: 1,
+  pageIndex: 0,
+}, sessionPlugin);
+await new Promise((resolve) => setTimeout(resolve, 0));
+
+// The retry is one logical task: total chunks are not double-counted and the
+// old session's repeated 463 cannot cancel the replacement session.
+assert.equal(binarySendCalls, 2);
+assert.equal(sessionPlugin.totalChunksToUpload, 1);
+assert.equal(sessionPlugin.fileSyncTasks.failed, 0);
+assert.deepEqual(completed463, []);
+receiveFileUploadSessionNotFound("session-463", sessionPlugin);
+receiveFileUploadAck({ path: file.path, pathHash: "hash-463", lastTime: 3 }, sessionPlugin);
+assert.equal(release463Calls, 2);
+assert.equal(sessionPlugin.syncState.pendingFileUploadAcks.size, 0);
+assert.equal(sessionPlugin.fileSyncTasks.failed, 0);
+assert.deepEqual(completed463, [0]);
+
+// Contract: a retry response timeout is bounded. Three FileUploadCheck
+// attempts are allowed; after the third unanswered response the logical task
+// is recorded as failed and every completion marker is drained exactly once.
+let timeoutReleaseCalls = 0;
+const timeoutChecks = [];
+const timeoutCompleted = [];
+const timeoutPlugin = {
+  ...uploadPlugin,
+  lockManager: { withLock: async (_path, task) => task() },
+  concurrencyLimiter: {
+    waitForSlot: async () => undefined,
+    releaseSlot: () => { timeoutReleaseCalls++; },
+  },
+  localStorageManager: {
+    savePending: () => undefined,
+    getMetadata: () => 0,
+    setMetadata: () => undefined,
+  },
+  pendingUploadHashes: new Map(),
+  syncState: {
+    pendingFilePushPageIndex: new Map(),
+    pendingFileUploadAcks: new Set(),
+  },
+  fileSyncTasks: { failed: 0 },
+  recordSyncCompleted: (_type, pageIndex) => { timeoutCompleted.push(pageIndex); },
+  websocket: {
+    SendMessage: async (action, payload) => {
+      timeoutChecks.push({ action, payload });
+      return "sent";
+    },
+    SendBinary: async (_frame, _prefix, before, after) => {
+      if (before?.()) return "cancelled";
+      after?.();
+      return "sent";
+    },
+  },
+};
+await receiveFileUpload({
+  path: file.path,
+  pathHash: "hash-timeout",
+  ctime: 1,
+  mtime: 1,
+  sessionId: "session-timeout",
+  chunkSize: 1,
+  pageIndex: 4,
+}, timeoutPlugin);
+await flushMicrotasks();
+receiveFileUploadSessionNotFound("session-timeout", timeoutPlugin);
+assert.equal(getActiveUploadCount(), 1);
+
+await advanceTimers(500);
+assert.equal(timeoutChecks.length, 1);
+await advanceTimers(5000);
+await advanceTimers(1000);
+assert.equal(timeoutChecks.length, 2);
+await advanceTimers(5000);
+await advanceTimers(2000);
+assert.equal(timeoutChecks.length, 3);
+await advanceTimers(5000);
+assert.equal(timeoutPlugin.fileSyncTasks.failed, 1);
+assert.deepEqual(timeoutCompleted, [4]);
+assert.equal(timeoutPlugin.syncState.pendingFileUploadAcks.size, 0);
+assert.equal(timeoutPlugin.pendingUploadHashes.size, 0);
+assert.equal(getActiveUploadCount(), 0);
+assert.equal(timeoutReleaseCalls, 1);
+
+// Contract: deleting a path cancels a scheduled session retry, so no retry
+// check or delete request is emitted after the local file has disappeared.
+let deleteRetryChecks = 0;
+const deletePlugin = {
+  ...uploadPlugin,
+  lastSyncPathDeleted: new Set(),
+  concurrencyLimiter: {
+    waitForSlot: async () => undefined,
+    releaseSlot: () => undefined,
+  },
+  localStorageManager: {
+    savePending: () => undefined,
+    getMetadata: () => 0,
+    setMetadata: () => undefined,
+  },
+  pendingUploadHashes: new Map(),
+  syncState: {
+    pendingFilePushPageIndex: new Map(),
+    pendingFileUploadAcks: new Set(),
+  },
+  websocket: {
+    SendMessage: async () => {
+      deleteRetryChecks++;
+      return "sent";
+    },
+    SendBinary: async (_frame, _prefix, before, after) => {
+      if (before?.()) return "cancelled";
+      after?.();
+      return "sent";
+    },
+  },
+};
+await receiveFileUpload({
+  path: file.path,
+  pathHash: "hash-delete-retry",
+  ctime: 1,
+  mtime: 1,
+  sessionId: "session-delete-retry",
+  chunkSize: 1,
+  pageIndex: 5,
+}, deletePlugin);
+await flushMicrotasks();
+receiveFileUploadSessionNotFound("session-delete-retry", deletePlugin);
+await fileDeleteByPath(file.path, deletePlugin);
+await advanceTimers(500);
+assert.equal(deleteRetryChecks, 0);
+assert.equal(deletePlugin.syncState.pendingFileUploadAcks.size, 0);
+assert.equal(getActiveUploadCount(), 0);
+
+// Contract: abortAllFileOperations clears retrying and queued state, releases
+// acquired resources, and leaves no timer capable of sending on the old socket.
+const abortPlugin = {
+  ...deletePlugin,
+  pendingUploadHashes: new Map(),
+  syncState: {
+    pendingFilePushPageIndex: new Map(),
+    pendingFileUploadAcks: new Set(),
+  },
+};
+await receiveFileUpload({
+  path: file.path,
+  pathHash: "hash-abort",
+  ctime: 1,
+  mtime: 1,
+  sessionId: "session-abort",
+  chunkSize: 1,
+  pageIndex: 6,
+}, abortPlugin);
+await flushMicrotasks();
+receiveFileUploadSessionNotFound("session-abort", abortPlugin);
+assert.equal(getActiveUploadCount(), 1);
+abortAllFileOperations(abortPlugin);
+await advanceTimers(10000);
+assert.equal(getActiveUploadCount(), 0);
+assert.equal(abortPlugin.syncState.pendingFileUploadAcks.size, 0);
+assert.equal(abortPlugin.totalChunksToUpload, 0);
+resetFileOperations();
 
 console.log("upload-queue-cancel.test.mjs: all scenarios passed");

@@ -42,6 +42,15 @@ const requireStub = (id) => {
   };
   if (id === "../../main") return {};
   if (id === "./background_activity_gate") return { waitForForeground: async () => true };
+  if (id === "../api/http_api_service") return {
+    HttpApiService: class { async getNoteContent() { return null; } },
+  };
+  if (id === "./write_precondition") return {
+    // Fail-open shape: this suite does not exercise M7, so the guard must be
+    // inert here rather than silently changing what these contracts cover.
+    decideWrite: () => ({ kind: "upload", reason: "precondition-unavailable" }),
+    shouldCheckPrecondition: () => false,
+  };
   if (id === "./stable_capture") return {
     captureStableSnapshot: async () => ({ value: "", hash: "0", stat: { size: 0, mtime: 0, ctime: 0 } }),
     stableCaptureCoordinator: { capture: async (_key, task) => task() },

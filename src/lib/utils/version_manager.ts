@@ -6,6 +6,9 @@ import { AppWithInternal } from "./types";
 import type FastSync from "../../main";
 import { $ } from "../../i18n/lang";
 
+/** The plugin release source is owned by the fork, not by the upstream project. */
+export const PLUGIN_RELEASE_REPOSITORY = "violesea/obsidian-fast-note-sync-plus";
+
 
 /**
  * 版本提示与自动升级管理器
@@ -175,19 +178,23 @@ export class VersionManager {
             throw new Error(`Invalid update version format: "${latest}". Upgrade aborted.`);
         }
 
-        const source = plugin.settings.updateSource || 'github';
+        const configuredSource = plugin.settings.updateSource || 'github';
         const tag = latest;
 
         // 提取版本号部分：1.20.12-alpha -> 1.20.12
         const versionPart = latest.split('-')[0];
         const zipFileName = `fast-note-sync-v${versionPart}.zip`;
 
-        const baseUrl = source === 'github'
-            ? `https://github.com/haierkeys/obsidian-fast-note-sync/releases/download/${tag}`
-            : `https://cnb.cool/haierkeys/obsidian-fast-note-sync/-/releases/download/${tag}`;
+        // The fork currently publishes releases on GitHub only. Keep the
+        // legacy source setting for compatibility, but never redirect a fork
+        // installation to the upstream plugin or its mirror.
+        const baseUrl = `https://github.com/${PLUGIN_RELEASE_REPOSITORY}/releases/download/${tag}`;
+        if (configuredSource === "cnb") {
+            dump("Legacy CNB plugin source ignored; using the fork GitHub Release");
+        }
 
         const pluginDir = getPluginDir(plugin);
-        dump(`Upgrade info: source=${source}, tag=${tag}, zipName=${zipFileName}, dir=${pluginDir}`);
+        dump(`Upgrade info: source=${configuredSource}, tag=${tag}, zipName=${zipFileName}, dir=${pluginDir}`);
 
         onProgress($("ui.version.downloading_file", { file: zipFileName }));
         const url = `${baseUrl}/${zipFileName}`;

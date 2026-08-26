@@ -1,6 +1,6 @@
 import { TFolder, TFile, normalizePath } from "obsidian";
 
-import { receiveFileUpload, receiveFileSyncUpdate, receiveFileSyncDelete, receiveFileSyncMtime, receiveFileSyncChunkDownload, receiveFileSyncEnd, checkAndUploadAttachments, receiveFileSyncRename, receiveFileRenameAck, receiveFileUploadAck, receiveFileDeleteAck, isPluginUnloading, clearUploadQueue, resetFileDownloadSessions } from "./operator_file";
+import { receiveFileUpload, receiveFileSyncUpdate, receiveFileSyncDelete, receiveFileSyncMtime, receiveFileSyncChunkDownload, receiveFileSyncEnd, checkAndUploadAttachments, receiveFileSyncRename, receiveFileRenameAck, receiveFileUploadAck, receiveFileDeleteAck, isPluginUnloading, clearUploadQueue, resetFileDownloadSessions, getActiveUploadCount } from "./operator_file";
 import { hashContent, hashContentAsync, dump, isPathExcluded, isFolderSyncPathExcluded, configIsPathExcluded, getConfigSyncCustomDirs, generateUUID, showSyncNotice, isLargeBinarySyncRisk, describeBinarySyncLimit, hashFileAsync, formatFileSize, yieldToMain, getPluginDir, sleep } from "../utils/helpers";
 import { receiveConfigSyncModify, receiveConfigUpload, receiveConfigSyncMtime, receiveConfigSyncDelete, receiveConfigSyncEnd, configAllPaths, receiveConfigSyncClear, receiveConfigModifyAck, receiveConfigDeleteAck } from "./operator_config";
 import { receiveNoteSyncModify, receiveNoteUpload, receiveNoteSyncMtime, receiveNoteSyncDelete, receiveNoteSyncEnd, receiveNoteSyncRename, receiveNoteModifyAck, receiveNoteRenameAck, receiveNoteDeleteAck, repairSuspiciousEmptyNotes } from "./operator_note";
@@ -15,9 +15,8 @@ import { SyncType } from "./sync_progress_tracker";
 import { ConfirmModal } from "../../views/confirm-modal";
 import { incrementalEntryKey, mergeDirtyEntries } from "./incremental_scan_manager";
 import type { DirtyEntry, DirtySnapshot } from "./incremental_scan_manager";
-import { collectIncrementalReconciliationEntries } from "./incremental_reconciliation";
-import type { ReconciliationLocalEntry } from "./incremental_reconciliation";
 import { getPostSendSyncPhase } from "./sync_state";
+import { canCompleteSync } from "./sync_completion_gate";
 import { createIncrementalScanProgress } from "./incremental_scan_progress";
 import { planChangeFeedRound, changeFeedDecisionInput, runChangeFeedCatchUp, shouldRestartFreshRoundOnResume } from "./change_feed";
 import type { CatchUpResult as ChangeFeedCatchUpResult } from "./change_feed";
@@ -136,53 +135,6 @@ const collectIncrementalEntries = (plugin: FastSync, snapshot: DirtySnapshot): D
     supplementalEntries.push({ kind: "file", operation: "modify", path: pending.newPath, version: 0 });
   }
   return mergeDirtyEntries(snapshot.entries, supplementalEntries);
-};
-
-const collectVaultMetadataEntries = (plugin: FastSync): ReconciliationLocalEntry[] => {
-  const entries: ReconciliationLocalEntry[] = [];
-  for (const file of plugin.app.vault.getAllLoadedFiles()) {
-    if (file instanceof TFolder) {
-      entries.push({ path: file.path, kind: "folder" });
-      continue;
-    }
-    if (file instanceof TFile) {
-      entries.push({
-        path: file.path,
-        kind: file.extension === "md" ? "note" : "file",
-        mtime: file.stat.mtime,
-        size: file.stat.size,
-        ctime: file.stat.ctime,
-      });
-    }
-  }
-  return entries;
-};
-
-const collectIncrementalReconciliation = (
-  plugin: FastSync,
-  incrementalEntries: DirtyEntry[],
-): DirtyEntry[] => {
-  const dirtyKeys = new Set(incrementalEntries.map((entry) => incrementalEntryKey(entry.kind, entry.path)));
-  const candidates = collectIncrementalReconciliationEntries(
-    collectVaultMetadataEntries(plugin),
-    {
-      getValidHash: (path, mtime, size, ctime) => plugin.fileHashManager.getValidHash(path, mtime, size, ctime),
-      getPathHash: (path) => plugin.fileHashManager.getPathHash(path),
-      getAllPaths: () => plugin.fileHashManager.getAllPaths(),
-      getFolderMtime: (path) => plugin.folderSnapshotManager.getMtime(path),
-      getAllFolderPaths: () => plugin.folderSnapshotManager.getAllPaths(),
-    },
-    {
-      dirtyKeys,
-      isPathExcluded: (path) => isPathExcluded(path, plugin),
-      isFolderPathExcluded: (path) => isFolderSyncPathExcluded(path, plugin),
-      isIgnoredPath: (path) => plugin.isIgnoredFile?.(path) === true,
-    },
-  );
-  if (candidates.length > 0) {
-    dump(`[IncrementalReconcile] metadata candidates=${candidates.length}`);
-  }
-  return mergeDirtyEntries(incrementalEntries, candidates);
 };
 
 const shouldSkipUnchangedLocalEntry = (
@@ -627,7 +579,31 @@ export function checkSyncCompletion(plugin: FastSync, intervalId?: number, syncS
   // 计算整体权重进度
   const overallPercentage = plugin.progressTracker.getOverallPct();
 
-  if (allSyncDone && allDownloadsComplete && bufferCleared && !plugin.isSyncRequesting) {
+  const completionReady = canCompleteSync({
+    allSyncDone,
+    allDownloadsComplete,
+    bufferCleared,
+    isSyncRequesting: plugin.isSyncRequesting,
+    syncPhase: plugin.syncState.syncPhase,
+    activeUnprocessedCount: plugin.incrementalScanManager?.getActiveUnprocessedCount() ?? 0,
+    pendingNoteModifies: plugin.pendingNoteModifies.size,
+    pendingUploadHashes: plugin.pendingUploadHashes.size,
+    pendingConfigModifies: plugin.pendingConfigModifies.size,
+    pendingFileUploadAcks: plugin.syncState.pendingFileUploadAcks.size,
+    pendingNoteDeleteAcks: plugin.pendingNoteDeleteAcks.size,
+    pendingFileDeleteAcks: plugin.pendingFileDeleteAcks.size,
+    pendingConfigDeleteAcks: plugin.pendingConfigDeleteAcks.size,
+    pendingNoteRenames: plugin.pendingNoteRenames.size,
+    pendingFileRenames: plugin.pendingFileRenames.length,
+    pendingDeleteNotePaths: plugin.pendingDeleteNotePaths.size,
+    pendingDeleteFilePaths: plugin.pendingDeleteFilePaths.size,
+    pendingDeleteFolderPaths: plugin.pendingDeleteFolderPaths.size,
+    pendingDeleteConfigPaths: plugin.pendingDeleteConfigPaths.size,
+    syncPageAckOutbox: plugin.syncPageAckOutbox.size,
+    activeUploads: getActiveUploadCount(),
+  });
+
+  if (completionReady) {
     if (intervalId) {
       window.clearInterval(intervalId);
       if (plugin.syncState.progressCheckIntervalId === intervalId) {
@@ -945,10 +921,11 @@ async function receiveSyncEndWrapper(data: unknown, plugin: FastSync, type: "not
   } else if (type === "file") {
     plugin.fileHashManager.removeFileHashes(plugin.pendingDeleteFilePaths)
     plugin.pendingDeleteFilePaths.clear()
-    // 同步结束，提交本轮同步中可能产生的待确认上传 hash
-    plugin.fileHashManager.setFileHashes(plugin.pendingUploadHashes, (path) => plugin.app.vault.getFileByPath(path)?.stat)
-    plugin.pendingUploadHashes.clear()
-    plugin.localStorageManager.clearPending('pendingUploadHashes')
+    // SyncEnd only closes the announce phase. A FileUploadAck is the sole
+    // proof that an upload reached the server; keep pendingUploadHashes until
+    // that ACK arrives so a late/missing ACK remains retryable.
+    // 同步结束只收口清单阶段；只有 FileUploadAck 能证明上传已落到服务端，
+    // 因此在 ACK 到达前保留 pendingUploadHashes，避免迟到/丢失 ACK 造成假基线。
     // 同步结束，提交扫描阶段计算出的哈希 (Commit hashes calculated during scan)
     commitScannedHashes(plugin.scannedFileHashes, (entries) => plugin.fileHashManager.bulkSetFromScanned(entries));
     // 同步结束，强制落盘本轮防抖累积的哈希写入
@@ -961,21 +938,12 @@ async function receiveSyncEndWrapper(data: unknown, plugin: FastSync, type: "not
   } else if (type === "config") {
     if (plugin.configHashManager && plugin.configHashManager.isReady()) {
       plugin.configHashManager.removeFileHashes(plugin.pendingDeleteConfigPaths)
-      // 同步结束，提交本轮同步中可能产生的待确认上传 hash
-      await plugin.configHashManager.setFileHashes(plugin.pendingConfigModifies, async (path) => {
-        const isVirtual = path.startsWith(plugin.localStorageManager.syncPathPrefix)
-        if (isVirtual) return { mtime: Date.now(), size: plugin.localStorageManager.getItemValue(plugin.localStorageManager.pathToKey(path) || "")?.length || 0 }
-        try {
-          await requireForeground(plugin)
-          return await plugin.app.vault.adapter.stat(normalizePath(path))
-        } catch {
-          return null
-        }
-      })
+      // SettingModifyAck, not SettingSyncEnd, is the proof for a local
+      // configuration write. Keep pendingConfigModifies durable until that
+      // per-path ACK arrives.
+      // 配置写入必须等 SettingModifyAck，不能由 SettingSyncEnd 提前推进基线。
     }
     plugin.pendingDeleteConfigPaths.clear()
-    plugin.pendingConfigModifies.clear()
-    plugin.localStorageManager.clearPending('pendingConfigModifies')
     // 同步结束，提交扫描阶段计算出的哈希 (Commit hashes calculated during scan)
     commitScannedHashes(plugin.scannedConfigHashes, (entries) => plugin.configHashManager.bulkSetFromScanned(entries));
     // 同步结束，强制落盘本轮防抖累积的哈希写入
@@ -1159,9 +1127,10 @@ export const handleSync = async function (
     let incrementalEntries = fastIncremental && dirtySnapshot
       ? collectIncrementalEntries(plugin, dirtySnapshot)
       : [];
-    if (fastIncremental) {
-      incrementalEntries = collectIncrementalReconciliation(plugin, incrementalEntries);
-    }
+    // Fast incremental rounds are event/journal-only by design.  A vault-wide
+    // metadata reconciliation here defeats the whole point of the iPad path:
+    // it re-enumerates every loaded file and leaves the hash progress looking
+    // stuck at zero while the reconciliation runs.
     const scanStats: ScanStats = {
       enumeratedEntries: 0,
       metadataChanged: 0,
@@ -1832,7 +1801,7 @@ export const handleSync = async function (
     }
 
     // 检测被删除的配置文件 (对比哈希表和本地配置)
-    if (plugin.settings.configSyncEnabled && shouldSyncConfigs && plugin.settings.offlineDeleteSyncEnabled) {
+    if (plugin.settings.configSyncEnabled && shouldSyncConfigs && !fastIncremental && plugin.settings.offlineDeleteSyncEnabled) {
       if (plugin.configHashManager && plugin.configHashManager.isReady()) {
         const trackedConfigPaths = plugin.configHashManager.getAllPaths();
         const localConfigPathsSet = new Set(configPaths);
@@ -1850,7 +1819,7 @@ export const handleSync = async function (
           }
         }
       }
-    } else if (plugin.settings.configSyncEnabled && shouldSyncConfigs && isLoadLastTime) {
+    } else if (plugin.settings.configSyncEnabled && shouldSyncConfigs && !fastIncremental && isLoadLastTime) {
       // 增量同步且未开启离线删除同步：检测缺失的配置文件
       if (plugin.configHashManager && plugin.configHashManager.isReady()) {
         const trackedConfigPaths = plugin.configHashManager.getAllPaths();
@@ -2516,12 +2485,46 @@ async function sendSyncInBatches<T1, T2, T3>(
 }
 
 /**
+ * A FolderSyncEnd only closes the announce request.  Folder detail pages may
+ * still be writing directories and may still need their page ACK.  Hold the
+ * dependent NoteSync/FileSync requests until that work has drained.
+ */
+async function waitForSyncTypeDrain(
+  plugin: FastSync,
+  type: "folder" | "note" | "file" | "config",
+  context: string | undefined,
+): Promise<void> {
+  const trackerType: SyncType = type === "config" ? "setting" : type;
+  const endFlag = type === "folder" ? "folderSyncEnd"
+    : type === "note" ? "noteSyncEnd"
+      : type === "file" ? "fileSyncEnd"
+        : "configSyncEnd";
+  const startedAt = Date.now();
+  const timeoutMs = 300000;
+
+  while (plugin.syncState.activeSyncContext === context) {
+    if (plugin.syncState.transportResetPending || !isSyncConnectionReady(plugin)) {
+      throw new SyncTransportError(`[SyncBarrier] ${type} interrupted by connection close`);
+    }
+    if (plugin[endFlag] && plugin.progressTracker.isTypeFullyDone(trackerType)
+      && plugin.syncPageAckOutbox.size === 0) {
+      return;
+    }
+    if (Date.now() - startedAt > timeoutMs) {
+      throw new Error(`[SyncBarrier] ${type} did not drain within ${timeoutMs}ms`);
+    }
+    await sleep(25);
+  }
+
+  throw new SyncTransportError(`[SyncBarrier] ${type} context is no longer active`);
+}
+
+/**
  * 发送同步请求
- * folder/note/file/setting 四类清单并发发出（不再串行等待 folder 屏障）；
- * 并发下的 createFolder 竞态由各消息处理器的惰性建目录兜底承接（设计稿 §6.2）
+ * FolderSync 先完成并排空其下行页，再发送依赖目录存在的 NoteSync/FileSync；
+ * 配置同步随后发送，避免服务端先拿到文件实体、目录却尚未落地。
  * Send sync requests
- * The four batch types (folder/note/file/setting) are dispatched concurrently (folder barrier removed);
- * concurrent createFolder races are absorbed by each handler's lazy folder-creation fallback (design §6.2)
+ * FolderSync is drained before dependent NoteSync/FileSync requests; config follows after them.
  */
 export const handleRequestSend = async function (plugin: FastSync, syncMode: SyncMode, noteData: NoteSyncData, fileData: FileSyncData, configData: ConfigSyncData, folderData: FolderSyncData) {
   const shouldSyncNotes = syncMode === "auto" || syncMode === "note";
@@ -2542,11 +2545,17 @@ export const handleRequestSend = async function (plugin: FastSync, syncMode: Syn
   const jobs: Promise<void>[] = [];
 
   if (plugin.settings.syncEnabled && shouldSyncNotes) {
+    // Register delete intent before the first request is sent.  A fast
+    // SyncEnd/ACK must never beat this bookkeeping step.
+    // 在首个请求发出前登记删除意图，避免快速 SyncEnd/ACK 抢在登记之前到达。
+    if (plugin.settings.offlineDeleteSyncEnabled) {
+      plugin.pendingDeleteNotePaths = new Set(noteData.delNotes.map((item) => item.path));
+      plugin.pendingDeleteFilePaths = new Set(fileData.delFiles.map((item) => item.path));
+      plugin.pendingDeleteFolderPaths = new Set(folderData.delFolders.map((item) => item.path));
+    }
 
-    // 并发分批发送 FolderSync / NoteSync / FileSync
-    // Concurrently batch-send FolderSync / NoteSync / FileSync
     dump(`[Sync] Starting batch send: ${folderData.folders.length} folders, ${noteData.notes.length} notes, ${fileData.files.length} files`);
-    jobs.push(sendSyncInBatches(
+    await sendSyncInBatches(
       plugin,
       "FolderSync",
       "FolderSyncBatchAck",
@@ -2564,11 +2573,11 @@ export const handleRequestSend = async function (plugin: FastSync, syncMode: Syn
         ...(plugin.settings.offlineDeleteSyncEnabled ? { delFolders: delChunk } : {}),
         ...(missingChunk.length > 0 ? { missingFolders: missingChunk } : {}),
       }),
-      () => {
-        const paths = folderData.folders.map(f => f.path);
-        plugin.folderSnapshotManager.setFolderMtimes(paths, Date.now());
-      }
-    ));
+    );
+    await waitForSyncTypeDrain(plugin, "folder", folderData.context);
+    // FolderSyncEnd plus drained folder pages is the first point at which the
+    // local folder baseline can safely be advanced.
+    plugin.folderSnapshotManager.setFolderMtimes(folderData.folders.map((folder) => folder.path), Date.now());
 
     jobs.push(sendSyncInBatches(
       plugin,
@@ -2587,13 +2596,7 @@ export const handleRequestSend = async function (plugin: FastSync, syncMode: Syn
         totalBatches,
         ...(plugin.settings.offlineDeleteSyncEnabled ? { delNotes: delChunk } : {}),
         ...(missingChunk.length > 0 ? { missingNotes: missingChunk } : {}),
-      }),
-      () => {
-        for (const note of noteData.notes) {
-          plugin.pendingNoteModifies.set(note.path, note.contentHash);
-        }
-        plugin.localStorageManager.savePending('pendingNoteModifies', plugin.pendingNoteModifies);
-      }
+      })
     ));
 
     // 云预览模式且未开启类型限制时跳过 FileSync
@@ -2626,6 +2629,9 @@ export const handleRequestSend = async function (plugin: FastSync, syncMode: Syn
     // Batch-send SettingSync (config sync), dispatched concurrently with the three types above
     // 注意：客户端发送字段名为 settings / delSettings / missingSettings（非 configs）
     // Note: client sends field names 'settings' / 'delSettings' / 'missingSettings' (not 'configs')
+    if (plugin.settings.offlineDeleteSyncEnabled && plugin.configHashManager && plugin.configHashManager.isReady()) {
+      plugin.pendingDeleteConfigPaths = new Set(configData.delConfigs.map((item) => item.path));
+    }
     const isCover = Number(plugin.localStorageManager.getMetadata("lastConfigSyncTime")) === 0;
     jobs.push(sendSyncInBatches(
       plugin,
@@ -2645,13 +2651,7 @@ export const handleRequestSend = async function (plugin: FastSync, syncMode: Syn
         totalBatches,
         ...(plugin.settings.offlineDeleteSyncEnabled ? { delSettings: delChunk } : {}),
         ...(missingChunk.length > 0 ? { missingSettings: missingChunk } : {}),
-      }),
-      () => {
-        for (const config of configData.configs) {
-          plugin.pendingConfigModifies.set(config.path, config.contentHash);
-        }
-        plugin.localStorageManager.savePending('pendingConfigModifies', plugin.pendingConfigModifies);
-      }
+      })
     ));
   }
 
@@ -2666,21 +2666,4 @@ export const handleRequestSend = async function (plugin: FastSync, syncMode: Syn
     throw new Error(String(firstFailure.reason));
   }
 
-  if (plugin.settings.syncEnabled && shouldSyncNotes) {
-    // 将已删除路径加入 pending set，等待 SyncEnd 确认服务端已处理后再从 hashManager 移除
-    // Populate pending delete sets; remove from hashManager only after SyncEnd confirms server processed
-    if (plugin.settings.offlineDeleteSyncEnabled) {
-      plugin.pendingDeleteNotePaths = new Set(noteData.delNotes.map(i => i.path));
-      plugin.pendingDeleteFilePaths = new Set(fileData.delFiles.map(i => i.path));
-      plugin.pendingDeleteFolderPaths = new Set(folderData.delFolders.map(i => i.path));
-    }
-  }
-
-  if (plugin.settings.configSyncEnabled && shouldSyncConfigs) {
-    // 将已删除配置路径加入 pending set，等待 SettingSyncEnd 确认服务端已处理后再移除
-    // Populate pending config delete set; remove from hashManager only after SettingSyncEnd
-    if (plugin.settings.offlineDeleteSyncEnabled && plugin.configHashManager && plugin.configHashManager.isReady()) {
-      plugin.pendingDeleteConfigPaths = new Set(configData.delConfigs.map(i => i.path));
-    }
-  }
 };

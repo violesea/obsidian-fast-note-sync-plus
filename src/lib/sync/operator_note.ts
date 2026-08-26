@@ -1,11 +1,13 @@
 import { TFile, TAbstractFile, normalizePath } from "obsidian";
 
 import { ReceiveMessage, ReceiveMtimeMessage, ReceivePathMessage, SyncEndData } from "../utils/types";
-import { hashContent, hashContentAsync, dump, dumpError, isPathExcluded, getSafeCtime, vaultDelete, checkAndNotifyCaseConflict, getPluginDir } from "../utils/helpers";
+import { hashContent, hashContentAsync, dump, dumpError, isPathExcluded, getSafeCtime, vaultDelete, checkAndNotifyCaseConflict, getPluginDir, showSyncNotice } from "../utils/helpers";
 import { SyncLogManager } from "./sync_log_manager";
 import type FastSync from "../../main";
 import { waitForForeground } from "./background_activity_gate";
 import { captureStableSnapshot, stableCaptureCoordinator } from "./stable_capture";
+import { HttpApiService } from "../api/http_api_service";
+import { decideWrite, shouldCheckPrecondition } from "./write_precondition";
 
 const waitForNoteActivity = async (plugin: FastSync): Promise<boolean> => waitForForeground(plugin);
 
@@ -18,6 +20,58 @@ const readStableStat = async (plugin: FastSync, path: string) => {
 const stableCaptureKey = (plugin: FastSync, path: string): string => (
   `${plugin.settings.vault}:${path}`
 );
+
+/**
+ * Park both sides of a diverged path instead of overwriting one of them.
+ *
+ * Reuses the same conflict-notes layout the receive path already writes, so a
+ * conflict raised by the upload guard and a conflict raised by an incoming
+ * push land in one place for the existing conflict UI to resolve.
+ */
+const parkUploadConflict = async function (
+  plugin: FastSync,
+  notePath: string,
+  localContent: string,
+  serverContent: string,
+): Promise<void> {
+  const adapter = plugin.app.vault.adapter;
+  const conflictDir = `${getPluginDir(plugin)}/conflict-notes`;
+  const safeName = notePath.replace(/\.md$/, "").replace(/[/\\]/g, "_");
+  const pathHash = hashContent(notePath);
+
+  // 与接收方向的冲突落盘同款纪律：每一次 Vault I/O 之前都过前台闸，
+  // 避免在 iOS 后台切换时留下半写的备份。
+  if (!(await waitForNoteActivity(plugin))) return;
+  if (!(await adapter.exists(conflictDir))) await adapter.mkdir(conflictDir);
+  if (!(await waitForNoteActivity(plugin))) return;
+  await adapter.write(`${conflictDir}/${safeName}_${pathHash}.remote.md`, serverContent);
+  const baseBackupPath = `${conflictDir}/${safeName}_${pathHash}.base.md`;
+  if (!(await waitForNoteActivity(plugin))) return;
+  if (!(await adapter.exists(baseBackupPath))) await adapter.write(baseBackupPath, localContent);
+
+  plugin.syncState.conflictedPaths.add(notePath);
+};
+
+/**
+ * Read the server's current hash for one path.
+ *
+ * Returns null for every failure mode on purpose. A null makes decideWrite
+ * fail open, so an unreachable server degrades to the previous behaviour
+ * rather than stalling the upload queue.
+ */
+const readServerNoteState = async function (
+  plugin: FastSync,
+  notePath: string,
+): Promise<{ hash: string; content: string } | null> {
+  try {
+    const remote = await new HttpApiService(plugin).getNoteContent(notePath);
+    if (!remote || typeof remote.contentHash !== "string" || remote.contentHash === "") return null;
+    return { hash: String(remote.contentHash), content: remote.content };
+  } catch (error) {
+    dumpError(`[WritePrecondition] server state unreadable: ${notePath}`, error);
+    return null;
+  }
+};
 
 const EMPTY_NOTE_HASH = hashContent("");
 const MAX_EMPTY_NOTE_REPAIRS_PER_ROUND = 20;
@@ -96,6 +150,9 @@ export const noteModify = async function (file: TAbstractFile, plugin: FastSync,
     dump(`[StableCapture] Note changed during quiet window; discarded: ${file.path}`)
     return;
   }
+  // Narrow once here: the guard above does not survive the closure boundary,
+  // so the captured text must be bound to a string before the lock body.
+  const capturedContent: string = capture.value;
 
   await plugin.lockManager.withLock(file.path, async () => {
     plugin.addIgnoredFile(file.path)
@@ -103,7 +160,7 @@ export const noteModify = async function (file: TAbstractFile, plugin: FastSync,
     try {
       const baseHash = plugin.fileHashManager.getPathHash(file.path)
       const lastSyncMtime = plugin.lastSyncMtime.get(file.path)
-      const content = capture.value;
+      const content = capturedContent;
       const contentHash = capture.hash;
       const stableStat = capture.stat;
 
@@ -119,6 +176,38 @@ export const noteModify = async function (file: TAbstractFile, plugin: FastSync,
         plugin.incrementalScanManager?.markSent("note", file.path)
         plugin.incrementalScanManager?.acknowledge("note", file.path)
         return
+      }
+
+      // M7 写入乐观锁：服务端自本设备上次 ACK 之后动过，且本地内容与服务端不同，
+      // 说明两侧都改了。这种情况绝不覆盖，两份都留住交给冲突 UI。
+      // 服务端读不到时 decideWrite 会 fail open，回到本次修复之前的行为。
+      if (shouldCheckPrecondition({
+        enabled: plugin.settings.writePreconditionEnabled !== false,
+        baseHash,
+        localHash: contentHash,
+      })) {
+        const remote = await readServerNoteState(plugin, file.path);
+        const decision = decideWrite({ localHash: contentHash, baseHash, serverHash: remote?.hash ?? null });
+        if (decision.kind === "conflict" && remote) {
+          dump(`[WritePrecondition] conflict, upload withheld: ${file.path} base=${baseHash} server=${remote.hash} local=${contentHash}`)
+          await parkUploadConflict(plugin, file.path, content, remote.content)
+          showSyncNotice(`同步冲突，未覆盖服务端：${file.path}`, 10000)
+          plugin.incrementalScanManager?.markSent("note", file.path)
+          plugin.incrementalScanManager?.acknowledge("note", file.path)
+          return
+        }
+        if (decision.kind === "skip" && remote) {
+          // 服务端当前就持有这份内容，是直接读回来的服务端状态，不是本地自证，
+          // 因此按 ACK 同款方式推进基线（INV-2）。
+          dump(`[WritePrecondition] server already holds this content: ${file.path}`)
+          plugin.fileHashManager.setFileHash(file.path, contentHash, stableStat.mtime, stableStat.size)
+          plugin.incrementalScanManager?.markSent("note", file.path)
+          plugin.incrementalScanManager?.acknowledge("note", file.path)
+          return
+        }
+        if (decision.reason === "precondition-unavailable") {
+          dump(`[WritePrecondition] server state unavailable, proceeding without guard: ${file.path}`)
+        }
       }
 
       const data = {

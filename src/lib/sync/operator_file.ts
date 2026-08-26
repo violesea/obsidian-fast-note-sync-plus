@@ -39,9 +39,34 @@ const MAX_DOWNLOAD_BUFFER_BYTES = 20 * 1024 * 1024
 type ActiveUpload = {
   cancelled: boolean;
   queueGeneration: number;
+  slotAcquired: boolean;
   slotReleased: boolean;
   taskRecorded: boolean;
+  sessionId: string;
+  descriptor: UploadCheckDescriptor;
+  message: FileUploadMessage;
+  pageIndex?: number;
+  chunkSize: number;
+  retryCount: number;
+  retryTimer: number | null;
+  retrying: boolean;
+  retryResponseReceived: boolean;
+  runActive: boolean;
+  chunksSent: boolean;
+  actualTotalChunks: number;
+  totalCountSettled: boolean;
 }
+
+type UploadCheckDescriptor = {
+  vault: string;
+  path: string;
+  pathHash: string;
+  contentHash: string;
+  size: number;
+  ctime: number;
+  mtime: number;
+};
+
 const activeUploadsMap = new Map<string, ActiveUpload>()
 let uploadQueueGeneration = 0
 
@@ -51,12 +76,61 @@ let cloudPreviewCheckPromise: Promise<void> | null = null;
 // 全局中止信号，用于插件卸载时
 export let isPluginUnloading = false;
 
-// 会话 ID 到文件路径的映射，用于处理 463 会话不存在错误
-const sessionIdToPathMap = new Map<string, string>()
+// Session identity is mapped to the exact upload state, not just a path. This
+// prevents a late 463 for an old session from cancelling a replacement upload
+// for the same path.
+const sessionIdToUploadMap = new Map<string, ActiveUpload>()
+const retryingUploadsMap = new Map<string, ActiveUpload>()
+const MAX_UPLOAD_SESSION_RETRIES = 3;
+const UPLOAD_SESSION_RETRY_BASE_DELAY_MS = 500;
+const UPLOAD_SESSION_RESPONSE_TIMEOUT_MS = 5000;
+
+const uploadPathKey = (path: string): string => normalizePath(path);
+
+const uploadMessageForState = (state: ActiveUpload): FileUploadMessage => ({
+  ...state.message,
+  path: state.descriptor.path,
+  pathHash: state.descriptor.pathHash,
+  ctime: state.descriptor.ctime,
+  mtime: state.descriptor.mtime,
+  sessionId: state.sessionId,
+  chunkSize: state.chunkSize,
+  pageIndex: state.pageIndex,
+});
+
+const clearUploadRetryTimer = (state: ActiveUpload): void => {
+  if (state.retryTimer !== null) {
+    window.clearTimeout(state.retryTimer);
+    state.retryTimer = null;
+  }
+};
+
+const removeUploadStateIfCurrent = (path: string, state: ActiveUpload): void => {
+  const key = uploadPathKey(path);
+  if (activeUploadsMap.get(key) === state) activeUploadsMap.delete(key);
+  if (retryingUploadsMap.get(key) === state) retryingUploadsMap.delete(key);
+  if (sessionIdToUploadMap.get(state.sessionId) === state) {
+    sessionIdToUploadMap.delete(state.sessionId);
+  }
+};
+
+/** Number of upload tasks that can still perform work on the current queue. */
+export const getActiveUploadCount = (): number => {
+  let count = 0;
+  for (const state of activeUploadsMap.values()) {
+    // `cancelled` also marks the old transport session after a 463. The
+    // logical upload remains active in retryingUploadsMap until its replacement
+    // is ACKed or the retry budget is exhausted, so only taskRecorded is a
+    // terminal signal here.
+    if (!state.taskRecorded) count++;
+  }
+  return count;
+};
 
 const releaseUploadSlot = (plugin: FastSync, path: string, state: ActiveUpload): void => {
-  if (state.slotReleased) return;
+  if (state.slotReleased || !state.slotAcquired) return;
   state.slotReleased = true;
+  state.slotAcquired = false;
   plugin.concurrencyLimiter.releaseSlot(path);
 };
 
@@ -65,6 +139,135 @@ const recordUploadTask = (plugin: FastSync, data: FileUploadMessage, state: Acti
   state.taskRecorded = true;
   if (failed) plugin.fileSyncTasks.failed++;
   plugin.recordSyncCompleted('file', data.pageIndex);
+};
+
+const settleUploadTotal = (plugin: FastSync, state: ActiveUpload): void => {
+  if (state.totalCountSettled) return;
+  state.totalCountSettled = true;
+  plugin.totalChunksToUpload = Math.max(0, plugin.totalChunksToUpload - state.actualTotalChunks);
+};
+
+const clearUploadCheckpoint = (plugin: FastSync, state: ActiveUpload): void => {
+  const vaultName = plugin.app.vault.getName();
+  try {
+    plugin.app.saveLocalStorage(`fns-${vaultName}-uploadSession-${state.descriptor.pathHash}`, null);
+  } catch {
+    // Ignore storage cleanup errors; the next retry validates the session ID.
+  }
+};
+
+const clearPendingUploadHashIfCurrent = (plugin: FastSync, state: ActiveUpload): void => {
+  const path = state.descriptor.path;
+  const pendingHash = plugin.pendingUploadHashes.get(path);
+  if (pendingHash === undefined || state.descriptor.contentHash === "" || pendingHash === state.descriptor.contentHash) {
+    plugin.pendingUploadHashes.delete(path);
+    plugin.localStorageManager.savePending('pendingUploadHashes', plugin.pendingUploadHashes);
+  }
+};
+
+const removeUploadTaskState = (plugin: FastSync, state: ActiveUpload, settleTotal = false): void => {
+  const path = state.descriptor.path;
+  state.cancelled = true;
+  state.retrying = false;
+  state.retryResponseReceived = false;
+  clearUploadRetryTimer(state);
+  removeUploadStateIfCurrent(path, state);
+  plugin.syncState.pendingFileUploadAcks.delete(uploadPathKey(path));
+  plugin.syncState.pendingFilePushPageIndex.delete(path);
+  if (settleTotal) settleUploadTotal(plugin, state);
+  releaseUploadSlot(plugin, path, state);
+};
+
+const getRetryDescriptor = (plugin: FastSync, state: ActiveUpload): UploadCheckDescriptor => {
+  const file = plugin.app.vault.getFileByPath(normalizePath(state.descriptor.path));
+  const pendingHash = plugin.pendingUploadHashes.get(state.descriptor.path);
+  return {
+    ...state.descriptor,
+    ...(pendingHash ? { contentHash: pendingHash } : {}),
+    ...(file ? {
+      size: file.stat.size,
+      ctime: file.stat.ctime ?? state.descriptor.ctime,
+      mtime: file.stat.mtime,
+    } : {}),
+  };
+};
+
+const finishUploadSessionFailure = (plugin: FastSync, state: ActiveUpload): void => {
+  const data = uploadMessageForState(state);
+  removeUploadTaskState(plugin, state, true);
+  clearUploadCheckpoint(plugin, state);
+  // Keep the durable dirty-journal entry. Clear only the pending hash so the
+  // next incremental round can discover the local content and try again.
+  clearPendingUploadHashIfCurrent(plugin, state);
+  recordUploadTask(plugin, data, state, true);
+};
+
+const scheduleUploadSessionCheck = (plugin: FastSync, state: ActiveUpload): void => {
+  if (state.retryTimer !== null || isPluginUnloading) return;
+  if (state.retryCount >= MAX_UPLOAD_SESSION_RETRIES) {
+    finishUploadSessionFailure(plugin, state);
+    return;
+  }
+
+  const generation = uploadQueueGeneration;
+  const key = uploadPathKey(state.descriptor.path);
+  const delay = UPLOAD_SESSION_RETRY_BASE_DELAY_MS * (2 ** state.retryCount);
+  state.retryCount++;
+  state.retryTimer = window.setTimeout(() => {
+    state.retryTimer = null;
+    if (generation !== uploadQueueGeneration || isPluginUnloading || retryingUploadsMap.get(key) !== state) {
+      return;
+    }
+    const currentFile = plugin.app.vault.getFileByPath(normalizePath(state.descriptor.path));
+    if (!currentFile) {
+      finishUploadSessionFailure(plugin, state);
+      return;
+    }
+
+    const descriptor = getRetryDescriptor(plugin, state);
+    state.descriptor = descriptor;
+    dump(`[FileUploadSession] retrying FileUploadCheck ${state.descriptor.path} attempt=${state.retryCount}/${MAX_UPLOAD_SESSION_RETRIES}`);
+    void plugin.websocket.SendMessage("FileUploadCheck", descriptor).then((result) => {
+      if (generation !== uploadQueueGeneration || retryingUploadsMap.get(key) !== state) return;
+      if (result === "sent") {
+        // A sent check still needs a bounded response wait. Without this timer,
+        // a dropped server response leaves the logical upload active forever.
+        state.retryTimer = window.setTimeout(() => {
+          state.retryTimer = null;
+          if (generation === uploadQueueGeneration && retryingUploadsMap.get(key) === state) {
+            scheduleUploadSessionCheck(plugin, state);
+          }
+        }, UPLOAD_SESSION_RESPONSE_TIMEOUT_MS);
+        return;
+      }
+      // A transient send failure is retried within the same logical attempt;
+      // a transport close will invalidate this timer through clearUploadQueue.
+      scheduleUploadSessionCheck(plugin, state);
+    }).catch((error) => {
+      if (generation !== uploadQueueGeneration) return;
+      dumpError(`[FileUploadSession] retry check failed: ${state.descriptor.path}`, error);
+      scheduleUploadSessionCheck(plugin, state);
+    });
+  }, delay);
+};
+
+const cancelUploadRetry = (plugin: FastSync, path: string): boolean => {
+  const key = uploadPathKey(path);
+  const state = retryingUploadsMap.get(key);
+  if (!state) return false;
+  removeUploadTaskState(plugin, state, true);
+  clearPendingUploadHashIfCurrent(plugin, state);
+  return true;
+};
+
+const cancelUploadForPath = (plugin: FastSync, path: string): boolean => {
+  const key = uploadPathKey(path);
+  if (retryingUploadsMap.has(key)) return cancelUploadRetry(plugin, path);
+  const state = activeUploadsMap.get(key);
+  if (!state) return false;
+  removeUploadTaskState(plugin, state, true);
+  clearPendingUploadHashIfCurrent(plugin, state);
+  return true;
 };
 
 // 大文件跳过同步通知去重：本会话内已提示过的 "path|size"，避免同一文件每轮同步重复弹 toast
@@ -261,13 +464,25 @@ export const resetFileDownloadSessions = (plugin: FastSync): void => {
 export const clearUploadQueue = (plugin?: FastSync) => {
   uploadQueueGeneration++
   let cancelledCount = 0
-  for (const upload of activeUploadsMap.values()) {
+  const uploads = new Set([...activeUploadsMap.values(), ...retryingUploadsMap.values()]);
+  for (const upload of uploads) {
     if (!upload.cancelled) cancelledCount++
     upload.cancelled = true
+    upload.retrying = false
+    upload.retryResponseReceived = false
+    clearUploadRetryTimer(upload)
+    if (plugin) {
+      settleUploadTotal(plugin, upload)
+      releaseUploadSlot(plugin, upload.descriptor.path, upload)
+      plugin.syncState.pendingFilePushPageIndex.delete(upload.descriptor.path)
+      plugin.syncState.pendingFileUploadAcks.delete(uploadPathKey(upload.descriptor.path))
+    }
   }
+  activeUploadsMap.clear()
+  retryingUploadsMap.clear()
   // Session IDs belong to the old WebSocket. Late 463 responses must not be
   // allowed to settle a replacement upload task.
-  sessionIdToPathMap.clear()
+  sessionIdToUploadMap.clear()
   // A replacement transport must not accept ACKs belonging to the dead socket.
   plugin?.syncState.pendingFileUploadAcks.clear()
   if (cancelledCount > 0) {
@@ -278,11 +493,9 @@ export const clearUploadQueue = (plugin?: FastSync) => {
 /**
  * 中止所有进行中的文件操作 (插件卸载时调用)
  */
-export const abortAllFileOperations = () => {
+export const abortAllFileOperations = (plugin?: FastSync) => {
   isPluginUnloading = true;
-  for (const upload of activeUploadsMap.values()) {
-    upload.cancelled = true;
-  }
+  clearUploadQueue(plugin);
   dump("All file operations aborted.");
 }
 
@@ -294,6 +507,21 @@ export const resetFileOperations = () => {
   // A plugin reload must not allow a Promise from the previous instance to
   // resume against the new WebSocket and vault state.
   uploadQueueGeneration++;
+  for (const upload of activeUploadsMap.values()) {
+    upload.cancelled = true;
+    upload.retrying = false;
+    upload.retryResponseReceived = false;
+    clearUploadRetryTimer(upload);
+  }
+  for (const upload of retryingUploadsMap.values()) {
+    upload.cancelled = true;
+    upload.retrying = false;
+    upload.retryResponseReceived = false;
+    clearUploadRetryTimer(upload);
+  }
+  activeUploadsMap.clear();
+  retryingUploadsMap.clear();
+  sessionIdToUploadMap.clear();
 }
 
 export const BINARY_PREFIX_FILE_SYNC = "00"
@@ -411,14 +639,10 @@ export const fileDelete = async function (file: TAbstractFile, plugin: FastSync,
 
   await plugin.lockManager.withLock(file.path, async () => {
     // 如果该文件正在上传或在队列中，则标记为取消，且不再发送服务端删除消息
-    if (activeUploadsMap.has(file.path)) {
-      activeUploadsMap.get(file.path)!.cancelled = true;
+    if (cancelUploadForPath(plugin, file.path)) {
       dump(`Upload cancelled due to file deletion: ${file.path}`);
-      plugin.syncState.pendingFileUploadAcks.delete(normalizePath(file.path))
       // 仅清理本地状态
       plugin.fileHashManager.removeFileHash(file.path)
-      plugin.pendingUploadHashes.delete(file.path)
-      plugin.localStorageManager.savePending('pendingUploadHashes', plugin.pendingUploadHashes)
       return
     }
 
@@ -464,12 +688,8 @@ export const fileDeleteByPath = async function (filePath: string, plugin: FastSy
   await plugin.lockManager.withLock(filePath, async () => {
     // 如果该文件正在上传或在队列中，则标记为取消，且不再发送服务端删除消息
     // If the file is being uploaded or in the queue, cancel and skip server delete
-    if (activeUploadsMap.has(filePath)) {
-      activeUploadsMap.get(filePath)!.cancelled = true;
-      plugin.syncState.pendingFileUploadAcks.delete(normalizePath(filePath))
+    if (cancelUploadForPath(plugin, filePath)) {
       plugin.fileHashManager.removeFileHash(filePath)
-      plugin.pendingUploadHashes.delete(filePath)
-      plugin.localStorageManager.savePending('pendingUploadHashes', plugin.pendingUploadHashes)
       return
     }
 
@@ -544,8 +764,7 @@ export const fileRename = async function (file: TAbstractFile, oldfile: string, 
       dump(`File rename`, oldfile, file.path)
 
       // 如果旧文件正在上传，则取消上传且不发送删除消息
-      if (activeUploadsMap.has(oldfile)) {
-        activeUploadsMap.get(oldfile)!.cancelled = true;
+      if (cancelUploadForPath(plugin, oldfile)) {
         // 重新上传
         void fileModify(file, plugin)
         dump(`Upload cancelled due to file rename: ${oldfile}`);
@@ -586,6 +805,308 @@ export const fileRename = async function (file: TAbstractFile, oldfile: string, 
 }
 
 
+const createUploadDescriptor = (plugin: FastSync, data: FileUploadMessage, file: TFile): UploadCheckDescriptor => ({
+  vault: plugin.settings.vault,
+  path: data.path,
+  pathHash: data.pathHash,
+  contentHash: plugin.pendingUploadHashes.get(data.path) || "",
+  size: file.stat.size,
+  ctime: file.stat.ctime ?? data.ctime ?? 0,
+  mtime: file.stat.mtime ?? data.mtime ?? 0,
+});
+
+const updateUploadSession = (plugin: FastSync, state: ActiveUpload, data: FileUploadMessage, file: TFile): void => {
+  const key = uploadPathKey(data.path);
+  if (sessionIdToUploadMap.get(state.sessionId) === state) {
+    sessionIdToUploadMap.delete(state.sessionId);
+  }
+  state.sessionId = data.sessionId;
+  state.message = {
+    ...state.message,
+    ...data,
+    pageIndex: data.pageIndex ?? state.pageIndex,
+  };
+  state.pageIndex = data.pageIndex ?? state.pageIndex;
+  state.chunkSize = data.chunkSize || state.chunkSize || 1024 * 1024;
+  state.descriptor = {
+    ...state.descriptor,
+    ...createUploadDescriptor(plugin, data, file),
+    pathHash: data.pathHash || state.descriptor.pathHash,
+  };
+
+  const nextTotalChunks = file.stat.size === 0 ? 1 : Math.ceil(file.stat.size / state.chunkSize);
+  if (nextTotalChunks !== state.actualTotalChunks && !state.totalCountSettled) {
+    plugin.totalChunksToUpload += nextTotalChunks - state.actualTotalChunks;
+    state.actualTotalChunks = nextTotalChunks;
+  }
+  sessionIdToUploadMap.set(state.sessionId, state);
+  if (state.pageIndex !== undefined) {
+    plugin.syncState.pendingFilePushPageIndex.set(data.path, state.pageIndex);
+  }
+  if (activeUploadsMap.get(key) !== state) {
+    activeUploadsMap.set(key, state);
+  }
+};
+
+const startUploadRun = (plugin: FastSync, state: ActiveUpload): void => {
+  if (state.runActive || state.cancelled || state.retrying || isPluginUnloading) return;
+  void runUpload(plugin, state);
+};
+
+/**
+ * Execute one logical upload session. A 463 transitions the same state into
+ * retrying mode; it never creates a second logical task for the same path.
+ */
+async function runUpload(plugin: FastSync, state: ActiveUpload): Promise<void> {
+  if (state.runActive) return;
+  const path = state.descriptor.path;
+  const key = uploadPathKey(path);
+  const generation = state.queueGeneration;
+  state.runActive = true;
+  let checkpointKey = "";
+
+  try {
+    state.slotAcquired = false;
+    state.slotReleased = false;
+    await plugin.concurrencyLimiter.waitForSlot(path, false, 10);
+    state.slotAcquired = true;
+
+    if (isPluginUnloading || state.cancelled || state.retrying
+      || state.queueGeneration !== uploadQueueGeneration || activeUploadsMap.get(key) !== state) {
+      dump("Upload dropped before read: " + path);
+      if (state.retrying) {
+        releaseUploadSlot(plugin, path, state);
+      } else if (state.queueGeneration === uploadQueueGeneration && !isPluginUnloading) {
+        removeUploadTaskState(plugin, state, true);
+        recordUploadTask(plugin, uploadMessageForState(state), state);
+      } else {
+        removeUploadTaskState(plugin, state, true);
+      }
+      return;
+    }
+
+    const file = plugin.app.vault.getFileByPath(normalizePath(path));
+    if (!file) {
+      dump("File not found for upload: " + path);
+      removeUploadTaskState(plugin, state, true);
+      recordUploadTask(plugin, uploadMessageForState(state), state);
+      return;
+    }
+    if (isLargeBinarySyncRisk(file.stat.size, plugin)) {
+      dump("Skip file upload for large attachment (" + describeBinarySyncLimit() + " limit): " + path, file.stat.size);
+      notifyLargeFileSkipped(plugin, path, file.stat.size, "Fast Note Sync skipped large file upload: " + path);
+      removeUploadTaskState(plugin, state, true);
+      recordUploadTask(plugin, uploadMessageForState(state), state);
+      return;
+    }
+
+    checkpointKey = "fns-" + plugin.app.vault.getName() + "-uploadSession-" + state.descriptor.pathHash;
+
+    let content: ArrayBuffer | null = null;
+    try {
+      logMemorySnapshot("before upload read " + path);
+      content = await plugin.app.vault.readBinary(file);
+    } catch (error) {
+      dump("Failed to read file for upload: " + path, error);
+    }
+    if (!content) {
+      removeUploadTaskState(plugin, state, true);
+      recordUploadTask(plugin, uploadMessageForState(state), state);
+      return;
+    }
+
+    const contentHash = await hashFileAsync(plugin.app, file.path, plugin);
+    logMemorySnapshot("after upload hash " + path);
+    state.descriptor.contentHash = contentHash;
+    plugin.pendingUploadHashes.set(path, contentHash);
+    plugin.localStorageManager.savePending('pendingUploadHashes', plugin.pendingUploadHashes);
+    plugin.fileHashManager.setLocalFileHash(path, contentHash, file.stat.mtime, file.stat.size);
+    plugin.syncState.pendingFileUploadAcks.add(key);
+
+    const contentTotalChunks = content.byteLength === 0 ? 1 : Math.ceil(content.byteLength / state.chunkSize);
+    if (contentTotalChunks !== state.actualTotalChunks && !state.totalCountSettled) {
+      plugin.totalChunksToUpload += contentTotalChunks - state.actualTotalChunks;
+      state.actualTotalChunks = contentTotalChunks;
+    }
+    const actualTotalChunks = state.actualTotalChunks;
+    const sessionId = state.sessionId;
+    const chunkSize = state.chunkSize;
+
+    let startChunkIndex = 0;
+    try {
+      const cpRaw = plugin.app.loadLocalStorage(checkpointKey) as string | undefined;
+      if (cpRaw) {
+        const cp = JSON.parse(cpRaw) as { sessionId?: string; lastChunkIndex?: number; contentHash?: string };
+        if (cp.sessionId === sessionId && cp.contentHash === contentHash
+          && typeof cp.lastChunkIndex === 'number'
+          && cp.lastChunkIndex >= 0 && cp.lastChunkIndex < actualTotalChunks - 1) {
+          startChunkIndex = cp.lastChunkIndex + 1;
+          dump("Resume upload from chunk " + startChunkIndex + "/" + actualTotalChunks + ": " + path);
+        }
+      }
+    } catch (error) {
+      dump("Failed to read upload checkpoint for " + path, error);
+    }
+    if (startChunkIndex > 0) plugin.uploadedChunksCount += startChunkIndex;
+
+    dump([{
+      操作: "文件上传",
+      路径: path,
+      文件大小: (content.byteLength / 1024 / 1024).toFixed(2) + " MB",
+      分片大小: (chunkSize / 1024).toFixed(0) + " KB",
+      分片数量: actualTotalChunks,
+      SessionID: sessionId.substring(0, 8) + "...",
+    }]);
+
+    const sleepTime = Platform.isMobile ? 10 : 2;
+    for (let i = startChunkIndex; i < actualTotalChunks; i++) {
+      const chunk = new Uint8Array(content, i * chunkSize, Math.min(chunkSize, content.byteLength - i * chunkSize));
+      const sessionIdBytes = new TextEncoder().encode(sessionId);
+      const chunkIndexBytes = new Uint8Array(4);
+      new DataView(chunkIndexBytes.buffer).setUint32(0, i, false);
+      const frame = new Uint8Array(36 + 4 + chunk.byteLength);
+      frame.set(sessionIdBytes, 0);
+      frame.set(chunkIndexBytes, 36);
+      frame.set(chunk, 40);
+
+      const sendResult = await plugin.websocket.SendBinary(
+        frame,
+        BINARY_PREFIX_FILE_SYNC,
+        () => {
+          if (isPluginUnloading || state.cancelled || state.retrying
+            || state.sessionId !== sessionId || activeUploadsMap.get(key) !== state) {
+            dump("Upload aborted for " + path + " (state changed before send)");
+            return true;
+          }
+          return false;
+        },
+        () => {
+          if (state.cancelled || state.sessionId !== sessionId || state.retrying
+            || state.queueGeneration !== uploadQueueGeneration || activeUploadsMap.get(key) !== state) return;
+          plugin.uploadedChunksCount++;
+          const currentProgress = Math.floor(((i + 1) / actualTotalChunks) * 100);
+          const isLastChunk = (i + 1) === actualTotalChunks;
+          if (!isLastChunk) {
+            try {
+              plugin.app.saveLocalStorage(checkpointKey, JSON.stringify({
+                sessionId,
+                lastChunkIndex: i,
+                contentHash,
+                timestamp: Date.now(),
+              }));
+            } catch (error) {
+              dump("Failed to save upload checkpoint for " + path, error);
+            }
+          }
+          SyncLogManager.getInstance().addOrUpdateLog({
+            id: sessionId,
+            type: 'send',
+            action: 'FileUpload',
+            path,
+            status: isLastChunk ? 'success' : 'pending',
+            progress: currentProgress,
+          });
+        },
+      );
+
+      if (state.retrying) {
+        releaseUploadSlot(plugin, path, state);
+        return;
+      }
+      if (sendResult === 'closed') {
+        dump("Upload interrupted for " + path + " at chunk " + i + "/" + actualTotalChunks + " (connection closed), will resume after reconnect");
+        SyncLogManager.getInstance().addOrUpdateLog({
+          id: sessionId,
+          type: 'send',
+          action: 'FileUpload',
+          path,
+          status: 'pending',
+          message: '连接已断开，等待重连后续传',
+        });
+        removeUploadTaskState(plugin, state, true);
+        return;
+      }
+      if (sendResult === 'cancelled' || isPluginUnloading || state.cancelled) {
+        if (state.retrying) {
+          releaseUploadSlot(plugin, path, state);
+          return;
+        }
+        try { plugin.app.saveLocalStorage(checkpointKey, null); } catch { /* ignore */ }
+        removeUploadTaskState(plugin, state, true);
+        recordUploadTask(plugin, uploadMessageForState(state), state);
+        return;
+      }
+      await sleep(sleepTime);
+    }
+
+    content = null;
+    if (state.retrying || state.cancelled || state.sessionId !== sessionId) {
+      if (state.retrying) releaseUploadSlot(plugin, path, state);
+      return;
+    }
+
+    // Keep the state and the limiter slot until FileUploadAck. This preserves
+    // the session identity long enough to recover a late 463 and prevents
+    // SyncEnd from declaring the upload complete before the server commits it.
+    state.chunksSent = true;
+
+    // 上传完成后，如果开启了附件云预览 - 上传后删除，则删除本地附件
+    if (plugin.settings.cloudPreviewEnabled && plugin.settings.cloudPreviewAutoDeleteLocal) {
+      const ext = file.path.substring(file.path.lastIndexOf(".")).toLowerCase();
+      const isRestricted = FileCloudPreview.isRestrictedType(ext);
+      if (!(plugin.settings.cloudPreviewTypeRestricted && !isRestricted)) {
+        void (async () => {
+          await sleep(2000);
+          if (isPluginUnloading) return;
+          try {
+            const apiService = new HttpApiService(plugin);
+            const serverInfo = await apiService.getFileInfo(file.path);
+            if (serverInfo && serverInfo.path === file.path
+              && serverInfo.size === file.stat.size && serverInfo.mtime === file.stat.mtime) {
+              dump("Cloud Preview: Auto delete verified file: " + file.path);
+              plugin.addIgnoredFile(file.path);
+              try {
+                await vaultDelete(plugin.app.vault, file);
+                plugin.fileHashManager.removeFileHash(file.path);
+              } finally {
+                plugin.removeIgnoredFile(file.path);
+              }
+            }
+          } catch (error) {
+            dump("Cloud Preview: Auto delete failed to fetch info for " + file.path, error);
+          }
+        })();
+      }
+    }
+  } catch (error) {
+    if (state.retrying) {
+      releaseUploadSlot(plugin, path, state);
+      return;
+    }
+    dump("Upload process error for " + path, error);
+    if (checkpointKey) {
+      try { plugin.app.saveLocalStorage(checkpointKey, null); } catch { /* ignore */ }
+    }
+    removeUploadTaskState(plugin, state, true);
+    recordUploadTask(plugin, uploadMessageForState(state), state, true);
+  } finally {
+    state.runActive = false;
+    if (state.retryResponseReceived && retryingUploadsMap.get(key) === state
+      && !isPluginUnloading && generation === uploadQueueGeneration) {
+      state.retryResponseReceived = false;
+      state.retrying = false;
+      state.cancelled = false;
+      state.chunksSent = false;
+      state.queueGeneration = uploadQueueGeneration;
+      retryingUploadsMap.delete(key);
+      sessionIdToUploadMap.set(state.sessionId, state);
+      startUploadRun(plugin, state);
+    } else if (!state.retrying && !state.chunksSent && activeUploadsMap.get(key) === state && state.cancelled) {
+      removeUploadStateIfCurrent(path, state);
+    }
+  }
+}
+
 /**
  * 接收服务端文件上传指令 (FileUpload)
  */
@@ -594,298 +1115,86 @@ export const receiveFileUpload = async function (data: FileUploadMessage, plugin
   if (plugin.settings.syncEnabled == false) return
 
   if (plugin.settings.readonlySyncEnabled) {
-    dump(`Read-only mode: Intercepted file upload request for ${data.path}`)
-    plugin.recordSyncCompleted('file', data.pageIndex)
-    return
+    dump("Read-only mode: Intercepted file upload request for " + data.path);
+    plugin.recordSyncCompleted('file', data.pageIndex);
+    return;
   }
   if (isPathExcluded(data.path, plugin)) {
-    plugin.recordSyncCompleted('file', data.pageIndex)
-    return
+    plugin.recordSyncCompleted('file', data.pageIndex);
+    return;
   }
-  dump(`Receive file need upload (queued): `, data.path, data.sessionId)
-  sessionIdToPathMap.set(data.sessionId, data.path)
 
-  const file = plugin.app.vault.getFileByPath(normalizePath(data.path))
+  const key = uploadPathKey(data.path);
+  const file = plugin.app.vault.getFileByPath(normalizePath(data.path));
   if (!file) {
-    dump(`File not found for upload: ${data.path} `)
-    plugin.recordSyncCompleted('file', data.pageIndex)
-    return
+    dump("File not found for upload: " + data.path);
+    plugin.recordSyncCompleted('file', data.pageIndex);
+    return;
   }
   if (isLargeBinarySyncRisk(file.stat.size, plugin)) {
-    dump(`Skip file upload for large attachment (${describeBinarySyncLimit()} limit): ${data.path}`, file.stat.size)
-    notifyLargeFileSkipped(plugin, data.path, file.stat.size, `Fast Note Sync skipped large file upload: ${data.path}`)
-    plugin.recordSyncCompleted('file', data.pageIndex)
-    return
+    dump("Skip file upload for large attachment (" + describeBinarySyncLimit() + " limit): " + data.path, file.stat.size);
+    notifyLargeFileSkipped(plugin, data.path, file.stat.size, "Fast Note Sync skipped large file upload: " + data.path);
+    plugin.recordSyncCompleted('file', data.pageIndex);
+    return;
   }
 
-  // NeedPush(FileUpload) 驱动的上传-回执往返：FileUploadAck 本身不带 pageIndex，按 path 记下所属页
-  // 供 Ack 到达时查表归账（见 sync_state.ts pendingFilePushPageIndex 注释）
-  // NeedPush(FileUpload)-driven upload/ack round trip: FileUploadAck carries no pageIndex; record
-  // the owning page by path for the Ack to look up on arrival (see sync_state.ts
-  // pendingFilePushPageIndex comment)
-  if (data.pageIndex !== undefined) {
-    plugin.syncState.pendingFilePushPageIndex.set(data.path, data.pageIndex)
+  const existing = activeUploadsMap.get(key);
+  if (existing) {
+    if (existing.sessionId === data.sessionId && !existing.retrying) {
+      dump("Duplicate FileUpload ignored: " + data.path + " (" + data.sessionId + ")");
+      return;
+    }
+    if (!existing.retrying) {
+      dump("Stale FileUpload ignored while another session is active: " + data.path + " (" + data.sessionId + ")");
+      return;
+    }
+
+    // This is the response to our FileUploadCheck retry. Keep one logical task
+    // and let the old run unwind before starting the new session.
+    clearUploadRetryTimer(existing);
+    updateUploadSession(plugin, existing, data, file);
+    existing.chunksSent = false;
+    existing.retryResponseReceived = existing.runActive;
+    if (existing.runActive) return;
+    existing.retrying = false;
+    existing.cancelled = false;
+    retryingUploadsMap.delete(key);
+    startUploadRun(plugin, existing);
+    return;
   }
 
-  const chunkSize = data.chunkSize || 1024 * 1024
-  const actualTotalChunks = file.stat.size === 0 ? 1 : Math.ceil(file.stat.size / chunkSize)
-
-  // 始终在进入并发队列前就累加待上传分片总数，以精确驱动进度条
-  plugin.totalChunksToUpload += actualTotalChunks
-
-  const runUpload = async () => {
-    // 标记该路径进入活跃上传状态
-    const uploadState: ActiveUpload = {
-      cancelled: false,
-      queueGeneration: uploadQueueGeneration,
-      slotReleased: false,
-      taskRecorded: false,
-    }
-    activeUploadsMap.set(data.path, uploadState);
-    await plugin.concurrencyLimiter.waitForSlot(data.path, false, 10) // 优先级设为 10，优先处理上传
-
-    // clearUploadQueue() releases queued limiter promises so they cannot hang
-    // forever. They must stop here before reading the file or writing a chunk
-    // to a replacement socket.
-    if (isPluginUnloading || uploadState.cancelled || uploadState.queueGeneration !== uploadQueueGeneration) {
-      dump(`Upload dropped after transport reset: ${data.path}`)
-      releaseUploadSlot(plugin, data.path, uploadState)
-      activeUploadsMap.delete(data.path)
-      sessionIdToPathMap.delete(data.sessionId)
-      return
-    }
-
-    // 断点续传 checkpoint key，提升到 try 外以便 catch 块中也能清除
-    // Resume checkpoint key hoisted outside try so the catch block can also remove it
-    const vaultName = plugin.app.vault.getName()
-    const checkpointKey = `fns-${vaultName}-uploadSession-${data.pathHash}`
-
-    try {
-      // 延迟到任务排到时才读取文件内容, 减少内存积压
-      let content: ArrayBuffer | null = null;
-      try {
-        logMemorySnapshot(`before upload read ${data.path}`)
-        content = await plugin.app.vault.readBinary(file)
-      } catch (e) {
-        dump(`Failed to read file for upload: ${data.path}`, e)
-      }
-      if (!content) {
-        plugin.totalChunksToUpload -= actualTotalChunks
-        releaseUploadSlot(plugin, data.path, uploadState)
-        recordUploadTask(plugin, data, uploadState)
-        return;
-      }
-
-      const contentHash = await hashFileAsync(plugin.app, file.path, plugin)
-      logMemorySnapshot(`after upload hash ${data.path}`)
-      // 将 hash 暂存到 pending map，等待服务端 FileUploadAck 后再写入 hashManager
-      // Temporarily store hash in pending map, update hashManager only after server FileUploadAck
-      plugin.pendingUploadHashes.set(data.path, contentHash)
-      plugin.localStorageManager.savePending('pendingUploadHashes', plugin.pendingUploadHashes)
-      // 记录当前文件的 mtime/size 到缓存，以便后续利用
-      plugin.fileHashManager.setLocalFileHash(data.path, contentHash, file.stat.mtime, file.stat.size)
-      plugin.syncState.pendingFileUploadAcks.add(normalizePath(data.path))
-
-      // 使用外层计算好的 actualTotalChunks
-
-      // 断点续传：从 localStorage 读取上次中断的 checkpoint
-      // Resume upload: read checkpoint from localStorage for the last interrupted upload
-      let startChunkIndex = 0
-      try {
-        const cpRaw = plugin.app.loadLocalStorage(checkpointKey) as string | undefined;
-        if (cpRaw) {
-          const cp = JSON.parse(cpRaw) as { sessionId?: string; lastChunkIndex?: number; contentHash?: string }
-          if (cp.sessionId === data.sessionId &&
-            cp.contentHash === contentHash &&
-            typeof cp.lastChunkIndex === 'number' &&
-            cp.lastChunkIndex >= 0 &&
-            cp.lastChunkIndex < actualTotalChunks - 1) {
-            startChunkIndex = cp.lastChunkIndex + 1
-            dump(`Resume upload from chunk ${startChunkIndex}/${actualTotalChunks}: ${data.path}`)
-          }
-        }
-      } catch (e) {
-        dump(`Failed to read upload checkpoint for ${data.path}`, e)
-      }
-
-      // 如从断点恢复，则同步累加已上传计数以对齐进度
-      if (startChunkIndex > 0) {
-        plugin.uploadedChunksCount += startChunkIndex
-      }
-
-      // 打印上传信息表格
-      dump([
-        {
-          操作: "文件上传",
-          路径: data.path,
-          文件大小: `${(content.byteLength / 1024 / 1024).toFixed(2)} MB`,
-          分片大小: `${(chunkSize / 1024).toFixed(0)} KB`,
-          分片数量: actualTotalChunks,
-          SessionID: data.sessionId.substring(0, 8) + "...",
-        },
-      ])
-
-      const sleepTime = Platform.isMobile ? 10 : 2;
-
-      for (let i = startChunkIndex; i < actualTotalChunks; i++) {
-        const start = i * chunkSize
-        const end = Math.min(start + chunkSize, content.byteLength)
-        const length = end - start;
-
-        // 使用 Uint8Array 视图代替 slice 拷贝，减少内存翻倍
-        const chunk = new Uint8Array(content, start, length)
-
-        const sessionIdBytes = new TextEncoder().encode(data.sessionId)
-        const chunkIndexBytes = new Uint8Array(4)
-        const view = new DataView(chunkIndexBytes.buffer)
-        view.setUint32(0, i, false)
-
-        const frame = new Uint8Array(36 + 4 + chunk.byteLength)
-        frame.set(sessionIdBytes, 0)
-        frame.set(chunkIndexBytes, 36)
-        frame.set(chunk, 40)
-
-        // 在 before 回调中检查是否已被取消,这样可以在数据真正进入 WebSocket 缓冲区之前拦截
-        const sendResult = await plugin.websocket.SendBinary(
-          frame,
-          BINARY_PREFIX_FILE_SYNC,
-          () => {
-            // before: 检查是否已被取消(例如由于文件在上传过程中被删除)
-            if (isPluginUnloading || activeUploadsMap.get(data.path)?.cancelled) {
-              dump(`Upload aborted for ${data.path} (cancelled before send)`);
-              return true; // 返回 true 表示应该取消发送
-            }
-            return false;
-          },
-          () => {
-            // after: 发送成功后更新计数和日志
-            plugin.uploadedChunksCount++
-            const currentProgress = Math.floor(((i + 1) / actualTotalChunks) * 100);
-            const isLastChunk = (i + 1) === actualTotalChunks;
-
-            // 更新断点续传 checkpoint（发送成功后，非最后一块）
-            // Update resume checkpoint after successful send (not the last chunk)
-            if (!isLastChunk) {
-              try {
-                plugin.app.saveLocalStorage(checkpointKey, JSON.stringify({
-                  sessionId: data.sessionId,
-                  lastChunkIndex: i,
-                  contentHash: contentHash,
-                  timestamp: Date.now(),
-                }))
-              } catch (e) {
-                dump(`Failed to save upload checkpoint for ${data.path}`, e)
-              }
-            }
-
-            // 更新日志进度
-            SyncLogManager.getInstance().addOrUpdateLog({
-              id: data.sessionId,
-              type: 'send',
-              action: 'FileUpload',
-              path: data.path,
-              status: isLastChunk ? 'success' : 'pending',
-              progress: currentProgress
-            });
-          }
-        )
-
-        // 连接不可用：分片未真正发出，立即中断循环，保留断点续传 checkpoint（不清除、不标记完成任务数），
-        // 等重连后由后续同步轮次从 checkpoint 处续传，避免"分片假成功"（空转跑完循环但数据未真正传完）
-        // Connection unavailable: the chunk was never actually sent. Break immediately and keep the
-        // resume checkpoint intact (don't clear it, don't bump the completed counter) so the next
-        // sync round can resume from the checkpoint after reconnect.
-        if (sendResult === 'closed') {
-          dump(`Upload interrupted for ${data.path} at chunk ${i}/${actualTotalChunks} (connection closed), will resume after reconnect`);
-          SyncLogManager.getInstance().addOrUpdateLog({
-            id: data.sessionId,
-            type: 'send',
-            action: 'FileUpload',
-            path: data.path,
-            status: 'pending',
-            message: '连接已断开，等待重连后续传'
-          });
-          plugin.syncState.pendingFileUploadAcks.delete(normalizePath(data.path))
-          releaseUploadSlot(plugin, data.path, uploadState)
-          return;
-        }
-
-        // 如果被取消,立即退出循环并释放槽位
-        if (sendResult === 'cancelled' || isPluginUnloading) {
-          // 取消时清除 checkpoint，避免使用已失效的会话
-          // Clear checkpoint on cancel to avoid stale session reuse
-          try { plugin.app.saveLocalStorage(checkpointKey, null) } catch { /* ignore */ }
-          plugin.syncState.pendingFileUploadAcks.delete(normalizePath(data.path))
-          releaseUploadSlot(plugin, data.path, uploadState)
-          recordUploadTask(plugin, data, uploadState)
-          return;
-        }
-
-        // 让出主线程，手机端给更多呼吸时间
-        await sleep(sleepTime)
-      }
-
-      // 手动置空辅助 GC
-      content = null;
-
-      // 上传完成后，如果开启了附件云预览 - 上传后删除，则删除本地附件
-      if (plugin.settings.cloudPreviewEnabled && plugin.settings.cloudPreviewAutoDeleteLocal) {
-        const ext = file.path.substring(file.path.lastIndexOf(".")).toLowerCase();
-        const isRestricted = FileCloudPreview.isRestrictedType(ext);
-
-        // 如果开启了类型限制，则仅删除受限类型 (图片/音频/视频/PDF)
-        // 如果未开启类型限制，则全部删除
-        if (plugin.settings.cloudPreviewTypeRestricted && !isRestricted) {
-          return;
-        }
-
-        void (async () => {
-          await sleep(2000);
-          if (isPluginUnloading) return;
-          try {
-            const apiService = new HttpApiService(plugin);
-            const serverInfo = await apiService.getFileInfo(file.path);
-
-            if (serverInfo) {
-              // 核对 path、size、mtime 是否一致
-              if (serverInfo.path === file.path &&
-                serverInfo.size === file.stat.size &&
-                serverInfo.mtime === file.stat.mtime) {
-                dump(`Cloud Preview: Auto delete verified file: ${file.path}`);
-                plugin.addIgnoredFile(file.path);
-                try {
-                  await vaultDelete(plugin.app.vault, file);
-                  plugin.fileHashManager.removeFileHash(file.path);
-                } finally {
-                  plugin.removeIgnoredFile(file.path);
-                }
-              } else {
-                dump(`Cloud Preview: Auto delete skip, info mismatch for ${file.path}`, { server: serverInfo, local: file.stat });
-              }
-            }
-          } catch (e) {
-            dump(`Cloud Preview: Auto delete failed to fetch info for ${file.path}`, e);
-          }
-        })();
-      }
-    } catch (e) {
-      dump(`Upload process error for ${data.path}`, e);
-      // 异常退出时清除 checkpoint，避免下次用无效的 sessionId 继续
-      try { plugin.app.saveLocalStorage(checkpointKey, null) } catch { /* ignore */ }
-      plugin.syncState.pendingFileUploadAcks.delete(normalizePath(data.path))
-      plugin.totalChunksToUpload -= actualTotalChunks
-      releaseUploadSlot(plugin, data.path, uploadState)
-      recordUploadTask(plugin, data, uploadState, true)
-    } finally {
-      // 任务结束（完成或取消/失败），移除活跃标记
-      activeUploadsMap.delete(data.path);
-      sessionIdToPathMap.delete(data.sessionId);
-    }
+  const chunkSize = data.chunkSize || 1024 * 1024;
+  const actualTotalChunks = file.stat.size === 0 ? 1 : Math.ceil(file.stat.size / chunkSize);
+  const state: ActiveUpload = {
+    cancelled: false,
+    queueGeneration: uploadQueueGeneration,
+    slotAcquired: false,
+    slotReleased: false,
+    taskRecorded: false,
+    sessionId: data.sessionId,
+    descriptor: createUploadDescriptor(plugin, data, file),
+    message: { ...data },
+    pageIndex: data.pageIndex,
+    chunkSize,
+    retryCount: 0,
+    retryTimer: null,
+    retrying: false,
+    retryResponseReceived: false,
+    runActive: false,
+    chunksSent: false,
+    actualTotalChunks,
+    totalCountSettled: false,
+  };
+  activeUploadsMap.set(key, state);
+  sessionIdToUploadMap.set(state.sessionId, state);
+  if (state.pageIndex !== undefined) {
+    plugin.syncState.pendingFilePushPageIndex.set(data.path, state.pageIndex);
   }
-
-  // 任务立即执行，受外部 ConcurrencyLimiter 控制
-  void runUpload()
-}
+  plugin.syncState.pendingFileUploadAcks.add(key);
+  plugin.totalChunksToUpload += actualTotalChunks;
+  dump("Receive file need upload (queued): " + data.path + " " + data.sessionId);
+  startUploadRun(plugin, state);
+};
 
 /**
  * 接收服务端文件更新通知 (FileSyncUpdate)
@@ -1706,18 +2015,31 @@ export const receiveFileRenameAck = function (data: { lastTime?: number }, plugi
 // 收到 FileUploadAck，将 pending hash 转移到正式 hashManager 并更新 lastFileSyncTime
 // Receive FileUploadAck, move pending hash to formal hashManager and update lastFileSyncTime
 export const receiveFileUploadAck = function (data: { lastTime?: number; path?: string; pathHash?: string }, plugin: FastSync) {
+  const active = data.path ? activeUploadsMap.get(uploadPathKey(data.path)) : undefined;
+  if (active && data.pathHash && active.descriptor.pathHash && data.pathHash !== active.descriptor.pathHash) {
+    dump(`FileUploadAck ignored for stale path hash: ${data.path} (${data.pathHash})`);
+    return;
+  }
   if (data.path) {
-    const ackKey = normalizePath(data.path)
+    const ackKey = uploadPathKey(data.path)
     if (!plugin.syncState.pendingFileUploadAcks.delete(ackKey)) {
       dump(`FileUploadAck ignored as duplicate or stale: ${data.path}`)
       return
     }
+  }
+  if (active) {
+    active.cancelled = true;
+    active.retrying = false;
+    active.retryResponseReceived = false;
+    clearUploadRetryTimer(active);
+    removeUploadStateIfCurrent(data.path!, active);
   }
   // 服务端确认上传成功，将 pending hash 转移到正式 hashManager
   // Server confirmed upload success, move pending hash to formal hashManager
   if (data.path) {
     const journalResult = plugin.incrementalScanManager?.acknowledge("file", data.path)
     const contentHash = plugin.pendingUploadHashes.get(data.path)
+      ?? plugin.pendingUploadHashes.get(uploadPathKey(data.path))
     if (contentHash !== undefined && journalResult !== "stale") {
       const file = plugin.app.vault.getFileByPath(normalizePath(data.path))
       plugin.fileHashManager.setFileHash(data.path, contentHash, file?.stat.mtime || 0, file?.stat.size || 0)
@@ -1727,23 +2049,35 @@ export const receiveFileUploadAck = function (data: { lastTime?: number; path?: 
   }
   // 上传完成，清除断点续传 checkpoint
   // Upload complete, clear resume checkpoint
-  if (data.pathHash) {
+  const checkpointPathHash = data.pathHash || active?.descriptor.pathHash;
+  if (checkpointPathHash) {
     const vaultName = plugin.app.vault.getName()
-    try { plugin.app.saveLocalStorage(`fns-${vaultName}-uploadSession-${data.pathHash}`, null) } catch { /* ignore */ }
+    try { plugin.app.saveLocalStorage(`fns-${vaultName}-uploadSession-${checkpointPathHash}`, null) } catch { /* ignore */ }
   }
   if (data.lastTime && data.lastTime > Number(plugin.localStorageManager.getMetadata("lastFileSyncTime"))) {
     plugin.localStorageManager.setMetadata("lastFileSyncTime", data.lastTime)
     dump(`FileUploadAck: lastFileSyncTime updated to`, data.lastTime)
   }
   if (data.path) {
-    plugin.concurrencyLimiter.releaseSlot(data.path)
+    if (active) releaseUploadSlot(plugin, data.path, active)
+    else plugin.concurrencyLimiter.releaseSlot(data.path)
   }
   // 查表归账所属下载页（NeedPush=FileUpload 驱动）；查不到说明是本地用户自发编辑触发的上传 Ack，走旧路径
   // Look up the owning download page (NeedPush=FileUpload-driven); a miss means a local
   // user-initiated edit triggered this upload Ack, falls back to the legacy path
-  const pushPageIndex = data.path ? plugin.syncState.pendingFilePushPageIndex.get(data.path) : undefined;
+  const pushPageIndex = data.path
+    ? plugin.syncState.pendingFilePushPageIndex.get(data.path) ?? active?.pageIndex
+    : undefined;
   if (data.path) plugin.syncState.pendingFilePushPageIndex.delete(data.path)
-  plugin.recordSyncCompleted('file', pushPageIndex)
+  if (active) {
+    // The upload may receive its ACK before runUpload gets past waitForSlot.
+    // Mark it recorded now so that the late run cannot count the same page a
+    // second time when it observes the cancelled state.
+    active.pageIndex = pushPageIndex ?? active.pageIndex;
+    recordUploadTask(plugin, uploadMessageForState(active), active);
+  } else {
+    plugin.recordSyncCompleted('file', pushPageIndex)
+  }
 }
 
 // 收到 FileDeleteAck，仅当路径仍在 pending set 中时才从 hashManager 移除
@@ -1766,28 +2100,36 @@ export const receiveFileDeleteAck = function (data: { lastTime?: number; path?: 
  * 收到服务端 463 错误（上传附件会话不存在），清理该文件的活跃上传状态并增加完成计数
  */
 export const receiveFileUploadSessionNotFound = function (sessionId: string, plugin: FastSync) {
-  const path = sessionIdToPathMap.get(sessionId)
-  if (!path) return
-
-  // Consume the mapping before doing any cleanup. The server can repeat a
-  // 463 response, and completion accounting must remain exactly-once.
-  sessionIdToPathMap.delete(sessionId)
-  const active = activeUploadsMap.get(path)
+  const active = sessionIdToUploadMap.get(sessionId)
   if (!active) {
-    dump(`FileUploadSessionNotFound: Ignored stale session for path: ${path} (${sessionId})`)
+    dump(`FileUploadSessionNotFound: Ignored stale session: ${sessionId}`)
+    return
+  }
+  const path = active.descriptor.path
+  const key = uploadPathKey(path)
+  if (active.sessionId !== sessionId || activeUploadsMap.get(key) !== active) {
+    sessionIdToUploadMap.delete(sessionId)
+    dump(`FileUploadSessionNotFound: Ignored stale upload state for path: ${path} (${sessionId})`)
+    return
+  }
+  if (active.retrying) {
+    // The first 463 already moved this state to the retry map. Repeated 463s
+    // for the consumed session must not release or complete it a second time.
+    sessionIdToUploadMap.delete(sessionId)
+    dump(`FileUploadSessionNotFound: Duplicate 463 ignored for path: ${path} (${sessionId})`)
     return
   }
 
-  active.cancelled = true
-  plugin.syncState.pendingFileUploadAcks.delete(normalizePath(path))
+  sessionIdToUploadMap.delete(sessionId)
+  active.cancelled = true;
+  active.retrying = true;
+  active.retryResponseReceived = false;
+  active.chunksSent = false;
+  retryingUploadsMap.set(key, active);
+  // Keep both the dirty hash and page ACK marker alive until the replacement
+  // session is acknowledged or the bounded retry budget is exhausted.
+  plugin.syncState.pendingFileUploadAcks.add(key);
   releaseUploadSlot(plugin, path, active)
-  recordUploadTask(plugin, {
-    path,
-    pathHash: hashContent(path),
-    ctime: 0,
-    mtime: 0,
-    sessionId,
-    chunkSize: 0,
-  }, active, true)
-  dump(`FileUploadSessionNotFound: Cleaned active state and completed task for path: ${path} (${sessionId})`)
+  scheduleUploadSessionCheck(plugin, active)
+  dump(`FileUploadSessionNotFound: scheduling FileUploadCheck retry for path: ${path} (${sessionId})`)
 }

@@ -1,6 +1,6 @@
 {
   "name": "fast-note-sync",
-  "version": "2.5.9",
+  "version": "2.5.10",
   "type": "module",
   "description": "Real-time sync of your vaults across server, mobile, and web; shareable with anyone; supports REST and MCP integrations to build your personal AI knowledge base.",
   "main": "main.js",
@@ -13,7 +13,7 @@
     "fix": "eslint --fix src",
     "build": "tsc -noEmit -skipLibCheck && node esbuild.config.mjs production",
     "test:auth": "node tests/websocket-auth-error.test.mjs",
-    "test:incremental": "node tests/incremental-scan-progress.test.mjs && node tests/incremental-scan-manager.test.mjs && node tests/incremental-reconciliation.test.mjs && node tests/file-hash-checkpoint.test.mjs && node tests/sync-metadata-mirror.test.mjs",
+    "test:incremental": "node tests/incremental-scan-progress.test.mjs && node tests/incremental-scan-manager.test.mjs && node tests/incremental-reconciliation.test.mjs && node tests/incremental-scan-contract.test.mjs && node tests/file-hash-checkpoint.test.mjs && node tests/sync-metadata-mirror.test.mjs",
     "test:mirror": "node tests/file-mirror-restore.test.mjs",
     "test:vault-name": "node tests/vault-name-setting.test.mjs",
     "ver": "node ./scripts/update-version.js",
