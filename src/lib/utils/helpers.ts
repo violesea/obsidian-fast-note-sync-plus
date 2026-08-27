@@ -334,6 +334,19 @@ export const configIsPathExcluded = function (relativePath: string, plugin: Fast
     return true
   }
 
+  // 固定排除整个插件目录树：插件程序是设备本地软件而非 vault 内容。经 ConfigSync 搬运
+  // 会在设备间互覆插件版本，并让同 id 备份目录从服务端反复复活（ISSUE-026；
+  // 2026-08-27 .19 现场实测：同 id 备份被上传后每轮 config sync 拉回重载）。
+  // Hard exclude the whole plugins directory tree: plugin binaries are per-device
+  // software, never vault content. Syncing them cross-device overwrites plugin
+  // versions and resurrects same-id backup copies from the server (ISSUE-026;
+  // observed live on .19 2026-08-27: an uploaded same-id backup was re-downloaded
+  // and reloaded every config sync round).
+  const pluginsRoot = normalizePath(`${plugin.app.vault.configDir}/plugins`)
+  if (normalizedPath === pluginsRoot || normalizedPath.startsWith(`${pluginsRoot}/`)) {
+    return true
+  }
+
   // 0. 检查白名单 (优先级最高 - 使用共享设置)
   if (syncExcludeWhitelist) {
     const whitelist = parseRules(syncExcludeWhitelist)
