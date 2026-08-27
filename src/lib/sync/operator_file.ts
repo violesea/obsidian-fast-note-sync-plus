@@ -367,8 +367,59 @@ const cleanupFileDownloadSession = async (plugin: FastSync, session: FileDownloa
   plugin.recordSyncCompleted('file', session.pageIndex)
 }
 
+/** 下载失败路径的冷却时长：冷却期内该路径的下载任务直接按失败记账跳过，到期自动恢复重试 */
+const DOWNLOAD_COOLDOWN_MS = 10 * 60 * 1000
+
+const markDownloadCooldown = (plugin: FastSync, path: string): void => {
+  if (!path) return
+  // 有界性：名单超长时先过期清扫，防止长会话内存增长
+  const cooldowns = plugin.downloadCooldownPaths
+  if (cooldowns.size > 2000) {
+    const now = Date.now()
+    for (const [p, expiry] of cooldowns) {
+      if (expiry <= now) cooldowns.delete(p)
+    }
+  }
+  cooldowns.set(path, Date.now() + DOWNLOAD_COOLDOWN_MS)
+}
+
+export const isDownloadCoolingDown = (plugin: FastSync, path: string): boolean => {
+  const expiry = plugin.downloadCooldownPaths.get(path)
+  if (!expiry) return false
+  if (expiry <= Date.now()) {
+    plugin.downloadCooldownPaths.delete(path)
+    return false
+  }
+  return true
+}
+
+/**
+ * 收割孤儿下载会话 / Reap orphaned download sessions.
+ * 服务端条目销毁或分片永不到达时，会话会永远挂起并卡死 allDownloadsComplete
+ * 完成判定（2026-08-27 实测：.19 曾积累 189 个空 temp-chunks 会话目录；iPad
+ * 的"同一批文件无限循环"同源）。超过 maxAgeMs 无任何活动（通告/分片）的会话
+ * 按失败清算并进入冷却名单。
+ */
+export const reapStaleFileDownloadSessions = async (plugin: FastSync, maxAgeMs = 120000): Promise<number> => {
+  if (plugin.fileDownloadSessions.size === 0) return 0
+  const now = Date.now()
+  const stale: FileDownloadSession[] = []
+  for (const session of plugin.fileDownloadSessions.values()) {
+    // 无 lastActivityAt 的旧会话（本补丁前创建）按 0 处理，立即收割——它们正是孤儿
+    const lastActivity = session.lastActivityAt ?? 0
+    if (now - lastActivity > maxAgeMs) {
+      stale.push(session)
+    }
+  }
+  for (const session of stale) {
+    await failFileDownloadSession(plugin, session, `session reaped: no chunk activity for ${Math.round((now - (session.lastActivityAt ?? 0)) / 1000)}s`)
+  }
+  return stale.length
+}
+
 const failFileDownloadSession = async (plugin: FastSync, session: FileDownloadSession, message: string, releaseSlot = true) => {
   dumpError(`File download failed: ${session.path} (${session.sessionId}) - ${message}`)
+  markDownloadCooldown(plugin, session.path)
   const completedCount = getCompletedDownloadChunks(session)
   SyncLogManager.getInstance().addOrUpdateLog({
     id: session.sessionId,
@@ -1236,6 +1287,19 @@ export const receiveFileSyncUpdate = async function (data: ReceiveFileSyncUpdate
     }
   }
 
+  // 冷却跳过：该路径本轮运行期间刚下载失败过（孤儿会话/分片丢失）。服务器每轮都会
+  // 重新下发缺失路径，立即重试会以同样方式失败，制造"同一批文件无限循环同步"。冷却
+  // 期内按失败记账跳过（不产生 I/O 与会话），到期自动恢复重试。
+  // Cooldown skip: this path failed to download recently in this app run (orphaned
+  // session / lost chunks). The server re-offers missing paths every round; an
+  // immediate retry would fail identically and loop the same batch forever.
+  // Skip with failure accounting while cooling down; retry resumes on expiry.
+  if (isDownloadCoolingDown(plugin, data.path)) {
+    dump(`File download skipped (cooldown after recent failure): ${data.path}`);
+    plugin.recordSyncCompleted('file', data.pageIndex);
+    return
+  }
+
   // 等待并发槽位，防止大量并发下载导致内存耗尽
   const slotKey = `download_${data.path}`
   await plugin.concurrencyLimiter.waitForSlot(slotKey, false, -10) // 优先级设为 -10，延后处理下载
@@ -1259,6 +1323,7 @@ export const receiveFileSyncUpdate = async function (data: ReceiveFileSyncUpdate
       size: data.size,
       pageIndex: data.pageIndex,
       initialSlotKey: slotKey,
+      lastActivityAt: Date.now(),
       ...createDownloadStorage(plugin, `init_${data.pathHash}`, data.size),
     }
     plugin.fileDownloadSessions.set(tempKey, tempSession)
@@ -1461,6 +1526,7 @@ export const receiveFileSyncChunkDownload = async function (data: FileSyncChunkD
       size: data.size,
       pageIndex: tempSession.pageIndex,
       initialSlotKey: tempSession.initialSlotKey,
+      lastActivityAt: Date.now(),
       ...createDownloadStorage(plugin, data.sessionId, data.size),
     }
     plugin.fileDownloadSessions.set(data.sessionId, session)
@@ -1476,6 +1542,7 @@ export const receiveFileSyncChunkDownload = async function (data: FileSyncChunkD
       totalChunks: data.totalChunks,
       size: data.size,
       initialSlotKey: `download_${data.path}`,
+      lastActivityAt: Date.now(),
       ...createDownloadStorage(plugin, data.sessionId, data.size),
     }
     plugin.fileDownloadSessions.set(data.sessionId, session)
@@ -1685,6 +1752,7 @@ export const handleFileChunkDownload = async function (buf: ArrayBuffer | Blob, 
     plugin.pendingFileChunks.set(sessionId, buf)
     return
   }
+  session.lastActivityAt = Date.now()
 
   try {
     if (chunkIndex >= session.totalChunks) {

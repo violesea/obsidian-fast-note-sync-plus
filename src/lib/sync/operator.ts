@@ -1,6 +1,6 @@
 import { TFolder, TFile, normalizePath } from "obsidian";
 
-import { receiveFileUpload, receiveFileSyncUpdate, receiveFileSyncDelete, receiveFileSyncMtime, receiveFileSyncChunkDownload, receiveFileSyncEnd, checkAndUploadAttachments, receiveFileSyncRename, receiveFileRenameAck, receiveFileUploadAck, receiveFileDeleteAck, isPluginUnloading, clearUploadQueue, resetFileDownloadSessions, getActiveUploadCount } from "./operator_file";
+import { receiveFileUpload, receiveFileSyncUpdate, receiveFileSyncDelete, receiveFileSyncMtime, receiveFileSyncChunkDownload, receiveFileSyncEnd, checkAndUploadAttachments, receiveFileSyncRename, receiveFileRenameAck, receiveFileUploadAck, receiveFileDeleteAck, isPluginUnloading, clearUploadQueue, resetFileDownloadSessions, getActiveUploadCount, reapStaleFileDownloadSessions } from "./operator_file";
 import { hashContent, hashContentAsync, dump, isPathExcluded, isFolderSyncPathExcluded, configIsPathExcluded, getConfigSyncCustomDirs, generateUUID, showSyncNotice, isLargeBinarySyncRisk, describeBinarySyncLimit, hashFileAsync, formatFileSize, yieldToMain, getPluginDir, sleep } from "../utils/helpers";
 import { receiveConfigSyncModify, receiveConfigUpload, receiveConfigSyncMtime, receiveConfigSyncDelete, receiveConfigSyncEnd, configAllPaths, receiveConfigSyncClear, receiveConfigModifyAck, receiveConfigDeleteAck } from "./operator_config";
 import { receiveNoteSyncModify, receiveNoteUpload, receiveNoteSyncMtime, receiveNoteSyncDelete, receiveNoteSyncEnd, receiveNoteSyncRename, receiveNoteModifyAck, receiveNoteRenameAck, receiveNoteDeleteAck, repairSuspiciousEmptyNotes } from "./operator_note";
@@ -632,6 +632,13 @@ export function checkSyncCompletion(plugin: FastSync, intervalId?: number, syncS
     }
     return;
   }
+  // 孤儿下载会话收割：无活动的会话会永远卡死 allDownloadsComplete，是"同一批文件
+  // 无限循环同步"的直接机制之一（2026-08-27 iPad/.19 实测）。与完成检查同频执行。
+  // Reap orphaned download sessions: an inactive session blocks allDownloadsComplete
+  // forever — one of the direct mechanisms of the endless same-batch re-sync loop.
+  void reapStaleFileDownloadSessions(plugin).then((reaped) => {
+    if (reaped > 0) dump(`[checkSyncCompletion] reaped ${reaped} stale file download session(s)`);
+  });
   // 超时保底：调大为 300s 以支持超大库（多批次）的分批同步，防止误判超时终止
   // Safety timeout: increased to 300s to support large vaults with many batches, preventing false timeout termination
   const SYNC_TIMEOUT_MS = 300000;

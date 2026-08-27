@@ -104,6 +104,14 @@ export interface FileDownloadSession {
     /** 所属下载页（0-based），从 receiveFileSyncUpdate 的 pageIndex 透传，供分片下载会话完成时归账（见 ReceiveMessage.pageIndex 注释） */
     pageIndex?: number;
     initialSlotKey?: string;
+    /**
+     * 最近一次会话活动（通告/分片到达）的墙钟时间戳。孤儿会话（服务端条目已销毁、
+     * 分片永不到达）会永远卡死 allDownloadsComplete 完成判定，reaper 按此字段收割。
+     * Wall-clock timestamp of the last session activity (announcement or chunk arrival).
+     * Orphaned sessions (server entry destroyed, chunks never arriving) block the
+     * allDownloadsComplete completion gate forever; the reaper harvests by this field.
+     */
+    lastActivityAt?: number;
 }
 
 export interface ReceiveMtimeMessage {

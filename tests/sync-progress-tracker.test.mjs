@@ -72,6 +72,30 @@ exhaustedTimer.callback();
 assert.deepEqual(stalledEvents, [{ type: "note", pageIndex: 0, retries: 1 }]);
 assert.equal(stalledAcks.length, 2, "no ACK is sent after the retry budget is exhausted");
 
+// Contract: forceCloseType closes a stalled type's accounting with the shortfall
+// returned as failures, letting the round terminate instead of looping forever
+// (2026-08-27 iPad: same batch of files re-synced endlessly because a stuck type
+// could never satisfy isTypeFullyDone, so the baseline never advanced).
+{
+  const closeTracker = new SyncProgressTracker();
+  closeTracker.reset(["note"]);
+  closeTracker.recordHashProgress(100);
+  closeTracker.recordUploadComplete("note");
+  closeTracker.setDownloadTotal("note", 10);
+  closeTracker.recordPageProgress("note", 0, 10, true);
+  // only 7 of 10 received items complete
+  for (let i = 0; i < 7; i++) closeTracker.recordCompleted("note", 0);
+  assert.equal(closeTracker.isTypeFullyDone("note"), false, "stalled type is not done before close-out");
+  assert.equal(closeTracker.hasReceivedAnyPages("note"), true);
+  const shortfall = closeTracker.forceCloseType("note");
+  assert.equal(shortfall, 3, "shortfall of uncompleted items is reported");
+  assert.equal(closeTracker.isTypeFullyDone("note"), true, "type closes out after forceCloseType");
+  assert.equal(closeTracker.hasReceivedAnyPages("note"), true, "close-out keeps received history");
+  // idempotent second close reports zero further shortfall
+  assert.equal(closeTracker.forceCloseType("note"), 0);
+  console.log("forceCloseType contract ok");
+}
+
 // Contract: an incomplete round never emits a 100% progress signal.
 const incompleteTracker = new SyncProgressTracker();
 const incompleteProgress = [];

@@ -524,6 +524,45 @@ export class SyncProgressTracker {
     return prog.uploadComplete && prog.allPagesReceived && downloadCompleted >= prog.receivedTaskTotal;
   }
 
+  /** Whether any download page metadata was received for this type this round. */
+  hasReceivedAnyPages(type: SyncType): boolean {
+    const prog = this.progressMap.get(type);
+    return !!prog && prog.receivedTaskTotal > 0;
+  }
+
+  /**
+   * Close out a stalled type's accounting with the shortfall recorded as failures.
+   * Used by the stagnation path when a type has received pages but some items can
+   * never complete (e.g. orphaned download sessions whose server-side entry was
+   * destroyed). Without this, the round — and therefore the baseline transition
+   * into incremental mode — can never happen, and every reconnect re-runs the full
+   * calibration scan (observed live on iPad 2026-08-27: the same batch of files
+   * re-synced forever). The shortfall is returned so callers can surface it; this
+   * is a failure close-out, not a success claim — failed items stay missing and
+   * are re-offered after their cooldown expires.
+   */
+  forceCloseType(type: SyncType): number {
+    const prog = this.progressMap.get(type);
+    if (!prog) return 0;
+    const completed = prog.pageTaskCompleted - prog.uploadTasksBase;
+    const shortfall = Math.max(0, prog.receivedTaskTotal - completed);
+    prog.pageTaskCompleted = prog.receivedTaskTotal + prog.uploadTasksBase;
+    prog.pageTaskTotal = Math.max(prog.pageTaskTotal, prog.receivedTaskTotal);
+    prog.allPagesReceived = true;
+    prog.uploadComplete = true;
+    // 页 bucket 全部关闭，避免 pages Map 中未完成页干扰后续判定
+    for (const page of prog.pages.values()) {
+      page.acked = true;
+    }
+    this.stagnationTimers.delete(type);
+    this.stagnationRetries.delete(type);
+    if (shortfall > 0) {
+      dump(`[SyncProgressTracker] forceCloseType(${type}): closing out with ${shortfall} failed item(s)`);
+    }
+    this.notify();
+    return shortfall;
+  }
+
   /**
    * Determine current active phase.
    * 判定当前活跃阶段 (哈希/上传/推送/空闲)。

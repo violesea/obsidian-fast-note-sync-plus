@@ -255,6 +255,17 @@ export class SyncState {
    * and replaying after registration closes that window.
    */
   pendingFileChunks = new Map<string, ArrayBuffer[]>();
+  /**
+   * 下载失败路径冷却名单 / Cooldown for paths whose download failed this run.
+   * path -> expiry (Date.now() based). 服务器每轮都会重新下发客户端仍缺失的路径；
+   * 刚失败的路径若立即重试会以同样方式失败，制造"同一批文件无限循环同步"。冷却期内
+   * 收到这些路径的下载任务时直接按失败记账跳过，冷却到期后自动恢复重试（自愈瞬时故障）。
+   * The server re-offers paths the client still lacks on every round; a path that just
+   * failed would fail identically on immediate retry, producing the "same batch of files
+   * syncing forever" loop. While cooling down, download tasks for these paths are skipped
+   * and accounted as failures; the cooldown expires so transient failures self-heal.
+   */
+  downloadCooldownPaths = new Map<string, number>();
 
 
   // ─── Helpers ─────────────────────────────────────────────────────────────────

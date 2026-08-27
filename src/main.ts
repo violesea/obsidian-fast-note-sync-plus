@@ -129,6 +129,18 @@ export default class FastSync extends Plugin {
     this.progressTracker.onPageAckStalled = (type, pageIndex, retries) => {
       const context = this.syncState.activeSyncContext;
       if (!context) return;
+      // 有页到达过却停滞：明细或下载会话永远不会齐（服务端条目已销毁/孤儿会话）。
+      // 按类型关账（缺口记为失败）让本轮有界终止——轮次终止才能推基线进增量模式，
+      // 否则每次重连都重走全量校准扫描（2026-08-27 iPad 实测：同一批文件无限循环）。
+      // Pages arrived but stalled: details or download sessions will never complete
+      // (server entry destroyed / orphaned sessions). Close the type out with the
+      // shortfall recorded as failures so the round terminates in bounded time —
+      // only a terminated round advances the baseline into incremental mode.
+      if (this.progressTracker.hasReceivedAnyPages(type)) {
+        const shortfall = this.progressTracker.forceCloseType(type);
+        dump(`[SyncSession] stalled ${type} page ${pageIndex} closed out (${shortfall} failed item(s)); continuing round without transport rotation`);
+        return;
+      }
       dump(`[SyncSession] page ACK stalled after ${retries} retries: type=${type}, pageIndex=${pageIndex}; forcing a new transport/context`);
       // A server-side "entry not found" or a suspended socket can make a
       // locally successful Send() ineffective. Stop feeding the old context
@@ -315,6 +327,7 @@ export default class FastSync extends Plugin {
   get fileDownloadSessions() { return this.syncState.fileDownloadSessions }
   set fileDownloadSessions(v: SyncState["fileDownloadSessions"]) { this.syncState.fileDownloadSessions = v }
   get pendingFileChunks() { return this.syncState.pendingFileChunks }
+  get downloadCooldownPaths() { return this.syncState.downloadCooldownPaths }
 
   // ─── Delegated helpers (keep API surface unchanged) ──────────────────────────
 
