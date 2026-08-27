@@ -247,6 +247,15 @@ export class SyncState {
   progressCheckIntervalId: number | null = null;
   /** 文件下载会话管理 / File download session map */
   fileDownloadSessions = new Map<string, FileDownloadSession>();
+  /**
+   * 早到的二进制下载分片缓冲 / Binary chunks that arrived before their download
+   * session finished registering. The chunk handler looks sessions up by id; the
+   * announcement handler awaits (temp-dir cleanup) before it inserts the id, so
+   * the first chunk can lose that race and be dropped forever. Buffering here
+   * and replaying after registration closes that window.
+   */
+  pendingFileChunks = new Map<string, ArrayBuffer[]>();
+
 
   // ─── Helpers ─────────────────────────────────────────────────────────────────
 

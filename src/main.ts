@@ -314,6 +314,7 @@ export default class FastSync extends Plugin {
   set syncTimer(v: number | null) { this.syncState.syncTimer = v }
   get fileDownloadSessions() { return this.syncState.fileDownloadSessions }
   set fileDownloadSessions(v: SyncState["fileDownloadSessions"]) { this.syncState.fileDownloadSessions = v }
+  get pendingFileChunks() { return this.syncState.pendingFileChunks }
 
   // ─── Delegated helpers (keep API surface unchanged) ──────────────────────────
 

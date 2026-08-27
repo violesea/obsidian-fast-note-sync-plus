@@ -1481,6 +1481,18 @@ export const receiveFileSyncChunkDownload = async function (data: FileSyncChunkD
     plugin.fileDownloadSessions.set(data.sessionId, session)
   }
 
+  // Replay any binary chunks that were buffered while this registration was
+  // still in flight (see handleFileChunkDownload). Registration is complete
+  // now, so each stored frame resolves its session and writes normally.
+  const earlyChunks = plugin.pendingFileChunks.get(data.sessionId)
+  if (earlyChunks && earlyChunks.length > 0) {
+    plugin.pendingFileChunks.delete(data.sessionId)
+    dump(`Replaying ${earlyChunks.length} early chunk(s) for session ${data.sessionId.slice(0, 8)}... (${data.path})`)
+    for (const frame of earlyChunks) {
+      void handleFileChunkDownload(frame, plugin)
+    }
+  }
+
   // 确保临时目录存在 (Ensure temp directory exists)
   // 并发下多个下载会话可能同时 mkdir 同一目录而抛错：catch 后复验是否已存在（并发创建属正常，吞掉）；
   // 真正未创建成功则不在此处兜底，交给首个分片写入时的既有失败路径处理（handleFileChunkDownload 的内存 fallback / failFileDownloadSession）
@@ -1648,16 +1660,29 @@ export const handleFileChunkDownload = async function (buf: ArrayBuffer | Blob, 
 
   const session = plugin.fileDownloadSessions.get(sessionId)
   if (!session) {
-    const message = `File download chunk dropped: session not found (${sessionId}), chunk ${chunkIndex}`
-    dumpError(message)
-    SyncLogManager.getInstance().addOrUpdateLog({
-      id: sessionId,
-      type: 'receive',
-      action: 'FileDownload',
-      status: 'error',
-      progress: 0,
-      message
-    });
+    // The announcement handler (receiveFileSyncChunkDownload) awaits temp-dir
+    // cleanup before it inserts this id into fileDownloadSessions, so the first
+    // binary chunk can arrive first and lose the lookup race. The server sends
+    // each chunk exactly once; dropping it here starves the download forever.
+    // Buffer the raw frame and replay it once the session registers.
+    const pending = plugin.pendingFileChunks.get(sessionId)
+    if (pending && pending.length >= 64) {
+      const message = `File download chunk dropped: pending buffer full for unregistered session (${sessionId}), chunk ${chunkIndex}`
+      dumpError(message)
+      SyncLogManager.getInstance().addOrUpdateLog({
+        id: sessionId,
+        type: 'receive',
+        action: 'FileDownload',
+        status: 'error',
+        progress: 0,
+        message
+      });
+      return
+    }
+    if (!pending) dump(`File download chunk buffered early (session not yet registered): ${sessionId.slice(0, 8)}..., chunk ${chunkIndex}`)
+    const buf = pending ?? []
+    buf.push(binaryData)
+    plugin.pendingFileChunks.set(sessionId, buf)
     return
   }
 
