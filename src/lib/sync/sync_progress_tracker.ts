@@ -75,8 +75,19 @@ export class SyncProgressTracker {
   private stagnationRetries: Map<SyncType, number> = new Map();
   private stagnationGeneration = 0;
 
-  /** Maximum number of timer-driven page ACK retries before transport recovery. */
-  static readonly MAX_STAGNATION_RETRIES = 3;
+  /**
+   * Maximum number of timer-driven page ACK retries before transport recovery.
+   * One retry, not three: a resent page ACK is interpreted by the server as
+   * "client fell behind", rewinding its send window and re-flooding pages the
+   * client already has (observed live 2026-08-27: "received retransmitted ack
+   * for previous page, rewinding window and resending"). Each rewind burst
+   * saturates the JS event loop, protocol pongs stop, and the server kills the
+   * connection at its 75s no-pong deadline before the old 3x15s budget could
+   * rotate gracefully — the reconnect-then-full-rescan loop. One 15s nudge
+   * still covers a genuinely lost ACK; rotation then happens at ~30s, well
+   * inside the server deadline.
+   */
+  static readonly MAX_STAGNATION_RETRIES = 1;
 
   // notify() 节流：整数百分比/阶段未变化时最多每 NOTIFY_THROTTLE_MS 触发一次，
   // 变化时（含阶段切换）立即触发，避免每完成一个文件就刷一次状态栏 + workspace 事件

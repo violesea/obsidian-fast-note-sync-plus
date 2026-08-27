@@ -57,17 +57,20 @@ stalledTracker.setDownloadTotal("note", 1);
 stalledTracker.recordPageProgress("note", 0, 1, false);
 stalledTracker.recordCompleted("note", 0);
 assert.deepEqual(stalledAcks, [0]);
-for (let retry = 0; retry < 3; retry++) {
-  const latestTimer = Array.from(timers.values()).filter((timer) => timer.delay === 15000).at(-1);
-  assert.ok(latestTimer, "each ACK retry should schedule the next stagnation check");
-  latestTimer.callback();
-}
-assert.equal(stalledAcks.length, 4, "initial ACK plus three bounded retries");
+// Contract: a stalled page ACK is nudged at most once, then the
+// transport-recovery callback is raised. A resent ACK makes the server rewind
+// its send window and reflood pages the client already has (2026-08-27 live
+// evidence), so the nudge budget is minimal and rotation happens well inside
+// the server's 75s no-pong deadline.
+const latestTimer = Array.from(timers.values()).filter((timer) => timer.delay === 15000).at(-1);
+assert.ok(latestTimer, "the ACK retry should schedule the next stagnation check");
+latestTimer.callback();
+assert.equal(stalledAcks.length, 2, "initial ACK plus exactly one bounded retry");
 const exhaustedTimer = Array.from(timers.values()).filter((timer) => timer.delay === 15000).at(-1);
 assert.ok(exhaustedTimer, "the exhausted retry should still have a final timer callback");
 exhaustedTimer.callback();
-assert.deepEqual(stalledEvents, [{ type: "note", pageIndex: 0, retries: 3 }]);
-assert.equal(stalledAcks.length, 4, "no ACK is sent after the retry budget is exhausted");
+assert.deepEqual(stalledEvents, [{ type: "note", pageIndex: 0, retries: 1 }]);
+assert.equal(stalledAcks.length, 2, "no ACK is sent after the retry budget is exhausted");
 
 // Contract: an incomplete round never emits a 100% progress signal.
 const incompleteTracker = new SyncProgressTracker();
