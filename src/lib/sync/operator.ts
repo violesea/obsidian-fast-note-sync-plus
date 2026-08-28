@@ -35,6 +35,7 @@ import {
 } from "./change_feed_health";
 import { isBackgroundActivityClosedError, requireForeground } from "./background_activity_gate";
 import { isChangeFeedRuntimeEnabled, isCloudPreviewRuntimeEnabled } from "./sync_feature_policy";
+import { appendScanDelta, loadScanDelta, clearScanDelta } from "./scan_delta";
 
 // C9: 离线超墓碑期保护 — 默认与服务端 soft-delete-retention-time 默认值对应（90 天），
 // 先硬编码常量；服务端墓碑物理清除窗口过后，长期离线设备重连若检测到"本地有服务端无"的
@@ -1032,6 +1033,8 @@ async function receiveSyncEndWrapper(data: unknown, plugin: FastSync, type: "not
     commitScannedHashes(plugin.scannedNoteHashes, (entries) => plugin.fileHashManager.bulkSetFromScanned(entries));
     // 同步结束，强制落盘本轮防抖累积的哈希写入
     plugin.fileHashManager.flush();
+    // 落盘成功后清理断点续扫增量（未被杀的轮次不需要它）
+    void clearScanDelta(plugin);
   } else if (type === "file") {
     plugin.fileHashManager.removeFileHashes(plugin.pendingDeleteFilePaths)
     plugin.pendingDeleteFilePaths.clear()
@@ -1044,6 +1047,8 @@ async function receiveSyncEndWrapper(data: unknown, plugin: FastSync, type: "not
     commitScannedHashes(plugin.scannedFileHashes, (entries) => plugin.fileHashManager.bulkSetFromScanned(entries));
     // 同步结束，强制落盘本轮防抖累积的哈希写入
     plugin.fileHashManager.flush();
+    // 落盘成功后清理断点续扫增量（未被杀的轮次不需要它）
+    void clearScanDelta(plugin);
   } else if (type === "folder") {
     plugin.folderSnapshotManager.removeFolders(plugin.pendingDeleteFolderPaths);
     plugin.pendingDeleteFolderPaths.clear()
@@ -1492,12 +1497,26 @@ export const handleSync = async function (
         // here serializes the complete vault every checkpoint and can make the
         // mobile renderer appear hung.  The final scan commit below performs
         // the single durable flush for this prepared sync snapshot.
-        commitScannedHashes(plugin.scannedNoteHashes, (entries) => plugin.fileHashManager.bulkSetFromScanned(entries, false));
-        commitScannedHashes(plugin.scannedFileHashes, (entries) => plugin.fileHashManager.bulkSetFromScanned(entries, false));
+        // The JSONL delta append keeps the just-computed hashes survivable
+        // across a mid-scan process kill without paying the full-map flush.
+        commitScannedHashes(plugin.scannedNoteHashes, (entries) => {
+          plugin.fileHashManager.bulkSetFromScanned(entries, false);
+          void appendScanDelta(plugin, "note", entries);
+        });
+        commitScannedHashes(plugin.scannedFileHashes, (entries) => {
+          plugin.fileHashManager.bulkSetFromScanned(entries, false);
+          void appendScanDelta(plugin, "file", entries);
+        });
       };
 
       let lastScanCheckpointProcessed = 0;
       let lastScanCheckpointAt = Date.now();
+
+      // 断点续扫：预载上次被杀扫描已算出的哈希（作为内存缓存候选，经 fingerprint
+      // 校验生效），本轮跳过这些文件的内容重算——重载后从断点继续而非从零。
+      // Resume: preload hashes persisted by the previous killed scan so this
+      // walk skips re-hashing them and continues from where it died.
+      await loadScanDelta(plugin);
 
       for (const file of list) {
         await requireForeground(plugin);
