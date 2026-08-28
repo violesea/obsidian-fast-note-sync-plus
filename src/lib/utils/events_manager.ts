@@ -309,8 +309,20 @@ export class EventManager {
     if (!path) return
 
     if (this.plugin.settings.manualSyncEnabled || this.plugin.settings.readonlySyncEnabled) return
-    // 路径安全性校验
-    if (!isPathInConfigSyncDirs(path, this.plugin)) return
+
+    // 正文通道桥接：外部（shell/agent/cron）写入的 vault 内容不经过 Obsidian 的
+    // modify 事件，增量模式因此永远看不见它们——服务端长期欠账（2026-08-28 实证：
+    // dasikou/wx 流水线整夜产出零上传）。raw 是 Obsidian 桌面端的文件系统级事件流，
+    // 外部写入同样触发；把非 config 路径喂进 note/file 的正常变更路径。
+    // Vault-content bridge: writes made outside Obsidian never fire vault 'modify'
+    // events, so incremental sync never sees them and the server accumulates a
+    // content debt (verified 2026-08-28: overnight pipeline output, zero uploads).
+    // 'raw' is the desktop filesystem-level event stream and fires for external
+    // writes too; feed non-config paths into the regular note/file change path.
+    if (!isPathInConfigSyncDirs(path, this.plugin)) {
+      this.bridgeExternalVaultWrite(normalizePath(path))
+      return
+    }
 
     if (!this.plugin.settings.configSyncEnabled || configIsPathExcluded(path, this.plugin)) return
     const normalizedPath = normalizePath(path)
@@ -329,6 +341,49 @@ export class EventManager {
         }
       },
       300,
+    )
+  }
+
+  /**
+   * 外部写入桥接（正文通道）/ Bridge one externally-written vault path into sync.
+   *
+   * 安全边界：
+   * - 回声抑制：插件自身物化下载的写入在 ignoredFiles 中，跳过（否则下载→raw→重传
+   *   循环）；延迟到期后二次复查。
+   * - 存在性校验：只处理 Obsidian 已索引为 TFile 的路径——未索引（点文件/临时文件/
+   *   已删除/纯文件夹）一律跳过。这同时保证**绝不把外部删除传播为删除**（F-3 红线：
+   *   本地缺失不构成删除依据），.DS_Store 与流水线点标记天然被过滤。
+   * - 延迟 500ms 让写入方写完并给 Obsidian 索引留时间，缓解撕裂读；到时仍未索引则
+   *   放弃本条（下轮 reconcile 兜底）。
+   * - 重命名窗口跳过：与 watchModify 相同的 pendingRenamePaths 语义。
+   *
+   * Safety: echo-suppressed via ignoredFiles (re-checked at flush); only paths
+   * indexed as TFile are bridged (dotfiles/temp/missing/folders skipped — this
+   * also guarantees external deletions are never propagated); 500ms delay avoids
+   * torn reads; rename windows are skipped like watchModify.
+   */
+  private bridgeExternalVaultWrite = (normalizedPath: string) => {
+    if (this.plugin.ignoredFiles.has(normalizedPath)) return
+    if (isPathExcluded(normalizedPath, this.plugin)) return
+
+    this.runWithDelay(
+      normalizedPath,
+      () => {
+        if (this.plugin.ignoredFiles.has(normalizedPath)) return
+        if (this.pendingRenamePaths.has(normalizedPath)) return
+        const file = this.plugin.app.vault.getAbstractFileByPath(normalizedPath)
+        if (!(file instanceof TFile)) {
+          dump(`[ExternalWriteBridge] raw path not indexed as file, skipping: ${normalizedPath}`)
+          return
+        }
+        dump(`[ExternalWriteBridge] bridging external write into sync: ${normalizedPath}`)
+        if (normalizedPath.endsWith(".md")) {
+          void noteModify(file, this.plugin, true)
+        } else {
+          void fileModify(file, this.plugin, true)
+        }
+      },
+      500,
     )
   }
 
