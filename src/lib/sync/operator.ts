@@ -2658,6 +2658,7 @@ async function waitForSyncTypeDrain(
   plugin: FastSync,
   type: "folder" | "note" | "file" | "config",
   context: string | undefined,
+  upstreamItems = 0,
 ): Promise<void> {
   const trackerType: SyncType = type === "config" ? "setting" : type;
   const endFlag = type === "folder" ? "folderSyncEnd"
@@ -2689,8 +2690,16 @@ async function waitForSyncTypeDrain(
     }
     const activityAt = plugin.progressTracker.lastProgressActivityAt;
     if (activityAt > lastActivityAt) lastActivityAt = activityAt;
+    // 基线须覆盖两侧规模：下行已收页任务 + 本类型上行 announce 批量
+    // （服务端逐类串行入库，本类型的 SyncEnd 可能早到而下行页远未排到；
+    //  只按下行规模算会让 note 类在服务端仍在消化 folder/note 入库时被 300s 误杀）
+    // The baseline must cover both sides: downstream pages received so far AND
+    // this type's own upstream announce size (the server ingests types
+    // serially, so a type's SyncEnd can arrive long before its downstream
+    // pages are queued; sizing by downstream alone let the 300s floor kill
+    // the note barrier mid-ingestion).
     const receivedTotal = plugin.progressTracker.getReceivedTaskTotal(trackerType);
-    const baselineMs = Math.max(300000, receivedTotal * 20);
+    const baselineMs = Math.max(300000, Math.max(receivedTotal, upstreamItems) * 20);
     const stalledFor = Date.now() - lastActivityAt;
     if (Date.now() - startedAt > baselineMs && stalledFor > STALLED_TIMEOUT_MS) {
       throw new Error(`[SyncBarrier] ${type} did not drain within ${Math.round(baselineMs / 1000)}s and stalled ${Math.round(stalledFor / 1000)}s without progress`);
@@ -2756,7 +2765,7 @@ export const handleRequestSend = async function (plugin: FastSync, syncMode: Syn
         ...(missingChunk.length > 0 ? { missingFolders: missingChunk } : {}),
       }),
     );
-    await waitForSyncTypeDrain(plugin, "folder", folderData.context);
+    await waitForSyncTypeDrain(plugin, "folder", folderData.context, folderData.folders.length + folderData.delFolders.length + folderData.missingFolders.length);
     // FolderSyncEnd plus drained folder pages is the first point at which the
     // local folder baseline can safely be advanced.
     plugin.folderSnapshotManager.setFolderMtimes(folderData.folders.map((folder) => folder.path), Date.now());
@@ -2781,6 +2790,16 @@ export const handleRequestSend = async function (plugin: FastSync, syncMode: Syn
       })
     ));
 
+    // ISSUE-039/2.5.20：note 上行批发出队后，必须等本类型下行页全部到齐并排空。
+    // 服务端逐类串行入库，SyncEnd 可能早到而页远未排到；drain 超时按上行批量规模
+    // 计算，健康串行不会误杀。
+    // ISSUE-039/2.5.20: after the note batch send completes, wait for this
+    // type's downstream pages to arrive and drain. The server ingests serially
+    // and its SyncEnd can arrive long before the pages are queued; the drain
+    // timeout scales with the upstream batch size so healthy seriality is
+    // never misjudged as a stall.
+    await waitForSyncTypeDrain(plugin, "note", noteData.context, noteData.notes.length + noteData.delNotes.length + noteData.missingNotes.length);
+
     // 云预览模式且未开启类型限制时跳过 FileSync
     // Skip FileSync when cloud-preview is on without type restriction
     if (!isCloudPreviewRuntimeEnabled(plugin.settings) || plugin.settings.cloudPreviewTypeRestricted) {
@@ -2803,6 +2822,10 @@ export const handleRequestSend = async function (plugin: FastSync, syncMode: Syn
           ...(missingChunk.length > 0 ? { missingFiles: missingChunk } : {}),
         })
       ));
+
+    // 同 note：文件类型下行页排空屏障（规模含本类型上行批量）
+    // Same as note: drain barrier for the file type's downstream pages.
+    await waitForSyncTypeDrain(plugin, "file", fileData.context, fileData.files.length + fileData.delFiles.length + fileData.missingFiles.length);
     }
   }
 
