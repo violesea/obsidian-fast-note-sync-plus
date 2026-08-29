@@ -2241,7 +2241,7 @@ export const handleSync = async function (
   } catch (error) {
     if (isBackgroundActivityClosedError(error)) {
       finishPendingHashLog(context, "cancelled", "⏹ 插件退出，哈希扫描已取消");
-      dump("Sync abandoned because the plugin is unloading");
+      dump("[RoundExit] abandoned mid-round: backgroundActivityClosed (silent-exit fingerprint, was at phase=" + plugin.syncState.syncPhase + ", needsFull=" + plugin.incrementalScanManager?.state?.needsFullReconcile + ")");
       return;
     }
     dump("Sync failed with error: " + (error instanceof Error ? error.message : String(error)));
