@@ -821,7 +821,17 @@ export function checkSyncCompletion(plugin: FastSync, intervalId?: number, syncS
     // 每次同步结束，均核实并更新一次状态栏冲突角标
     plugin.statusBarManager.updateConflictBadge();
 
-    if (plugin.expectedSyncCount > 0 && !plugin.localStorageManager.getMetadata("isInitSync")) {
+    // ISSUE-039 完成门禁：任何 failed 项都阻断"成功"语义——`isInitSync` 与
+    // `lastSyncSuccessTime` 只在零失败轮次推进。带失败的轮次仍然结束（2.5.15 的
+    // 有界终止不变、失败清单照常展示），但基线/时间戳不得前进：失败项在下一轮
+    // 重新协商，直到真实成功才授权增量模式的时间戳依据。
+    // ISSUE-039 completion gate: any failed item blocks the "success" semantic —
+    // isInitSync and lastSyncSuccessTime advance only on zero-failure rounds.
+    // Failed rounds still terminate (bounded termination from 2.5.15 stands,
+    // failure list still surfaced), but baselines/timestamps do not move: the
+    // failed items renegotiate next round until a genuinely clean round
+    // authorizes them.
+    if (totalFailed === 0 && plugin.expectedSyncCount > 0 && !plugin.localStorageManager.getMetadata("isInitSync")) {
       plugin.localStorageManager.setMetadata("isInitSync", true);
     }
 
@@ -833,7 +843,7 @@ export function checkSyncCompletion(plugin: FastSync, intervalId?: number, syncS
     // was intercepted by the offline guard this round (user clicked "Cancel"), that batch of
     // risky files was never actually handled — refreshing the timestamp would zero out the
     // offline duration and silently defeat the guard on the very next round.
-    if (!offlineGuardSkippedThisRound) {
+    if (!offlineGuardSkippedThisRound && totalFailed === 0) {
       plugin.localStorageManager.setMetadata("lastSyncSuccessTime", Date.now());
     }
 

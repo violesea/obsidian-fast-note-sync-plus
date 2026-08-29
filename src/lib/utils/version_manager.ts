@@ -116,17 +116,15 @@ export class VersionManager {
         if (typeof data.syncDownChunkNum === 'number') {
             plugin.syncState.syncDownChunkNum = data.syncDownChunkNum;
         }
-        // 兜底路径（设计稿 §5.1/S1）：ClientInfo 响应同样携带窗口参数，供旧握手流程或后台改配置后
-        // 广播时幂等覆盖；pv2 连接下 auth 协商块已经写过一次，这里再次覆盖为同一值，无副作用。
-        // Fallback path: ClientInfo response also carries window params for idempotent overwrite by
-        // the legacy handshake flow or an admin-side config broadcast; on pv2 connections this simply
-        // re-applies the same value already written from the auth negotiation block.
-        if (typeof data.pipelineWindowUp === 'number') {
-            plugin.syncState.pipelineWindowUp = data.pipelineWindowUp;
-        }
-        if (typeof data.pipelineWindowDown === 'number') {
-            plugin.syncState.pipelineWindowDown = data.pipelineWindowDown;
-        }
+        // 兜底路径（设计稿 §5.1/S1）：ClientInfo 响应同样携带窗口参数。ISSUE-039：
+        // 窗口流水线实验一律不采纳——无论此处收到什么值，上下行窗口固定 0
+        // （stop-and-wait），与 auth 协商块的处理保持同一立场（第三道保险）。
+        // Fallback path: the ClientInfo response also carries window params.
+        // ISSUE-039: never adopt the window-pipeline experiment — pin both
+        // windows to 0 (stop-and-wait) no matter what arrives here, matching
+        // the auth-block stance (third belt).
+        plugin.syncState.pipelineWindowUp = 0;
+        plugin.syncState.pipelineWindowDown = 0;
 
         // 针对服务端版本 (For server version)
         const serverCurrent = (plugin.localStorageManager.getMetadata("serverVersion") as string) || "";

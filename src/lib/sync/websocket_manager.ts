@@ -144,10 +144,11 @@ export class WebSocketManager {
         // Always include protocol=protobuf regardless of settings
         // 无论设置如何，始终包含 protocol=protobuf 参数
         const useProtoParam = "&protocol=protobuf";
-        // pv=2：声明客户端支持 v2 握手协商（auth 响应携带协商块、窗口流水线、pb 提前升级）
-        // pb=1/0：客户端本地 protobufEnabled 设置，供服务端判定是否提前升级 pb（设计稿 §2.2）
-        const isProtobufEnabled = this.plugin.settings.protobufEnabled !== false;
-        const negotiationParams = "&pv=2&pb=" + (isProtobufEnabled ? "1" : "0");
+        // ISSUE-039：不发送 pv=2/pb 实验协商参数。服务端对 pv<2 连接固定窗口 0
+        // （stop-and-wait），这是双保险的保险一；保险二在 auth 协商块采纳处强制 0。
+        // ISSUE-039: never send the pv=2/pb experimental handshake. The server
+        // pins window 0 (stop-and-wait) for pv<2 connections — first belt;
+        // the auth-block adoption below pins 0 as the suspenders.
         return addRandomParam(
           this.plugin.runWsApi +
           "/api/user/sync?lang=" +
@@ -160,8 +161,7 @@ export class WebSocketManager {
           clientName +
           "&clientVersion=" +
           clientVersion +
-          useProtoParam +
-          negotiationParams
+          useProtoParam
         );
       },
       preConnectProbe: async () => {
@@ -462,14 +462,15 @@ export class WebSocketManager {
             this.plugin.syncState.syncDownChunkNum = nego.syncDownChunkNum;
             negotiated = true;
           }
-          if (typeof nego.pipelineWindowUp === "number") {
-            this.plugin.syncState.pipelineWindowUp = nego.pipelineWindowUp;
-            negotiated = true;
-          }
-          if (typeof nego.pipelineWindowDown === "number") {
-            this.plugin.syncState.pipelineWindowDown = nego.pipelineWindowDown;
-            negotiated = true;
-          }
+          // ISSUE-039：窗口流水线实验参数一律不采纳——无论服务端协商块给什么值，
+          // 上下行窗口固定 0（stop-and-wait）。这是移除 pv=2 握手之外的第二道保险，
+          // 覆盖服务端仍主动下发窗口的旧/新版本。
+          // ISSUE-039: never adopt the window-pipeline experiment — pin both
+          // windows to 0 (stop-and-wait) regardless of what the server offers.
+          // Second belt beside dropping pv=2, covering servers that still send
+          // the negotiation block.
+          this.plugin.syncState.pipelineWindowUp = 0;
+          this.plugin.syncState.pipelineWindowDown = 0;
           this.plugin.syncState.negotiated = negotiated;
           // protobufAck===true：服务端已在 auth 响应后提前 setUseProtobuf，本连接后续下行帧即为 pb，
           // 客户端同步跟进，无需再等 ClientInfo 响应触发升级（websocket_client.ts:259 该触发仍保留作旧服务端路径）
@@ -485,7 +486,13 @@ export class WebSocketManager {
         const connectionId = this.client.connectionId;
         this.startKeepAlive();
         this.sendClientInfo();
-        this.plugin.flushSyncPageAcks();
+        // ISSUE-039：认证后不得把旧连接积累的页 ACK flush 进新 socket——新连接上
+        // 服务端尚未创建对应页/下载条目，这些 ACK 只会触发 "entry not found" 告警
+        // 与窗口回卷。outbox 由 beginContext/clearSyncContext 管理生命周期。
+        // ISSUE-039: never flush page ACKs accumulated on the old connection
+        // into the fresh socket — the server has not created those pages/entries
+        // here, so these ACKs only produce "entry not found" churn and window
+        // rewinds. Outbox lifecycle belongs to beginContext/clearSyncContext.
         void this.StartHandle(connectionId);
       }
       return;

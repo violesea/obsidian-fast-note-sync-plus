@@ -2031,23 +2031,59 @@ const handleFileChunkDownloadComplete = async function (session: FileDownloadSes
           if (!(await waitForFileActivity(plugin))) return
           await plugin.app.vault.createBinary(normalizedPath, completeFile.buffer, { ...(session.ctime > 0 && { ctime: session.ctime }), ...(session.mtime > 0 && { mtime: session.mtime }) })
         }
+        // ISSUE-039 写盘读回校验：binary 写入返回不代表字节已完好落盘。读回 stat
+        // 比对 size，不一致按失败处理——此时 lastFileSyncTime 尚未推进（它在读回
+        // 通过后才设置），失败态保留、下轮可重试。
+        // ISSUE-039 read-back check: a completed binary write does not prove the
+        // bytes landed intact. Stat the file back and compare size; a mismatch
+        // fails the session before lastFileSyncTime ever advances, leaving the
+        // failure state retryable next round.
+        const writtenFile = plugin.app.vault.getFileByPath(normalizedPath)
+        if (!(writtenFile && writtenFile.stat.size === session.size)) {
+          throw new Error(`Read-back size mismatch after write: expected ${session.size}, got ${writtenFile?.stat.size ?? "missing"}`)
+        }
       } finally {
         window.setTimeout(() => {
           plugin.removeIgnoredFile(normalizedPath)
         }, 500);
       }
 
+      // ISSUE-039：lastFileSyncTime 只在写盘读回通过后推进（原实现在此前推进，
+      // 属"收到元数据即推进时间戳"的假完成路径）。
+      // ISSUE-039: lastFileSyncTime advances only after the read-back check —
+      // the old code advanced it beforehand (the "metadata received = timestamp
+      // advanced" false-completion path).
       if (Number(plugin.localStorageManager.getMetadata("lastFileSyncTime")) < session.lastTime) {
         plugin.localStorageManager.setMetadata("lastFileSyncTime", session.lastTime)
       }
 
-      // 下载完成后自动计算哈希并更新缓存 (如果服务器传了内容哈希就直接使用，否则重新计算以兼容旧版本)
-      let contentHash = session.contentHash
-      if (!contentHash) {
-        contentHash = await hashArrayBuffer(completeFile.buffer)
+      // ISSUE-039 完整性门禁：本地字节是唯一事实。组装后按本地字节计算哈希与
+      // 服务端声明比对——不一致即失败（保留失败状态，不更新基线/时间戳/完成数），
+      // 杜绝"信任服务端 hash 而写入了残缺字节"的假完成。本地算出的哈希照样入库，
+      // 因为它证明的就是实际落盘的字节。
+      // ISSUE-039 integrity gate: local bytes are the single source of truth.
+      // Hash the assembled buffer locally and compare with the server-declared
+      // hash — a mismatch fails the session (failure state retained; baseline/
+      // timestamp/completion untouched), closing the "trust server hash while
+      // truncated bytes hit disk" false completion. The locally computed hash
+      // is still recorded because it describes the bytes actually on disk.
+      let contentHash = await hashArrayBuffer(completeFile.buffer)
+      if (session.contentHash && String(session.contentHash) !== String(contentHash)) {
+        dumpError(`Download hash mismatch (assembled bytes vs server declaration): ${session.path} local=${contentHash} server=${session.contentHash}`)
+        SyncLogManager.getInstance().addOrUpdateLog({
+          id: session.sessionId,
+          type: 'receive',
+          action: 'FileDownload',
+          path: session.path,
+          status: 'error',
+          progress: 100,
+          message: `Hash mismatch after assembly: local ${contentHash}, server ${session.contentHash}`
+        });
+        await failFileDownloadSession(plugin, session, `Hash mismatch after assembly: local ${contentHash}, server ${session.contentHash}`, false)
+        return
+      }
+      if (!session.contentHash) {
         dump(`Download complete: server missing hash, local calculated: ${session.path}`, contentHash)
-      } else {
-        dump(`Download complete: using server provided hash: ${session.path}`, contentHash)
       }
       plugin.fileHashManager.setFileHash(session.path, contentHash, session.mtime, session.size)
       // 记录同步后的 mtime
