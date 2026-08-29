@@ -107,4 +107,20 @@ assert.ok(
   assert.ok(tsPos > gatePos, "lastFileSyncTime advance must sit after the read-back gate, not before");
 }
 
+// 7. Mid-scan full-map flush must be gated (2.5.19): both flush paths check
+//    the scanning phase and defer to the scanDelta JSONL instead.
+const hashManagerSource = fs.readFileSync(path.join(root, "src", "lib", "storage", "file_hash_manager.ts"), "utf8");
+assert.ok(
+  (hashManagerSource.match(/syncPhase === "scanning"/g) || []).length >= 2,
+  "flush() and flushAsync() must both gate full-map persistence during scans",
+);
+assert.ok(
+  hashManagerSource.includes("appendScanDelta"),
+  "cold-build checkpoints must persist via scanDelta JSONL appends, not full-map serialization",
+);
+assert.ok(
+  !/if \(hashMapChangedSinceCheckpoint\) \{\s*\n\s*this\.saveHashMapToStorage\(\);/.test(hashManagerSource),
+  "cold-build checkpoint must not call saveHashMapToStorage (full-map serialization) anymore",
+);
+
 console.log("issue039-stop-and-wait: all contracts hold");

@@ -57,10 +57,23 @@ export const loadScanDelta = async (plugin: FastSync): Promise<number> => {
         loaded++;
       } catch { /* 跳过损坏行 */ }
     }
-    // 仅作内存缓存候选：使用时仍经 fingerprint（mtime/size/ctime）校验，过期即 miss
-    if (noteEntries.size) plugin.fileHashManager.bulkSetFromScanned(noteEntries, false);
-    if (fileEntries.size) plugin.fileHashManager.bulkSetFromScanned(fileEntries, false);
-    if (loaded > 0) dump(`[ScanDelta] resumed ${loaded} hashed entr${loaded === 1 ? "y" : "ies"} from an interrupted scan`);
+    if (loaded === 0) return 0;
+    // 预载目标：优先用调用方注入的 direct applier（冷建场景的调用者就是
+    // FileHashManager 自身，plugin.fileHashManager 回调会指回 stub 而非被测对象）；
+    // 无注入时回退到 plugin.fileHashManager（operator 扫描路径）。
+    // Preload target: prefer a caller-injected direct applier (in the cold build
+    // the caller IS the FileHashManager, so plugin.fileHashManager would point
+    // elsewhere); fall back to plugin.fileHashManager for the operator scan.
+    const applierContainer = plugin as FastSync & {
+      __applyScanDelta?: (noteEntries: Map<string, ScanDeltaEntry>, fileEntries: Map<string, ScanDeltaEntry>) => void;
+    };
+    if (typeof applierContainer.__applyScanDelta === "function") {
+      applierContainer.__applyScanDelta(noteEntries, fileEntries);
+    } else if (plugin.fileHashManager) {
+      if (noteEntries.size) plugin.fileHashManager.bulkSetFromScanned(noteEntries, false);
+      if (fileEntries.size) plugin.fileHashManager.bulkSetFromScanned(fileEntries, false);
+    }
+    dump(`[ScanDelta] resumed ${loaded} hashed entr${loaded === 1 ? "y" : "ies"} from an interrupted scan`);
     return loaded;
   } catch {
     return 0;

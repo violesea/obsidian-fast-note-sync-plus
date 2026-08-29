@@ -43,6 +43,19 @@ class FakeMirror {
   }
 }
 
+// 真实 scan_delta 模块（transpile 自源码），append/load/clear 均指向共享 scanDeltaStore；
+// plugin 参数由被测对象在调用时传入（fileHashManager 方法在真实对象上，delta 直接写 store）
+const realScanDelta = (() => {
+  const mod = { exports: {} };
+  const s = fs.readFileSync(path.join(root, "src", "lib", "sync", "scan_delta.ts"), "utf8");
+  const out = ts.transpileModule(s, { compilerOptions: { module: ts.ModuleKind.CommonJS, target: ts.ScriptTarget.ES2020, esModuleInterop: true }, fileName: "scan_delta.ts" }).outputText;
+  vm.runInNewContext(out, {
+    require: (id) => id === "obsidian" ? { normalizePath: (v) => v } : { getPluginDir: () => ".obsidian/plugins/fast-note-sync", dump: (...a) => console.error("[delta-dump]", String(a[0]).slice(0,110), a[1] && a[1].message ? a[1].message : "") },
+    module: mod, exports: mod.exports, console,
+  }, { filename: "scan_delta.ts" });
+  return mod.exports;
+})();
+
 function makeModule() {
   const module = { exports: {} };
   vm.runInNewContext(transpiled, {
@@ -68,6 +81,11 @@ function makeModule() {
           requireForeground: async () => undefined,
           waitForForeground: async () => true,
         };
+      }
+      if (id === "../sync/scan_delta") {
+        // 转发到真实 scan_delta（共享 scanDeltaStore）：冷建检查点写入 delta 的
+        // 行为必须真实生效，重启断言才有意义——吞掉写入会让"从断点恢复"变空谈。
+        return realScanDelta;
       }
       throw new Error("Unexpected require: " + id);
     },
@@ -96,11 +114,15 @@ const mirroredFiles = new Map();
 let hashCalls = 0;
 let shouldInterrupt = true;
 let hashMapSaveCalls = 0;
+// scanDelta JSONL 的内存替身（2.5.19 起冷建检查点写入这里而非全图 localStorage）
+const scanDeltaStore = new Map();
+let scanDeltaPreloaded = 0;
 
 function makePlugin() {
   return {
     manifest: { id: "fast-note-sync" },
     __mirroredFiles: mirroredFiles,
+    fileHashManager: { bulkSetFromScanned: (entries) => { scanDeltaPreloaded += entries.size; } },
     app: {
       vault: {
         configDir: ".obsidian",
@@ -109,6 +131,15 @@ function makePlugin() {
         read: async (file) => {
           hashCalls += 1;
           return contentByPath.get(file.path);
+        },
+        // 2.5.19：冷建检查点把新增哈希追加到 scanDelta JSONL（vault 外持久化），
+        // 取代原先的全图 localStorage 写。测试镜像该行为：追加到内存 store，
+        // 重启场景由下一个 makePlugin 共享同一 store 断言"从断点恢复"。
+        adapter: {
+          exists: async (p) => scanDeltaStore.has(p),
+          read: async (p) => scanDeltaStore.get(p) ?? "",
+          append: async (p, data) => { scanDeltaStore.set(p, (scanDeltaStore.get(p) ?? "") + data); },
+          remove: async (p) => { scanDeltaStore.delete(p); },
         },
       },
       loadLocalStorage: (key) => localStorage.get(key) ?? null,
@@ -152,6 +183,9 @@ vm.runInNewContext(interruptedSource, {
         requireForeground: async () => undefined,
         waitForForeground: async () => true,
       };
+    }
+    if (id === "../sync/scan_delta") {
+      return realScanDelta;
     }
     throw new Error("Unexpected require: " + id);
   },

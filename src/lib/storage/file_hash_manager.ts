@@ -1,6 +1,7 @@
 import { hashContentAsync, dump, isPathExcluded, showSyncNotice, isLargeBinarySyncRisk, describeBinarySyncLimit, logMemorySnapshot, hashFileAsync, debounce, LocalStateFileMirror } from "../utils/helpers";
 import type FastSync from "../../main";
 import { isBackgroundActivityClosedError, requireForeground, waitForForeground } from "../sync/background_activity_gate";
+import { appendScanDelta, loadScanDelta, clearScanDelta, type ScanDeltaEntry } from "../sync/scan_delta";
 
 
 /**
@@ -103,6 +104,25 @@ export class FileHashManager {
    */
   flush(): void {
     if (this.plugin.backgroundActivityGate?.isBackgrounded || this.plugin.backgroundActivityGate?.isClosed) return;
+    // ISSUE-039/2.5.19：扫描进行中禁止全图落盘。saveHashMapToStorage 会把整个
+    // 7 万+ 条目的 Map JSON.stringify 成 ~19MB 字符串并写 localStorage + 镜像
+    // 文件——扫描检查点每 2 秒触发一次合流的 debounce，这就是移动端"哈希越算越
+    // 慢"（序列化成本随 Map 线性增长）与内存尖峰（推高 iOS 杀 WebView 概率）的
+    // 直接来源。扫描期间新增哈希由 scanDelta JSONL 增量持久化兜底；脏标记保留，
+    // 扫描结束后的最终 flush（SyncEnd 处理器）一次性落盘。
+    // ISSUE-039/2.5.19: no full-map flush mid-scan. saveHashMapToStorage
+    // stringifies the entire 70k-entry map (~19 MB) into localStorage plus a
+    // mirror file; scan checkpoints coalesce a debounced flush every ~2 s,
+    // which is exactly why hashing slows down as it goes (serialization cost
+    // grows with the map) and why memory spikes push iOS into killing the
+    // WebView. During a scan the scanDelta JSONL carries durability
+    // incrementally; dirty flags stay set and the final flush (SyncEnd
+    // handler) persists everything once the scan completes.
+    if (this.plugin.syncState?.isSyncing && this.plugin.syncState?.syncPhase === "scanning") {
+      this.hashMapDirty = true;
+      this.syncHashMapDirty = true;
+      return;
+    }
     if (this.hashMapDirty) {
       this.hashMapDirty = false;
       this.saveHashMapToStorage();
@@ -119,6 +139,13 @@ export class FileHashManager {
 
   async flushAsync(): Promise<void> {
     if (!(await waitForForeground(this.plugin))) return;
+    // ISSUE-039/2.5.19：与 flush() 相同的扫描期全图落盘闸（见 flush() 注释）。
+    // Same mid-scan full-map gate as flush() (see comment there).
+    if (this.plugin.syncState?.isSyncing && this.plugin.syncState?.syncPhase === "scanning") {
+      this.hashMapDirty = true;
+      this.syncHashMapDirty = true;
+      return;
+    }
     if (this.hashMapDirty) {
       this.hashMapDirty = false;
       this.saveHashMapToStorage();
@@ -329,6 +356,28 @@ export class FileHashManager {
       };
       this.saveBuildState();
 
+      // ISSUE-039/2.5.19：恢复冷建时先预载上次中断期间追加到 scanDelta 的哈希
+      // （内存缓存候选，循环内经 matchesFingerprint 校验命中即 cacheHit，跳过
+      // 重哈希）。这是"检查点只增量、不写全图"方案的另一半：写侧在 saveCheckpoint，
+      // 读侧在这里。全图落盘只在冷建完成时发生，随后 delta 被清理。
+      // ISSUE-039/2.5.19: resume of an interrupted cold build preloads hashes
+      // appended to the scanDelta JSONL (in-memory candidates; the loop's
+      // matchesFingerprint turns them into cache hits and skips rehashing).
+      // This is the read side of the delta-only checkpoint scheme; the write
+      // side lives in saveCheckpoint. The full map is persisted once at cold
+      // build completion, after which the delta is cleared.
+      // 预载目标是自己（this）：冷建场景的调用者就是 FileHashManager 本身，
+      // 走 plugin.fileHashManager 会指回别处（测试 stub / 运行时其他实例）。
+      // The preload target is THIS manager; plugin.fileHashManager would route
+      // elsewhere (test stubs / another instance at runtime).
+      const withApplier = this.plugin as FastSync & { __applyScanDelta?: (n: Map<string, ScanDeltaEntry>, f: Map<string, ScanDeltaEntry>) => void };
+      withApplier.__applyScanDelta = (n, f) => {
+        if (n.size) this.bulkSetFromScanned(n, false);
+        if (f.size) this.bulkSetFromScanned(f, false);
+      };
+      await loadScanDelta(this.plugin);
+      delete withApplier.__applyScanDelta;
+
       dump(`FileHashManager: 开始遍历 ${totalFiles} 个文件`);
 
       // --- PERF: bounded concurrency for cold-build read+hash ---
@@ -345,6 +394,9 @@ export class FileHashManager {
       };
 
       let hashMapChangedSinceCheckpoint = false;
+      // ISSUE-039/2.5.19：本检查点窗口内新算出的哈希，供增量追加到 scanDelta
+      // （替代每 10 秒全图序列化）。冷建结束时由调用侧的最终 flush 覆盖落盘。
+      const pendingCheckpointEntries = new Map<string, ScanDeltaEntry>();
       let lastCheckpointProcessed = 0;
       let lastCheckpointAt = Date.now();
       const saveCheckpoint = async (): Promise<void> => {
@@ -354,8 +406,16 @@ export class FileHashManager {
         }
         // The local hash cache is safe to checkpoint. The server baseline is
         // deliberately not touched until an actual sync/ACK completes.
+        // ISSUE-039/2.5.19：冷建中途检查点不再全图序列化（Object.fromEntries +
+        // JSON.stringify 整个 7 万+ 条目的 Map 每 10 秒一次，是移动端"哈希越算越
+        // 慢"与内存尖峰推高 WebView 被杀概率的直接来源）。改为把本检查点新增的
+        // 哈希以 O(批次) 追加到 scanDelta JSONL（与 2.5.17 断点续扫共用载体）；
+        // 全图落盘只在冷建完成时发生一次。IO 失败静默——最坏退回重启重扫。
         if (hashMapChangedSinceCheckpoint) {
-          this.saveHashMapToStorage();
+          if (pendingCheckpointEntries.size > 0) {
+            await appendScanDelta(this.plugin, "note", pendingCheckpointEntries);
+            pendingCheckpointEntries.clear();
+          }
           hashMapChangedSinceCheckpoint = false;
         }
         this.buildState = {
@@ -428,6 +488,12 @@ export class FileHashManager {
               size: file.stat.size,
               ...(typeof file.stat.ctime === "number" ? { ctime: file.stat.ctime } : {}),
             });
+            pendingCheckpointEntries.set(file.path, {
+              hash: contentHash,
+              mtime: file.stat.mtime,
+              size: file.stat.size,
+              ...(typeof file.stat.ctime === "number" ? { ctime: file.stat.ctime } : {}),
+            });
             hashMapChangedSinceCheckpoint = true;
           } catch (error) {
             if (isBackgroundActivityClosedError(error)) throw error;
@@ -462,6 +528,9 @@ export class FileHashManager {
       }
       await requireForeground(this.plugin);
       this.saveHashMapToStorage();
+      // 冷建（或恢复冷建）完成即全图已持久化，此前的增量断点已无意义，清掉防止
+      // 与后续扫描的 delta 混叠（陈旧条目会被指纹校验自然过滤，但留着浪费预载）。
+      await clearScanDelta(this.plugin);
       this.buildState = {
         ...this.buildState,
         phase: "ready",

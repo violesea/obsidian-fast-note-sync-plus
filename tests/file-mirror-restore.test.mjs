@@ -64,6 +64,8 @@ const helpersRequireStub = (id) => {
         setLogEnabled: () => undefined,
         logLevel: () => undefined,
       };
+    case "../sync/scan_delta":
+      return { appendScanDelta: async () => undefined, loadScanDelta: async () => 0, clearScanDelta: async () => undefined };
     case "../sync/background_activity_gate":
       return { requireForeground: async () => undefined };
     default:
@@ -82,6 +84,8 @@ const fhmRequireStub = (id) => {
       return helpers;
     case "../../main":
       return {};
+    case "../sync/scan_delta":
+      return { appendScanDelta: async () => undefined, loadScanDelta: async () => 0, clearScanDelta: async () => undefined };
     case "../sync/background_activity_gate":
       return {
         isBackgroundActivityClosedError: () => false,
