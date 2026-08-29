@@ -2664,9 +2664,21 @@ async function waitForSyncTypeDrain(
     : type === "note" ? "noteSyncEnd"
       : type === "file" ? "fileSyncEnd"
         : "configSyncEnd";
+  // ISSUE-039/2.5.20：drain 超时=「无进展耐量」而非固定墙钟。全量轮的服务端
+  // 逐类串行处理（如 1.3 万文件夹入库）远超 300s，固定超时会在服务端仍在健康
+  // 工作时杀掉整轮——正是 iPad/本机"同步到一半停止"的机制。现在：
+  //  - 基线上限 = max(300s, receivedTaskTotal × 20ms)（7 万项 → ~24 分钟）；
+  //  - 任何进度活动（progressTracker.lastProgressActivityAt）都刷新耐量；
+  //  - 只有「连续 stalledTimeoutMs 无任何进展」才超时。
+  // ISSUE-039/2.5.20: drain timeout = stall tolerance, not a fixed wall clock.
+  // The server serializes per-type ingestion (13.7k folders takes >300 s), so
+  // the fixed timeout killed rounds while the server was still healthily
+  // working — the "sync stops halfway" mechanism. Now: baseline = max(300 s,
+  // receivedTaskTotal x 20 ms); any progress activity refreshes the budget;
+  // only a continuous no-progress window triggers the timeout.
+  const STALLED_TIMEOUT_MS = 120000; // 连续无进展耐量：超过即判停滞
   const startedAt = Date.now();
-  const timeoutMs = 300000;
-
+  let lastActivityAt = startedAt;
   while (plugin.syncState.activeSyncContext === context) {
     if (plugin.syncState.transportResetPending || !isSyncConnectionReady(plugin)) {
       throw new SyncTransportError(`[SyncBarrier] ${type} interrupted by connection close`);
@@ -2675,8 +2687,13 @@ async function waitForSyncTypeDrain(
       && plugin.syncPageAckOutbox.size === 0) {
       return;
     }
-    if (Date.now() - startedAt > timeoutMs) {
-      throw new Error(`[SyncBarrier] ${type} did not drain within ${timeoutMs}ms`);
+    const activityAt = plugin.progressTracker.lastProgressActivityAt;
+    if (activityAt > lastActivityAt) lastActivityAt = activityAt;
+    const receivedTotal = plugin.progressTracker.getReceivedTaskTotal(trackerType);
+    const baselineMs = Math.max(300000, receivedTotal * 20);
+    const stalledFor = Date.now() - lastActivityAt;
+    if (Date.now() - startedAt > baselineMs && stalledFor > STALLED_TIMEOUT_MS) {
+      throw new Error(`[SyncBarrier] ${type} did not drain within ${Math.round(baselineMs / 1000)}s and stalled ${Math.round(stalledFor / 1000)}s without progress`);
     }
     await sleep(25);
   }

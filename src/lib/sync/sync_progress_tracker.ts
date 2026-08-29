@@ -89,6 +89,14 @@ export class SyncProgressTracker {
    */
   static readonly MAX_STAGNATION_RETRIES = 1;
 
+  /**
+   * 最近一次进度活动时刻（任何 record 或 page 事件都会刷新）。
+   * SyncBarrier 据此区分"活轮"与"死轮"：有进展就不因固定超时杀全轮。
+   * Latest progress-activity instant (refreshed by every record or page event).
+   * The sync barrier uses this to tell a live round from a stalled one.
+   */
+  lastProgressActivityAt = Date.now();
+
   // notify() 节流：整数百分比/阶段未变化时最多每 NOTIFY_THROTTLE_MS 触发一次，
   // 变化时（含阶段切换）立即触发，避免每完成一个文件就刷一次状态栏 + workspace 事件
   private readonly NOTIFY_THROTTLE_MS = 80;
@@ -530,6 +538,12 @@ export class SyncProgressTracker {
     return !!prog && prog.receivedTaskTotal > 0;
   }
 
+  /** Total download tasks announced so far for this type (page metadata). */
+  getReceivedTaskTotal(type: SyncType): number {
+    const prog = this.progressMap.get(type);
+    return prog?.receivedTaskTotal ?? 0;
+  }
+
   /**
    * Close out a stalled type's accounting with the shortfall recorded as failures.
    * Used by the stagnation path when a type has received pages but some items can
@@ -721,6 +735,12 @@ export class SyncProgressTracker {
     const changed = pct !== this.lastNotifiedPct || phase !== this.lastNotifiedPhase;
     const now = Date.now();
     const elapsed = now - this.lastNotifyTime;
+    // ISSUE-039/2.5.20：记录最近一次进度活动时刻，供 SyncBarrier 判断
+    // "轮次是否仍有生命力"——有进展就不因固定超时杀轮。
+    // ISSUE-039/2.5.20: record the latest progress-activity instant so the
+    // sync barrier can tell a live round from a dead one instead of applying
+    // a fixed timeout.
+    this.lastProgressActivityAt = Date.now();
 
     // 整数百分比变化或阶段切换（start/end）立即触发；否则节流合并
     if (changed || elapsed >= this.NOTIFY_THROTTLE_MS) {
