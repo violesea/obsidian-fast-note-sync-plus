@@ -617,7 +617,7 @@ async function sendSyncMessage(
 /**
  * 检查同步是否完成
  */
-export function checkSyncCompletion(plugin: FastSync, intervalId?: number, syncStartTime?: number, ownerContext?: string) {
+export async function checkSyncCompletion(plugin: FastSync, intervalId?: number, syncStartTime?: number, ownerContext?: string) {
   // 会话归属守卫：本轮检测所属的 context 已被新会话取代，说明是旧会话的迟到定时器
   // （例如断线重连后旧会话的 BatchAck 超时才姗姗来迟），此时只清理自己的 interval，
   // 不再触碰任何共享同步状态，避免把新会话的进度/上下文误清掉
@@ -651,7 +651,7 @@ export function checkSyncCompletion(plugin: FastSync, intervalId?: number, syncS
       }
     }
     dump(`Sync completion timeout after ${SYNC_TIMEOUT_MS}ms. Tasks: note=${JSON.stringify(plugin.noteSyncTasks)}, file=${JSON.stringify(plugin.fileSyncTasks)}, folder=${JSON.stringify(plugin.folderSyncTasks)}, config=${JSON.stringify(plugin.configSyncTasks)}`)
-    plugin.incrementalScanManager?.abortSync();
+    plugin.incrementalScanManager?.failSync();
     plugin.syncState.clearScannedHashCaches();
     plugin.syncState.activeSyncContext = null; // 同步超时，清空活跃的上下文 / Sync timeout, reset the active context
     plugin.syncState.resumePendingSync = undefined;
@@ -759,6 +759,12 @@ export function checkSyncCompletion(plugin: FastSync, intervalId?: number, syncS
     const totalFailed = plugin.noteSyncTasks.failed + plugin.fileSyncTasks.failed
       + plugin.configSyncTasks.failed + plugin.folderSyncTasks.failed;
 
+    // A round is committable only when every write succeeded and no sync type
+    // was deliberately skipped by the offline tombstone guard. This single
+    // predicate governs every durable success ledger below.
+    const offlineGuardSkippedThisRound = plugin.syncState.offlineGuardSkippedThisRound;
+    const roundSucceeded = totalFailed === 0 && !offlineGuardSkippedThisRound;
+
     const summaryMessage = JSON.stringify({
       syncType,
       hasChanges,
@@ -770,25 +776,28 @@ export function checkSyncCompletion(plugin: FastSync, intervalId?: number, syncS
 
     SyncLogManager.getInstance().addOrUpdateLog({
       id: `summary-${Date.now()}`,
-      type: 'info',
+      type: roundSucceeded ? 'info' : 'error',
       action: 'SyncSummary',
-      status: 'success',
+      status: roundSucceeded ? 'success' : 'error',
       message: summaryMessage,
       timestamp: Date.now()
     });
 
-    // C9: 在 resetSyncTasks（会连带重置 offlineGuardSkippedThisRound）之前先取走本轮是否被
-    // 离线超墓碑期保护拦截过的标记，用于下方决定是否可信地刷新 lastSyncSuccessTime
-    // C9: capture whether this round was intercepted by the offline tombstone-retention guard
-    // before resetSyncTasks (which also clears offlineGuardSkippedThisRound), so we can decide
-    // below whether refreshing lastSyncSuccessTime is trustworthy
-    const offlineGuardSkippedThisRound = plugin.syncState.offlineGuardSkippedThisRound;
-
     plugin.syncState.activeSyncContext = null; // 同步完成，清空活跃的上下文 / Sync completed, reset the active context
     plugin.syncState.resumePendingSync = undefined;
+    if (roundSucceeded) {
+      // Whole-round commit: advance the baseline and retire the resumable scan
+      // sidecar together. Keep isSyncing true until the async removal settles,
+      // so a new scan cannot append to the same path while it is being cleared.
+      plugin.incrementalScanManager?.completeSync();
+      await clearScanDelta(plugin);
+    } else {
+      // Preserve both the previous committed baseline and scanDelta so a
+      // failed/interrupted mobile round remains retryable after reload.
+      plugin.incrementalScanManager?.failSync();
+    }
     plugin.syncState.syncPhase = "idle";
     plugin.isSyncing = false;
-    plugin.incrementalScanManager?.completeSync();
     plugin.syncTypeCompleteCount = 0;
     plugin.resetSyncTasks();
     plugin.clearSyncContext();
@@ -831,7 +840,7 @@ export function checkSyncCompletion(plugin: FastSync, intervalId?: number, syncS
     // failure list still surfaced), but baselines/timestamps do not move: the
     // failed items renegotiate next round until a genuinely clean round
     // authorizes them.
-    if (totalFailed === 0 && plugin.expectedSyncCount > 0 && !plugin.localStorageManager.getMetadata("isInitSync")) {
+    if (roundSucceeded && plugin.expectedSyncCount > 0 && !plugin.localStorageManager.getMetadata("isInitSync")) {
       plugin.localStorageManager.setMetadata("isInitSync", true);
     }
 
@@ -843,7 +852,7 @@ export function checkSyncCompletion(plugin: FastSync, intervalId?: number, syncS
     // was intercepted by the offline guard this round (user clicked "Cancel"), that batch of
     // risky files was never actually handled — refreshing the timestamp would zero out the
     // offline duration and silently defeat the guard on the very next round.
-    if (!offlineGuardSkippedThisRound && totalFailed === 0) {
+    if (roundSucceeded) {
       plugin.localStorageManager.setMetadata("lastSyncSuccessTime", Date.now());
     }
 
@@ -1043,8 +1052,6 @@ async function receiveSyncEndWrapper(data: unknown, plugin: FastSync, type: "not
     commitScannedHashes(plugin.scannedNoteHashes, (entries) => plugin.fileHashManager.bulkSetFromScanned(entries));
     // 同步结束，强制落盘本轮防抖累积的哈希写入
     plugin.fileHashManager.flush();
-    // 落盘成功后清理断点续扫增量（未被杀的轮次不需要它）
-    void clearScanDelta(plugin);
   } else if (type === "file") {
     plugin.fileHashManager.removeFileHashes(plugin.pendingDeleteFilePaths)
     plugin.pendingDeleteFilePaths.clear()
@@ -1057,8 +1064,6 @@ async function receiveSyncEndWrapper(data: unknown, plugin: FastSync, type: "not
     commitScannedHashes(plugin.scannedFileHashes, (entries) => plugin.fileHashManager.bulkSetFromScanned(entries));
     // 同步结束，强制落盘本轮防抖累积的哈希写入
     plugin.fileHashManager.flush();
-    // 落盘成功后清理断点续扫增量（未被杀的轮次不需要它）
-    void clearScanDelta(plugin);
   } else if (type === "folder") {
     plugin.folderSnapshotManager.removeFolders(plugin.pendingDeleteFolderPaths);
     plugin.pendingDeleteFolderPaths.clear()
@@ -2235,7 +2240,7 @@ export const handleSync = async function (
     // 同时记录开始时间，用于超时保底
     const syncStartTime = Date.now();
     const progressCheckInterval = window.setInterval(() => {
-      checkSyncCompletion(plugin, progressCheckInterval, syncStartTime, context);
+      void checkSyncCompletion(plugin, progressCheckInterval, syncStartTime, context);
     }, 100);
     plugin.syncState.progressCheckIntervalId = progressCheckInterval;
   } catch (error) {

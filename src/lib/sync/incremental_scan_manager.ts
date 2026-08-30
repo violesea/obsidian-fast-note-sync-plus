@@ -37,8 +37,13 @@ export const mergeDirtyEntries = (...groups: DirtyEntry[][]): DirtyEntry[] => {
 };
 
 interface PersistedState {
-  schema: 1;
+  schema: 2;
   nextVersion: number;
+  /** Monotonic proof of the last whole-round baseline commit. */
+  committedBaselineEpoch: number;
+  /** A requested repair is in progress; it does not revoke the last commit. */
+  repairRequested: boolean;
+  /** Compatibility fields kept for probes and older state readers. */
   completedInitialSync: boolean;
   localBaselineReady: boolean;
   serverBaselineReady: boolean;
@@ -47,8 +52,10 @@ interface PersistedState {
 }
 
 const EMPTY_STATE = (): PersistedState => ({
-  schema: 1,
+  schema: 2,
   nextVersion: 1,
+  committedBaselineEpoch: 0,
+  repairRequested: false,
   completedInitialSync: false,
   localBaselineReady: false,
   serverBaselineReady: false,
@@ -85,8 +92,9 @@ export class IncrementalScanManager {
     for (const key of localKeys) {
       const local = this.plugin.app.loadLocalStorage(key) as string | null;
       if (local && this.load(local)) {
-        if (key !== this.storageKey) this.save();
-        else this.mirror.scheduleWrite(local);
+        // Always persist the normalized schema. This also upgrades 2.5.22's
+        // split baseline flags into the explicit committed epoch model.
+        this.save();
         this.initialized = true;
         return;
       }
@@ -109,8 +117,10 @@ export class IncrementalScanManager {
   }
 
   canUseIncrementalSync(localStorageInitialSync: unknown): boolean {
-    if (!this.initialized || this.state.needsFullReconcile) return false;
-    if (this.state.localBaselineReady && this.state.serverBaselineReady) return true;
+    if (!this.initialized) return false;
+    this.adoptLegacyCommittedBaseline(localStorageInitialSync);
+    if (this.state.repairRequested) return false;
+    if (this.state.localBaselineReady && this.state.committedBaselineEpoch > 0) return true;
     // A state-less installation of the fork must perform one calibration scan.
     // The official plugin's isInitSync flag proves that it completed a sync at
     // some point, but it cannot prove that offline edits were observed because
@@ -126,9 +136,9 @@ export class IncrementalScanManager {
    */
   canUseMetadataReconciliation(): boolean {
     return this.initialized
-      && !this.state.needsFullReconcile
+      && !this.state.repairRequested
       && this.state.localBaselineReady
-      && !this.state.serverBaselineReady;
+      && this.state.committedBaselineEpoch === 0;
   }
 
   markLocalBaselineReady(): void {
@@ -139,8 +149,7 @@ export class IncrementalScanManager {
 
   invalidateLocalBaseline(): void {
     this.state.localBaselineReady = false;
-    this.state.serverBaselineReady = false;
-    this.state.completedInitialSync = false;
+    this.state.repairRequested = true;
     this.save();
   }
 
@@ -179,17 +188,17 @@ export class IncrementalScanManager {
   }
 
   markInitialSyncComplete(): void {
-    this.state.completedInitialSync = true;
+    this.state.committedBaselineEpoch = Math.max(1, this.state.committedBaselineEpoch);
     this.state.localBaselineReady = true;
-    this.state.serverBaselineReady = true;
-    this.state.needsFullReconcile = false;
+    this.state.repairRequested = false;
     this.save();
   }
 
   requestFullReconcile(): void {
-    this.state.needsFullReconcile = true;
-    this.state.serverBaselineReady = false;
-    this.state.completedInitialSync = false;
+    // Two-phase baseline protocol: requesting/starting a repair cannot erase
+    // the last committed epoch. The repair flag alone blocks incremental use
+    // until a whole zero-failure round commits a newer epoch.
+    this.state.repairRequested = true;
     this.save();
   }
 
@@ -233,15 +242,8 @@ export class IncrementalScanManager {
   }
 
   beginSync(fullReconcile = false): DirtySnapshot {
-    if (fullReconcile) {
-      // A process can disappear after the scan starts but before the server
-      // sends every SyncEnd. Do not let the previous successful server
-      // baseline survive that interruption and incorrectly authorize an
-      // event-only sync on the next launch.
-      this.state.serverBaselineReady = false;
-      this.state.completedInitialSync = false;
-      this.save();
-    }
+    // Beginning work is not a commit operation. In particular, a full repair
+    // must leave the previous committed baseline intact across an iOS reload.
     const entries = Object.values(this.state.entries).map((entry) => ({ ...entry }));
     this.activeSnapshot = { entries };
     this.activeProcessedKeys.clear();
@@ -263,10 +265,9 @@ export class IncrementalScanManager {
       this.state.entries = Object.fromEntries(
         Object.entries(this.state.entries).filter(([, entry]) => entry.version >= this.activeStartVersion),
       );
-      this.state.needsFullReconcile = false;
-      this.state.completedInitialSync = true;
+      this.state.committedBaselineEpoch = Math.max(1, this.state.committedBaselineEpoch + 1);
+      this.state.repairRequested = false;
       this.state.localBaselineReady = true;
-      this.state.serverBaselineReady = true;
     } else if (this.activeSnapshot) {
       const processed = new Set(processedKeys);
       for (const entry of this.activeSnapshot.entries) {
@@ -287,6 +288,14 @@ export class IncrementalScanManager {
     this.activeSnapshot = null;
     this.activeProcessedKeys.clear();
     this.activeFullReconcile = false;
+  }
+
+  /** End an unsuccessful round without advancing any committed state. */
+  failSync(): void {
+    this.abortSync();
+    // Persist normalized compatibility fields even when this was the first
+    // operation after a legacy schema load. Existing repairRequested remains.
+    this.save();
   }
 
   flush(): void {
@@ -319,8 +328,8 @@ export class IncrementalScanManager {
 
   private load(raw: string): boolean {
     try {
-      const parsed = JSON.parse(raw) as Partial<PersistedState>;
-      if (parsed.schema !== 1 || typeof parsed.entries !== "object" || parsed.entries === null) return false;
+      const parsed = JSON.parse(raw) as Partial<Omit<PersistedState, "schema">> & { schema?: 1 | 2 };
+      if ((parsed.schema !== 1 && parsed.schema !== 2) || typeof parsed.entries !== "object" || parsed.entries === null) return false;
       if (!Number.isSafeInteger(parsed.nextVersion) || (parsed.nextVersion as number) < 1) return false;
 
       const entries: Record<string, DirtyEntry> = {};
@@ -343,13 +352,24 @@ export class IncrementalScanManager {
         };
       }
 
+      const legacyCommitted = parsed.completedInitialSync === true || parsed.serverBaselineReady === true;
+      const parsedEpoch = Number.isSafeInteger(parsed.committedBaselineEpoch)
+        && (parsed.committedBaselineEpoch as number) >= 0
+        ? parsed.committedBaselineEpoch as number
+        : legacyCommitted ? 1 : 0;
+      const repairRequested = parsed.schema === 2
+        ? parsed.repairRequested === true
+        : parsed.needsFullReconcile === true;
+
       this.state = {
-        schema: 1,
+        schema: 2,
         nextVersion: parsed.nextVersion as number,
-        completedInitialSync: parsed.completedInitialSync === true,
+        committedBaselineEpoch: parsedEpoch,
+        repairRequested,
+        completedInitialSync: parsedEpoch > 0,
         localBaselineReady: parsed.localBaselineReady === true || parsed.completedInitialSync === true,
-        serverBaselineReady: parsed.serverBaselineReady === true || parsed.completedInitialSync === true,
-        needsFullReconcile: parsed.needsFullReconcile === true,
+        serverBaselineReady: parsedEpoch > 0,
+        needsFullReconcile: repairRequested,
         entries,
       };
       return true;
@@ -360,6 +380,7 @@ export class IncrementalScanManager {
   }
 
   private save(): void {
+    this.refreshCompatibilityFields();
     const raw = JSON.stringify(this.state);
     try {
       this.plugin.app.saveLocalStorage(this.storageKey, raw);
@@ -367,5 +388,29 @@ export class IncrementalScanManager {
       dump("IncrementalScanManager: localStorage write failed", error);
     }
     this.mirror.scheduleWrite(raw);
+  }
+
+  private refreshCompatibilityFields(): void {
+    const committed = this.state.committedBaselineEpoch > 0;
+    this.state.completedInitialSync = committed;
+    this.state.serverBaselineReady = committed;
+    this.state.needsFullReconcile = this.state.repairRequested;
+  }
+
+  /**
+   * Repair the exact 2.5.22 split-ledger state. isInitSync alone is not enough:
+   * only the fork-specific zero-failure timestamp proves that this manager had
+   * previously committed a clean round before beginSync revoked its flags.
+   */
+  private adoptLegacyCommittedBaseline(localStorageInitialSync: unknown): void {
+    if (this.state.committedBaselineEpoch > 0
+      || this.state.repairRequested
+      || !this.state.localBaselineReady
+      || localStorageInitialSync !== true) return;
+    const lastSuccess = Number(this.plugin.localStorageManager?.getMetadata("lastSyncSuccessTime"));
+    if (!Number.isFinite(lastSuccess) || lastSuccess <= 0) return;
+    this.state.committedBaselineEpoch = 1;
+    this.save();
+    dump("IncrementalScanManager: recovered 2.5.22 split baseline from proven clean round");
   }
 }

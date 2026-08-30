@@ -60,6 +60,14 @@ const { IncrementalScanManager, incrementalEntryKey } = module.exports;
 function makePlugin(localStorage = new Map(), mirroredFiles = new Map()) {
   return {
     manifest: { id: "fast-note-sync" },
+    localStorageManager: {
+      getMetadata: (field) => {
+        const value = localStorage.get(`fns-${field}`);
+        if (field === "isInitSync") return value === "true";
+        if (field === "lastSyncSuccessTime") return Number(value) || 0;
+        return value ?? "";
+      },
+    },
     app: {
       loadLocalStorage: (key) => localStorage.get(key) ?? null,
       saveLocalStorage: (key, value) => {
@@ -171,8 +179,9 @@ function readState(localStorage) {
   assert.equal(Object.values(readState(localStorage).entries).length, 0);
 }
 
-// Contract: an interrupted full reconciliation must not fall back to an
-// event-only sync after restart, even if the previous round had succeeded.
+// Contract: starting a new full round must not revoke the last committed
+// baseline. If the process disappears, a restart may continue from that
+// baseline and the durable dirty journal instead of entering a full-scan loop.
 {
   const localStorage = new Map();
   const manager = new IncrementalScanManager(makePlugin(localStorage));
@@ -182,13 +191,71 @@ function readState(localStorage) {
 
   manager.beginSync(true);
   const interrupted = JSON.parse(localStorage.get("fns-incrementalScanState"));
-  assert.equal(interrupted.serverBaselineReady, false);
-  assert.equal(interrupted.completedInitialSync, false);
+  assert.equal(interrupted.serverBaselineReady, true);
+  assert.equal(interrupted.completedInitialSync, true);
+  assert.ok(interrupted.committedBaselineEpoch >= 1);
+
+  const reloaded = new IncrementalScanManager(makePlugin(localStorage));
+  await reloaded.initialize();
+  assert.equal(reloaded.canUseIncrementalSync(true), true);
+  assert.equal(reloaded.canUseMetadataReconciliation(), false);
+}
+
+// Contract: an explicitly requested repair blocks incremental sync without
+// destroying the last committed baseline. A failed repair remains requested.
+{
+  const localStorage = new Map();
+  const manager = new IncrementalScanManager(makePlugin(localStorage));
+  await manager.initialize();
+  manager.markInitialSyncComplete();
+  manager.requestFullReconcile();
+  manager.beginSync(true);
+  manager.failSync();
+
+  const failedRepair = readState(localStorage);
+  assert.equal(failedRepair.serverBaselineReady, true);
+  assert.equal(failedRepair.completedInitialSync, true);
+  assert.equal(failedRepair.needsFullReconcile, true);
 
   const reloaded = new IncrementalScanManager(makePlugin(localStorage));
   await reloaded.initialize();
   assert.equal(reloaded.canUseIncrementalSync(true), false);
-  assert.equal(reloaded.canUseMetadataReconciliation(), true);
+  reloaded.beginSync(true);
+  reloaded.completeSync(true);
+  assert.equal(reloaded.canUseIncrementalSync(true), true);
+  assert.equal(readState(localStorage).needsFullReconcile, false);
+}
+
+// Contract: the 2.5.22 split-ledger state can be repaired only when the
+// fork's own zero-failure success timestamp proves a committed round. The
+// generic isInitSync flag alone remains insufficient for a state-less install.
+{
+  const provenLegacyState = JSON.stringify({
+    schema: 1,
+    nextVersion: 2,
+    completedInitialSync: false,
+    localBaselineReady: true,
+    serverBaselineReady: false,
+    needsFullReconcile: false,
+    entries: {},
+  });
+  const provenStorage = new Map([
+    ["fns-incrementalScanState", provenLegacyState],
+    ["fns-isInitSync", "true"],
+    ["fns-lastSyncSuccessTime", "123"],
+  ]);
+  const proven = new IncrementalScanManager(makePlugin(provenStorage));
+  await proven.initialize();
+  assert.equal(proven.canUseIncrementalSync(true), true);
+  assert.ok(readState(provenStorage).committedBaselineEpoch >= 1);
+
+  const unprovenStorage = new Map([
+    ["fns-incrementalScanState", provenLegacyState],
+    ["fns-isInitSync", "true"],
+  ]);
+  const unproven = new IncrementalScanManager(makePlugin(unprovenStorage));
+  await unproven.initialize();
+  assert.equal(unproven.canUseIncrementalSync(true), false);
 }
 
 // Contract: old vault-scoped storage and the file mirror both migrate to the stable key.

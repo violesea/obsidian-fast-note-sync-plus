@@ -82,12 +82,35 @@ assert.ok(
 // 5. Completion gate: success timestamps blocked by failures.
 const operatorSource = fs.readFileSync(path.join(root, "src", "lib", "sync", "operator.ts"), "utf8");
 assert.ok(
-  /totalFailed === 0 && plugin\.expectedSyncCount > 0 && !plugin\.localStorageManager\.getMetadata\("isInitSync"\)/.test(operatorSource),
-  "isInitSync must only advance on zero-failure rounds (ISSUE-039 gate)",
+  /roundSucceeded && plugin\.expectedSyncCount > 0 && !plugin\.localStorageManager\.getMetadata\("isInitSync"\)/.test(operatorSource),
+  "isInitSync must only advance on a whole-round commit (ISSUE-039 gate)",
 );
 assert.ok(
-  /!offlineGuardSkippedThisRound && totalFailed === 0/.test(operatorSource),
-  "lastSyncSuccessTime must only advance on zero-failure rounds (ISSUE-039 gate)",
+  /if \(roundSucceeded\) \{\s*plugin\.localStorageManager\.setMetadata\("lastSyncSuccessTime", Date\.now\(\)\);/.test(operatorSource),
+  "lastSyncSuccessTime must only advance on a whole-round commit (ISSUE-039 gate)",
+);
+
+// 5.1 Round commit is atomic: failures/guard skips abort the incremental
+// manager, and scanDelta survives until the entire round commits.
+assert.ok(
+  /const roundSucceeded = totalFailed === 0 && !offlineGuardSkippedThisRound;/.test(operatorSource),
+  "round success must combine write failures and the offline guard",
+);
+assert.ok(
+  /if \(roundSucceeded\) \{[\s\S]{0,360}incrementalScanManager\?\.completeSync\(\);[\s\S]{0,120}await clearScanDelta\(plugin\);[\s\S]{0,240}\} else \{[\s\S]{0,240}incrementalScanManager\?\.failSync\(\);/.test(operatorSource),
+  "baseline and scanDelta must commit only on whole-round success; failures must abort",
+);
+assert.ok(
+  operatorSource.indexOf("await clearScanDelta(plugin);") < operatorSource.indexOf('plugin.isSyncing = false;', operatorSource.indexOf("await clearScanDelta(plugin);")),
+  "scanDelta removal must settle before a new sync round is allowed",
+);
+const syncEndWrapperStart = operatorSource.indexOf("async function receiveSyncEndWrapper");
+const syncEndWrapperEnd = operatorSource.indexOf("export const handleRequestSend", syncEndWrapperStart);
+assert.ok(syncEndWrapperStart >= 0 && syncEndWrapperEnd > syncEndWrapperStart, "SyncEnd wrapper must be locatable");
+assert.equal(
+  operatorSource.slice(syncEndWrapperStart, syncEndWrapperEnd).includes("clearScanDelta(plugin)"),
+  false,
+  "a single note/file SyncEnd must not clear the shared scan checkpoint",
 );
 
 // 6. File download integrity gate: assembly hash mismatch fails the session
