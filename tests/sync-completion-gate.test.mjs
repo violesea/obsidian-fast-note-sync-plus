@@ -35,6 +35,10 @@ assert.match(timeoutPath, /ui\.status\.timeout_partial/);
 
 const ready = {
   allSyncDone: true,
+  remoteResponseReceived: true,
+  paginationDrained: true,
+  accountedCount: 0,
+  expectedAccountedCount: 0,
   allDownloadsComplete: true,
   bufferCleared: true,
   isSyncRequesting: false,
@@ -63,6 +67,10 @@ assert.equal(canCompleteSync(ready), true);
 
 const blockingFields = [
   "allSyncDone",
+  "remoteResponseReceived",
+  "paginationDrained",
+  "accountedCount",
+  "expectedAccountedCount",
   "allDownloadsComplete",
   "bufferCleared",
   "isSyncRequesting",
@@ -86,8 +94,14 @@ const blockingFields = [
 
 for (const field of blockingFields) {
   const blocked = { ...ready };
-  if (field === "allSyncDone" || field === "allDownloadsComplete" || field === "bufferCleared") {
+  if (field === "allSyncDone" || field === "remoteResponseReceived" || field === "paginationDrained" || field === "allDownloadsComplete" || field === "bufferCleared") {
     blocked[field] = false;
+  } else if (field === "accountedCount") {
+    blocked[field] = 0;
+    blocked.expectedAccountedCount = 1;
+  } else if (field === "expectedAccountedCount") {
+    blocked[field] = 1;
+    blocked.accountedCount = 0;
   } else if (field === "isSyncRequesting") {
     blocked[field] = true;
   } else {
@@ -99,5 +113,12 @@ for (const field of blockingFields) {
 // Contract: the scan phase cannot be mistaken for the monitoring phase even
 // when all queues happen to be empty at that instant.
 assert.equal(canCompleteSync({ ...ready, syncPhase: "scanning" }), false);
+
+// Contract: a transport response is not enough when the terminal page has
+// not arrived or a declared downstream item has not been materialized.
+assert.equal(canCompleteSync({ ...ready, remoteResponseReceived: false }), false);
+assert.equal(canCompleteSync({ ...ready, paginationDrained: false }), false);
+assert.equal(canCompleteSync({ ...ready, accountedCount: 1, expectedAccountedCount: 2 }), false);
+assert.equal(canCompleteSync({ ...ready, accountedCount: 2, expectedAccountedCount: 2 }), true);
 
 console.log("sync-completion-gate.test.mjs: all scenarios passed");

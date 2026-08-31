@@ -18,6 +18,7 @@ export default {
   "setting.debug.update_source_desc": "Select the download source for manual plugin upgrades. It is recommended to choose CNB first for faster download speeds.",
   "setting.debug.protobuf": "Enable Protobuf Protocol",
   "setting.debug.protobuf_desc": "Enable Protobuf binary protocol for WebSocket message transmission. If disabled, the original JSON text message protocol will be used by default. A reconnection is required for changes to take effect.",
+  "setting.debug.protobuf_ios_disabled": "A confirmed Protobuf wire-format incompatibility on iOS requires this version to use the JSON text protocol.",
 
   // --- setting.remote ---
   "setting.remote.title": "Remote",
@@ -274,6 +275,7 @@ export default {
   "ui.status.new_version": "New version found: ${version}, click to go to the update page",
   "ui.status.completed": "Sync completed",
   "ui.status.completed_with_failures": "Sync completed, ${count} items failed",
+  "ui.status.incremental_checked_empty": "Incremental check ended: no transport items (directory completeness not verified)",
   "ui.status.timeout_partial": "Sync timed out; some files were not completed and will continue in the next sync cycle",
   "ui.status.failed": "Sync failed",
   "ui.status.cancelled": "Sync cancelled",
@@ -333,9 +335,11 @@ export default {
   "ui.log.category_other": "Other",
   "ui.log.summary.title_full": "Sync Complete (Full)",
   "ui.log.summary.title_inc": "Sync Complete (Incremental)",
+  "ui.log.summary.title_inc_empty": "Incremental Check Ended",
   "ui.log.summary.title_cancelled_full": "Sync cancelled (full)",
   "ui.log.summary.title_cancelled_inc": "Sync cancelled (incremental)",
   "ui.log.summary.no_changes": "No changes",
+  "ui.log.summary.no_transport_items": "No transport items; directory completeness not verified",
 
   // --- ui.log.action ---
   "ui.log.action.VaultScanning_full": "Vault Hash Calculation Progress (Full)",

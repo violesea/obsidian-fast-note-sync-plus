@@ -714,9 +714,14 @@ export async function checkSyncCompletion(plugin: FastSync, intervalId?: number,
 
   // 计算整体权重进度
   const overallPercentage = plugin.progressTracker.getOverallPct();
+  const completionSnapshot = plugin.progressTracker.getCompletionSnapshot();
 
   const completionReady = canCompleteSync({
     allSyncDone,
+    remoteResponseReceived: completionSnapshot.remoteResponseReceived,
+    paginationDrained: completionSnapshot.paginationDrained,
+    accountedCount: completionSnapshot.accountedCount,
+    expectedAccountedCount: completionSnapshot.expectedAccountedCount,
     allDownloadsComplete,
     bufferCleared,
     isSyncRequesting: plugin.isSyncRequesting,
@@ -771,6 +776,9 @@ export async function checkSyncCompletion(plugin: FastSync, intervalId?: number,
       Object.values(fileStats).some(v => v > 0) ||
       Object.values(configStats).some(v => v > 0)
     );
+    const emptyIncremental = syncType !== "full"
+      && !hasChanges
+      && completionSnapshot.expectedAccountedCount === 0;
 
     // 汇总本轮写盘失败数：completed 仍然是"已处理数量"（成功+失败），驱动完成判定不变；
     // failed 是单独计数的失败子集，仅用于向用户如实展示"完成但有 N 项失败"，避免误报全部成功
@@ -786,12 +794,40 @@ export async function checkSyncCompletion(plugin: FastSync, intervalId?: number,
     const offlineGuardSkippedThisRound = plugin.syncState.offlineGuardSkippedThisRound;
     const roundSucceeded = totalFailed === 0 && !offlineGuardSkippedThisRound;
 
+    // SyncEnd carries a server watermark, not proof that its downstream
+    // content is present locally. Commit each type's watermark only after the
+    // aggregate completion gate has verified response, pagination, queues,
+    // and materialization. A failed/partial round therefore remains
+    // retryable from its previous watermark.
+    if (roundSucceeded) {
+      const syncTimeField: Record<SyncType, "lastNoteSyncTime" | "lastFileSyncTime" | "lastConfigSyncTime" | "lastFolderSyncTime"> = {
+        note: "lastNoteSyncTime",
+        file: "lastFileSyncTime",
+        setting: "lastConfigSyncTime",
+        folder: "lastFolderSyncTime",
+      };
+      for (const type of plugin.progressTracker.getActiveTypes()) {
+        const syncEndTime = plugin.progressTracker.getSyncEndTime(type);
+        const field = syncTimeField[type];
+        if (syncEndTime !== undefined && syncEndTime > Number(plugin.localStorageManager.getMetadata(field))) {
+          plugin.localStorageManager.setMetadata(field, syncEndTime);
+        }
+      }
+    }
+
     const summaryMessage = JSON.stringify({
       syncType,
       hasChanges,
+      emptyIncremental,
       note: noteStats,
       file: fileStats,
       config: configStats,
+      remote: {
+        responseReceived: completionSnapshot.remoteResponseReceived,
+        paginationDrained: completionSnapshot.paginationDrained,
+        expected: completionSnapshot.expectedAccountedCount,
+        accounted: completionSnapshot.accountedCount,
+      },
       failed: totalFailed
     });
 
@@ -833,7 +869,9 @@ export async function checkSyncCompletion(plugin: FastSync, intervalId?: number,
 
     const completionText = totalFailed > 0
       ? $("ui.status.completed_with_failures", { count: String(totalFailed) })
-      : $("ui.status.completed");
+      : emptyIncremental
+        ? $("ui.status.incremental_checked_empty")
+        : $("ui.status.completed");
     if (plugin.settings.isShowNotice) {
       showSyncNotice(completionText);
     }
@@ -1057,7 +1095,7 @@ async function receiveSyncEndWrapper(data: unknown, plugin: FastSync, type: "not
   const trueTotal = tasks.needUpload + tasks.needModify + tasks.needSyncMtime + tasks.needDelete;
   const trackerType: SyncType = type === "config" ? "setting" : type;
   plugin.progressTracker.setDownloadTotal(trackerType, trueTotal, plugin.syncState.syncDownChunkNum);
-  plugin.progressTracker.recordUploadComplete(trackerType, tasks.completed);
+  plugin.progressTracker.recordUploadComplete(trackerType, tasks.completed, syncData.lastTime);
 
   // 1.1 注意：v1.1 协议中 End 消息不再携带 messages 列表。
   // 排除项的处理将依赖于后端是否推送相关通知。

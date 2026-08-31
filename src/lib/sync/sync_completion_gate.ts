@@ -7,6 +7,14 @@
  */
 export interface SyncCompletionGateInput {
   allSyncDone: boolean;
+  /** Every enabled sync type received its server-side SyncEnd response. */
+  remoteResponseReceived: boolean;
+  /** Every enabled sync type received the terminal page (or an explicit empty response). */
+  paginationDrained: boolean;
+  /** Number of downstream items accounted for as applied, skipped, or failed. */
+  accountedCount: number;
+  /** Number of downstream items announced by the server's page/SyncEnd metadata. */
+  expectedAccountedCount: number;
   allDownloadsComplete: boolean;
   bufferCleared: boolean;
   isSyncRequesting: boolean;
@@ -39,6 +47,9 @@ export interface SyncCompletionGateInput {
  */
 export const canCompleteSync = (input: SyncCompletionGateInput): boolean => {
   return input.allSyncDone
+    && input.remoteResponseReceived
+    && input.paginationDrained
+    && input.accountedCount >= input.expectedAccountedCount
     && input.allDownloadsComplete
     && input.bufferCleared
     && !input.isSyncRequesting

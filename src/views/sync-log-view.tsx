@@ -61,6 +61,7 @@ const ObsidianIcon = ({ icon, className, style }: { icon: string, className?: st
 interface SyncSummaryStats {
     syncType?: string;
     hasChanges?: boolean;
+    emptyIncremental?: boolean;
     note?: { upload: number; modify: number; delete: number };
     file?: { upload: number; modify: number; delete: number };
     config?: { upload: number; modify: number; delete: number };
@@ -81,7 +82,8 @@ const SyncSummaryCard = ({ log }: { log: SyncLog }) => {
         note = { upload: 0, modify: 0, delete: 0 },
         file = { upload: 0, modify: 0, delete: 0 },
         config = { upload: 0, modify: 0, delete: 0 },
-        hasChanges
+        hasChanges,
+        emptyIncremental = false
     } = stats;
 
     // 辅助渲染每一行，如果该类别没有任何变更，则不显示它（符合“只展示有变化的行”）
@@ -132,9 +134,11 @@ const SyncSummaryCard = ({ log }: { log: SyncLog }) => {
         ? (syncType === 'full' 
             ? ($("ui.log.summary.title_cancelled_full") || "同步已取消 (全量)") 
             : ($("ui.log.summary.title_cancelled_inc") || "同步已取消 (增量)"))
-        : (syncType === 'full' 
-            ? ($("ui.log.summary.title_full") || "同步完成 (全量)") 
-            : ($("ui.log.summary.title_inc") || "同步完成 (增量)"));
+        : emptyIncremental
+            ? ($("ui.log.summary.title_inc_empty") || "增量检查结束")
+            : (syncType === 'full'
+                ? ($("ui.log.summary.title_full") || "同步完成 (全量)")
+                : ($("ui.log.summary.title_inc") || "同步完成 (增量)"));
 
     return (
         <div className={`fns-sync-summary-card ${isCancelled ? 'is-cancelled-card' : ''} ${(!hasChanges || isCancelled) ? 'no-changes-card' : ''}`}>
@@ -144,7 +148,9 @@ const SyncSummaryCard = ({ log }: { log: SyncLog }) => {
                     <span>{titleText}</span>
                     {!hasChanges && !isCancelled && (
                         <span style={{ fontSize: '11px', color: 'var(--text-muted)', fontWeight: 'normal', marginLeft: '6px' }}>
-                            ({$("ui.log.summary.no_changes") || "无内容变更"})
+                            ({emptyIncremental
+                                ? ($("ui.log.summary.no_transport_items") || "本轮无传输项，未验证目录完整性")
+                                : ($("ui.log.summary.no_changes") || "无内容变更")})
                         </span>
                     )}
                 </div>

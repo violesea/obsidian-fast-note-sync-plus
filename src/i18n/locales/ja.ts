@@ -18,6 +18,7 @@ export default {
   "setting.debug.update_source_desc": "プラグインを手動でアップグレードする際のダウンロード元を選択してください。より高速なダウンロード速度を得るため、CNB を優先して選択することを推奨します。",
   "setting.debug.protobuf": "Protobuf プロトコルを有効にする",
   "setting.debug.protobuf_desc": "WebSocket メッセージ伝送で Protobuf バイナリプロトコルを有効にします。無効にした場合、従来の JSON テキストメッセージプロトコルがデフォルトで使用されます。変更を有効にするには再接続が必要です。",
+  "setting.debug.protobuf_ios_disabled": "iOS では Protobuf のワイヤ形式に互換性問題が確認されているため、このバージョンでは JSON テキストプロトコルを使用します。",
 
   // --- setting.remote ---
   "setting.remote.title": "リモート",
@@ -274,6 +275,7 @@ export default {
   "ui.status.new_version": "新しいバージョンが見つかりました: ${version}。クリックすると更新ページに移動します",
   "ui.status.completed": "同期完了",
   "ui.status.completed_with_failures": "同期完了、${count}件の失敗あり",
+  "ui.status.incremental_checked_empty": "増分チェック終了：転送項目なし（ディレクトリの完全性は未検証）",
   "ui.status.timeout_partial": "同期タイムアウト、一部のファイルが未完了です。次の同期で続行されます。",
   "ui.status.failed": "同期に失敗しました",
   "ui.status.cancelled": "同期がキャンセルされました",
@@ -333,9 +335,11 @@ export default {
   "ui.log.category_other": "その他",
   "ui.log.summary.title_full": "同期完了（フル）",
   "ui.log.summary.title_inc": "同期完了（増分）",
+  "ui.log.summary.title_inc_empty": "増分チェック終了",
   "ui.log.summary.title_cancelled_full": "同期がキャンセルされました (全量)",
   "ui.log.summary.title_cancelled_inc": "同期がキャンセルされました (増分)",
   "ui.log.summary.no_changes": "変更なし",
+  "ui.log.summary.no_transport_items": "転送項目なし。ディレクトリの完全性は未検証",
 
   // --- ui.log.action ---
   "ui.log.action.VaultScanning_full": "Vaultハッシュ計算進捗(全量)",

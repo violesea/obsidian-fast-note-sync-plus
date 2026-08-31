@@ -213,20 +213,21 @@ const incoming = (contentHash, content = "") => ({
   assert.deepEqual(calls.completed, [4]);
 }
 
-// Contract: fallback failure preserves the existing file and does not advance
-// the page ACK watermark, so a later round can retry the item.
+// Contract: fallback failure preserves the existing file and is accounted as
+// failed. The page may drain, but the failed subset blocks the round watermark
+// and baseline commit so a later round retries the item.
 {
   const file = makeFile("notes/example.md", "keep-me");
   const { plugin, calls } = makePlugin(file, null);
   await receiveNoteSyncModify(incoming("h:restored"), plugin);
   assert.equal(file.content, "keep-me");
   assert.equal(calls.modified, 0);
-  assert.deepEqual(calls.completed, []);
+  assert.deepEqual(calls.completed, [4]);
   assert.equal(plugin.noteSyncTasks.failed, 1);
 }
 
 // Contract: a vault adapter that returns a different body after modify must
-// not advance the hash baseline or page ACK watermark.
+// not advance the hash baseline; it is still failure-accounted for drainage.
 {
   const file = makeFile("notes/example.md", "keep-me");
   const { plugin, calls } = makePlugin(file, {
@@ -242,9 +243,23 @@ const incoming = (contentHash, content = "") => ({
   plugin.app.vault.modify = async (target, _content, options) => modify(target, "corrupt", options);
   await receiveNoteSyncModify(incoming("h:restored"), plugin);
   assert.equal(file.content, "corrupt");
-  assert.deepEqual(calls.completed, []);
+  assert.deepEqual(calls.completed, [4]);
   assert.equal(plugin.noteSyncTasks.failed, 1);
   assert.deepEqual(calls.setHash, []);
+}
+
+// Contract: preserving an unsynced local edit is not remote materialization.
+// The page item is accounted so pagination can drain, but the failed subset
+// must block the round watermark/baseline commit.
+{
+  const file = makeFile("notes/example.md", "local-edit");
+  const { plugin, calls } = makePlugin(file, null);
+  plugin.pendingNoteModifies.set(file.path, "h:local-edit");
+  await receiveNoteSyncModify(incoming("h:remote", "remote"), plugin);
+  assert.equal(file.content, "local-edit");
+  assert.deepEqual(calls.completed, [4]);
+  assert.equal(plugin.noteSyncTasks.failed, 1);
+  assert.equal(calls.setHash.length, 0);
 }
 
 // Contract: a real empty note (hash of the empty string) does not trigger a

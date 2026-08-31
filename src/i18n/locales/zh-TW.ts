@@ -18,6 +18,7 @@ export default {
   "setting.debug.update_source_desc": "選擇外掛手動升級時的下載來源，建議優先選擇 CNB 以獲得更快的下載速度。",
   "setting.debug.protobuf": "啟用 Protobuf 協議",
   "setting.debug.protobuf_desc": "在 WebSocket 訊息傳輸中啟用 Protobuf 二進位協議。關閉後將預設使用原本的 JSON 文字訊息協議。修改後需重新連線生效。",
+  "setting.debug.protobuf_ios_disabled": "iOS 已確認存在 Protobuf 線格式相容問題，目前版本強制使用 JSON 文字協議。",
 
   // --- setting.remote ---
   "setting.remote.title": "遠端",
@@ -274,6 +275,7 @@ export default {
   "ui.status.new_version": "發現新版本: ${version}, 點擊後跳轉更新頁面",
   "ui.status.completed": "同步完成",
   "ui.status.completed_with_failures": "同步完成，其中 ${count} 項失敗",
+  "ui.status.incremental_checked_empty": "增量檢查結束：本輪無傳輸項（未驗證目錄完整性）",
   "ui.status.timeout_partial": "同步逾時，部分檔案未完成，將在下一輪同步繼續",
   "ui.status.failed": "同步失敗",
   "ui.status.cancelled": "同步已取消",
@@ -333,9 +335,11 @@ export default {
   "ui.log.category_other": "其他",
   "ui.log.summary.title_full": "同步完成（全量）",
   "ui.log.summary.title_inc": "同步完成（增量）",
+  "ui.log.summary.title_inc_empty": "增量檢查結束",
   "ui.log.summary.title_cancelled_full": "同步已取消 (全量)",
   "ui.log.summary.title_cancelled_inc": "同步已取消 (增量)",
   "ui.log.summary.no_changes": "無變更",
+  "ui.log.summary.no_transport_items": "本輪無傳輸項，未驗證目錄完整性",
 
   // --- ui.log.action ---
   "ui.log.action.VaultScanning_full": "筆記庫雜湊計算進度(全量)",

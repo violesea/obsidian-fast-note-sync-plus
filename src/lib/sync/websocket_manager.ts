@@ -51,6 +51,15 @@ export interface StructuredMessageData {
   pageIndex?: number;
 }
 
+/**
+ * iOS WebViews must stay on the JSON transport until the upstream protobuf
+ * wire-format incompatibility is fixed. The configured preference remains
+ * untouched so non-iOS devices keep their selected transport.
+ */
+export function shouldUseProtobufTransport(configured: boolean, isIosApp: boolean): boolean {
+  return configured && !isIosApp;
+}
+
 function normalizeNoticeValue(value: unknown): string {
   if (value == null) return "";
   if (Array.isArray(value)) {
@@ -217,6 +226,7 @@ export class WebSocketManager {
       deserializeMessage: (data) => {
         return deReceivePacket(data) as unknown as { action: string;[key: string]: unknown };
       },
+      shouldUseProtobuf: () => this.isProtobufTransportEnabled(),
     });
 
     // 绑定大流量下载 binary handler
@@ -474,7 +484,7 @@ export class WebSocketManager {
           this.plugin.syncState.negotiated = negotiated;
           // protobufAck===true：服务端已在 auth 响应后提前 setUseProtobuf，本连接后续下行帧即为 pb，
           // 客户端同步跟进，无需再等 ClientInfo 响应触发升级（websocket_client.ts:259 该触发仍保留作旧服务端路径）
-          if (nego.protobufAck === true && this.plugin.settings.protobufEnabled !== false) {
+          if (nego.protobufAck === true && this.isProtobufTransportEnabled()) {
             this.client.useProtobuf = true;
             dump("WS Client upgraded to Protobuf via auth negotiation (pv2)");
           }
@@ -602,7 +612,7 @@ export class WebSocketManager {
     }
 
     const clientName = this.plugin.getClientName();
-    const isProtobufEnabled = this.plugin.settings.protobufEnabled !== false;
+    const isProtobufEnabled = this.isProtobufTransportEnabled();
 
     if (!isProtobufEnabled) {
       // Reset client's Protobuf flag immediately to fallback to JSON format
@@ -626,6 +636,13 @@ export class WebSocketManager {
       offlineSyncStrategy: this.plugin.settings.offlineSyncStrategy,
       protobuf: isProtobufEnabled,
     }, undefined, "");
+  }
+
+  private isProtobufTransportEnabled(): boolean {
+    return shouldUseProtobufTransport(
+      this.plugin.settings.protobufEnabled !== false,
+      Platform.isIosApp,
+    );
   }
 
   /**

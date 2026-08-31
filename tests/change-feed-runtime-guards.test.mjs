@@ -34,7 +34,7 @@ class FakeTFolder {
   }
 }
 
-function loadChangeFeed(requestUrl) {
+function loadChangeFeed(requestUrl, deleteResult = true) {
   const module = { exports: {} };
   vm.runInNewContext(transpiled, {
     require: (id) => {
@@ -70,8 +70,8 @@ function loadChangeFeed(requestUrl) {
         };
       }
       if (id === "../utils/types") return { CLIENT_TYPE: "ObsidianPlugin" };
-      if (id === "./operator_note") return { receiveNoteSyncDelete: async () => undefined };
-      if (id === "./operator_file") return { receiveFileSyncDelete: async () => undefined };
+      if (id === "./operator_note") return { receiveNoteSyncDelete: async () => deleteResult };
+      if (id === "./operator_file") return { receiveFileSyncDelete: async () => deleteResult };
       if (id === "./background_activity_gate") return { requireForeground: async () => undefined };
       if (id === "./vault_folder") return {
         createVaultFolderIdempotent: async (vault, folderPath) => {
@@ -209,6 +209,47 @@ const stalledResult = await stalledFeed.runChangeFeedCatchUp(stalledHarness.plug
 assert.equal(stalledResult.ok, false);
 assert.equal(stalledResult.reason, "cursor_stalled");
 assert.equal(stalledHarness.getSetRevCalls(), 0);
+
+// Contract: a delete handler that could not mutate the local vault must keep
+// the page cursor and repair marker unchanged. A swallowed delete exception is
+// not evidence that the remote tombstone was projected.
+const failedDeleteFeed = loadChangeFeed(async ({ url }) => {
+  const since = Number(new URL(url).searchParams.get("since_rev"));
+  return {
+    status: 200,
+    json: {
+      ok: true,
+      data: {
+        changes: [{
+          rev: since + 1,
+          type: "note",
+          action: "delete",
+          path: "deleted-but-still-local.md",
+          content_hash: "",
+          path_hash: "path-hash",
+          size: 0,
+          mtime: 1,
+          ctime: 1,
+        }],
+        next_rev: since + 1,
+        has_more: false,
+        safe_rev: since + 1,
+        min_available_rev: 0,
+        collapsed: true,
+        scanned: 1,
+      },
+    },
+  };
+}, false);
+const failedDeleteCursor = { ...pageCursor, rev: 465000, repairPending: true };
+const failedDeleteHarness = makeCatchUpPlugin(failedDeleteCursor);
+failedDeleteHarness.plugin.app.vault.getAbstractFileByPath = () => ({ path: "deleted-but-still-local.md" });
+const failedDeleteResult = await failedDeleteFeed.runChangeFeedCatchUp(failedDeleteHarness.plugin);
+assert.equal(failedDeleteResult.ok, false);
+assert.equal(failedDeleteResult.reason, "materialization_failed");
+assert.equal(failedDeleteResult.failures, 1);
+assert.equal(failedDeleteHarness.getSetRevCalls(), 0);
+assert.equal(failedDeleteHarness.getCompleteRepairCalls(), 0);
 
 // Contract: two callers for the same plugin cannot register/poll the same
 // cursor concurrently. The second caller must share the in-flight operation.

@@ -939,16 +939,25 @@ export class SettingTab extends PluginSettingTab {
     )
     this.setDescWithBreaks(set.lastElementChild as HTMLElement, $("setting.support.debug_url_desc"))
 
-    new Setting(set).setName($("setting.debug.protobuf")).setClass("fns-setting-item-checkbox").addToggle((toggle) =>
-      toggle.setValue(this.plugin.settings.protobufEnabled !== false).onChange(async (value) => {
-        this.plugin.settings.protobufEnabled = value
-        await this.plugin.saveAndReloadServices()
-        // Send updated ClientInfo immediately to sync protocol change to the server
-        // 立即发送更新后的 ClientInfo 以便向服务端同步协议变更
-        this.plugin.websocket?.sendClientInfo()
-      }),
-    )
-    this.setDescWithBreaks(set.lastElementChild as HTMLElement, $("setting.debug.protobuf_desc"))
+    const protobufSetting = new Setting(set)
+      .setName($("setting.debug.protobuf"))
+      .setClass("fns-setting-item-checkbox")
+      .addToggle((toggle) => {
+        toggle
+          .setValue(!Platform.isIosApp && this.plugin.settings.protobufEnabled !== false)
+          .setDisabled(Platform.isIosApp)
+          .onChange(async (value) => {
+            this.plugin.settings.protobufEnabled = value
+            await this.plugin.saveAndReloadServices()
+            // Send updated ClientInfo immediately to sync protocol change to the server
+            // 立即发送更新后的 ClientInfo 以便向服务端同步协议变更
+            this.plugin.websocket?.sendClientInfo()
+          })
+      })
+    const protobufDescription = Platform.isIosApp
+      ? $("setting.debug.protobuf_ios_disabled")
+      : $("setting.debug.protobuf_desc")
+    this.setDescWithBreaks(protobufSetting.descEl, protobufDescription)
 
     new Setting(set)
       .setName($("setting.sync.clear_remote"))

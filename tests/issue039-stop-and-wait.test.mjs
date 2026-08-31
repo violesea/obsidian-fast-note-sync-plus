@@ -114,7 +114,7 @@ assert.equal(
 );
 
 // 6. File download integrity gate: assembly hash mismatch fails the session
-//    before baseline/timestamp advance.
+//    without allowing any per-item watermark advance.
 const operatorFileSource = fs.readFileSync(path.join(root, "src", "lib", "sync", "operator_file.ts"), "utf8");
 assert.ok(
   operatorFileSource.includes("Hash mismatch after assembly"),
@@ -126,8 +126,30 @@ assert.ok(
 );
 {
   const gatePos = operatorFileSource.indexOf("Read-back size mismatch after write");
-  const tsPos = operatorFileSource.indexOf('setMetadata("lastFileSyncTime", session.lastTime)', gatePos);
-  assert.ok(tsPos > gatePos, "lastFileSyncTime advance must sit after the read-back gate, not before");
+  assert.ok(gatePos >= 0, "download read-back gate must be locatable");
+  assert.doesNotMatch(
+    operatorFileSource,
+    /setMetadata\("lastFileSyncTime", session\.lastTime\)/,
+    "file handlers must leave lastFileSyncTime to the whole-round completion gate",
+  );
+}
+{
+  const updateStart = operatorFileSource.indexOf("export const receiveFileSyncUpdate");
+  const updateEnd = operatorFileSource.indexOf("export const receiveFileSyncDelete", updateStart);
+  assert.ok(updateStart >= 0 && updateEnd > updateStart, "file update handler must be locatable");
+  assert.doesNotMatch(
+    operatorFileSource.slice(updateStart, updateEnd),
+    /setMetadata\("lastFileSyncTime", data\.lastTime\)/,
+    "file metadata arrival must not advance the watermark before chunk materialization",
+  );
+  const endStart = operatorFileSource.indexOf("export const receiveFileSyncEnd");
+  const endEnd = operatorFileSource.indexOf("export const checkAndUploadAttachments", endStart);
+  assert.ok(endStart >= 0 && endEnd > endStart, "file SyncEnd handler must be locatable");
+  assert.doesNotMatch(
+    operatorFileSource.slice(endStart, endEnd),
+    /setMetadata\("lastFileSyncTime", syncData\.lastTime\)/,
+    "FileSyncEnd must remain transport evidence until the whole-round gate commits its watermark",
+  );
 }
 
 // 7. Mid-scan full-map flush must be gated (2.5.19): both flush paths check

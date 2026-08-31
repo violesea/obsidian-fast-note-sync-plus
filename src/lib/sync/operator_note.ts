@@ -429,6 +429,7 @@ export const receiveNoteSyncModify = async function (data: ReceiveMessage, plugi
   const normalizedPath = normalizePath(data.path)
   let resolvedContent = data.content
   let processed = false
+  let failed = false
 
   try {
     resolvedContent = await resolveIncomingNoteContent(data, plugin)
@@ -503,6 +504,10 @@ export const receiveNoteSyncModify = async function (data: ReceiveMessage, plugi
             plugin.statusBarManager.updateConflictBadge();
 
             SyncLogManager.getInstance().addLog('receive', 'NoteModifyConflict', `本地存在未同步的改动，跳过服务端覆盖，等待下一轮同步处理冲突: ${normalizedPath}`, 'cancelled', data.path)
+            // The remote version was deliberately not materialized. Count the
+            // item for page drainage, but fail the round so its watermark and
+            // baseline remain retryable after the user resolves the conflict.
+            plugin.noteSyncTasks.failed++
             processed = true
             return
           }
@@ -547,10 +552,6 @@ export const receiveNoteSyncModify = async function (data: ReceiveMessage, plugi
           if (!(await waitForNoteActivity(plugin))) return
           await plugin.app.vault.create(normalizedPath, resolvedContent, { ...(data.ctime > 0 && { ctime: data.ctime }), ...(data.mtime > 0 && { mtime: data.mtime }) })
         }
-        if (data.lastTime && data.lastTime > Number(plugin.localStorageManager.getMetadata("lastNoteSyncTime"))) {
-          plugin.localStorageManager.setMetadata("lastNoteSyncTime", data.lastTime)
-        }
-
         // Read back the materialized file before advancing the local hash or
         // page ACK. A process kill or adapter failure after the write must
         // remain retryable instead of becoming a false synced baseline.
@@ -587,8 +588,9 @@ export const receiveNoteSyncModify = async function (data: ReceiveMessage, plugi
       SyncLogManager.getInstance().addLog('receive', 'NoteModify', e instanceof Error ? e.message : String(e), 'error', data.path);
     }
     plugin.noteSyncTasks.failed++
+    failed = true
   } finally {
-    if (options.recordCompletion !== false && processed) {
+    if (options.recordCompletion !== false && (processed || failed)) {
       plugin.recordSyncCompleted('note', data.pageIndex)
     }
   }
@@ -666,6 +668,7 @@ export const receiveNoteUpload = async function (data: ReceivePathMessage, plugi
   }
   const file = plugin.app.vault.getFileByPath(normalizePath(data.path))
   if (!file) {
+    plugin.noteSyncTasks.failed++
     plugin.recordSyncCompleted('note', data.pageIndex)
     return
   }
@@ -756,13 +759,11 @@ export const receiveNoteSyncMtime = async function (data: ReceiveMtimeMessage, p
             plugin.pendingNoteModifies.delete(data.path)
             plugin.localStorageManager.savePending('pendingNoteModifies', plugin.pendingNoteModifies)
           }
-          // 更新同步时间
-          if (data.lastTime && data.lastTime > Number(plugin.localStorageManager.getMetadata("lastNoteSyncTime"))) {
-            plugin.localStorageManager.setMetadata("lastNoteSyncTime", data.lastTime)
-          }
         } finally {
           plugin.removeIgnoredFile(normalizedPath)
         }
+      } else {
+        plugin.noteSyncTasks.failed++
       }
     }, { maxRetries: 5, retryInterval: 100 });
   } catch (e) {
@@ -779,15 +780,16 @@ export const receiveNoteSyncMtime = async function (data: ReceiveMtimeMessage, p
 /**
  * 接收服务端笔记删除通知
  */
-export const receiveNoteSyncDelete = async function (data: ReceiveMessage, plugin: FastSync) {
-  if (!(await waitForNoteActivity(plugin))) return
-  if (plugin.settings.syncEnabled == false) return
+export const receiveNoteSyncDelete = async function (data: ReceiveMessage, plugin: FastSync): Promise<boolean> {
+  if (!(await waitForNoteActivity(plugin))) return false
+  if (plugin.settings.syncEnabled == false) return false
   if (isPathExcluded(data.path, plugin)) {
     plugin.recordSyncCompleted('note', data.pageIndex)
-    return
+    return true
   }
   dump(`Receive note delete:`, data.path, data.mtime, data.pathHash)
   const normalizedPath = normalizePath(data.path)
+  let applied = true
 
   try {
     await plugin.lockManager.withLock(normalizedPath, async () => {
@@ -797,7 +799,10 @@ export const receiveNoteSyncDelete = async function (data: ReceiveMessage, plugi
         // 记录待删除路径，用于拦截本地删除事件
         plugin.lastSyncPathDeleted.add(normalizedPath)
         try {
-          if (!(await waitForNoteActivity(plugin))) return
+          if (!(await waitForNoteActivity(plugin))) {
+            applied = false
+            return
+          }
           await vaultDelete(plugin.app.vault, file)
           // 服务端推送删除,从哈希表中移除
           plugin.fileHashManager.removeFileHash(normalizedPath)
@@ -806,10 +811,6 @@ export const receiveNoteSyncDelete = async function (data: ReceiveMessage, plugi
           // Clean up pending to prevent memory leak for deleted path
           plugin.pendingNoteModifies.delete(normalizedPath)
           plugin.localStorageManager.savePending('pendingNoteModifies', plugin.pendingNoteModifies)
-          // 更新同步时间
-          if (data.lastTime && data.lastTime > Number(plugin.localStorageManager.getMetadata("lastNoteSyncTime"))) {
-            plugin.localStorageManager.setMetadata("lastNoteSyncTime", data.lastTime)
-          }
         } finally {
           // 延时 500ms 清理拦截集合，确保本地事件已被处理
           window.setTimeout(() => {
@@ -823,9 +824,11 @@ export const receiveNoteSyncDelete = async function (data: ReceiveMessage, plugi
     dumpError(`[FastSync] Failed to receiveNoteSyncDelete: ${normalizedPath}`, e);
     SyncLogManager.getInstance().addLog('receive', 'NoteDelete', e instanceof Error ? e.message : String(e), 'error', data.path);
     plugin.noteSyncTasks.failed++
+    applied = false
   } finally {
     plugin.recordSyncCompleted('note', data.pageIndex)
   }
+  return applied
 }
 
 /**
@@ -843,9 +846,8 @@ export const receiveNoteSyncEnd = async function (data: unknown, plugin: FastSyn
   plugin.noteSyncTasks.needSyncMtime = syncData.needSyncMtimeCount || 0
   plugin.noteSyncTasks.needDelete = syncData.needDeleteCount || 0
 
-  // 无条件更新 lastNoteSyncTime，确保包含服务端本轮同步后的所有异步操作（如 SyncResourceFID）
-  // Unconditionally update lastNoteSyncTime to cover all async server-side ops after this sync round (e.g., SyncResourceFID)
-  plugin.localStorageManager.setMetadata("lastNoteSyncTime", syncData.lastTime)
+  // The terminal watermark is retained by SyncProgressTracker and committed
+  // by the whole-round completion gate after downstream materialization.
   plugin.syncTypeCompleteCount++
 }
 
@@ -906,10 +908,6 @@ export const receiveNoteSyncRename = async function (data: { path: string, oldPa
           const renamedFile = plugin.app.vault.getFileByPath(normalizedNewPath)
           plugin.fileHashManager.setFileHash(data.path, data.contentHash, data.mtime || (renamedFile instanceof TFile ? renamedFile.stat.mtime : 0), renamedFile instanceof TFile ? renamedFile.stat.size : 0)
 
-          // 更新同步时间
-          if (data.lastTime && data.lastTime > Number(plugin.localStorageManager.getMetadata("lastNoteSyncTime"))) {
-            plugin.localStorageManager.setMetadata("lastNoteSyncTime", data.lastTime)
-          }
         } finally {
           window.setTimeout(() => {
             plugin.removeIgnoredFile(normalizedNewPath)
@@ -938,11 +936,9 @@ export const receiveNoteSyncRename = async function (data: { path: string, oldPa
           pathHash: data.pathHash,
         }
         void plugin.websocket.SendMessage("NoteRePush", rePushData)
-        if (targetFile instanceof TFile) {
-          plugin.fileHashManager.setFileHash(data.path, data.contentHash, targetFile.stat.mtime, targetFile.stat.size)
-        } else {
-          plugin.fileHashManager.setFileHash(data.path, data.contentHash)
-        }
+        // RePush has not written the remote bytes yet. Do not fabricate a hash
+        // baseline for a missing/mismatched target; keep the round retryable.
+        plugin.noteSyncTasks.failed++
       }
     }, { maxRetries: 10, retryInterval: 100 });
   } catch (e) {
@@ -980,9 +976,6 @@ export const receiveNoteModifyAck = function (data: { lastTime?: number; path?: 
     } else {
       dump(`NoteModifyAck received for non-pending path: ${data.path}`)
     }
-  }
-  if (data.lastTime && data.lastTime > Number(plugin.localStorageManager.getMetadata("lastNoteSyncTime"))) {
-    plugin.localStorageManager.setMetadata("lastNoteSyncTime", data.lastTime)
   }
   if (data.path) {
     plugin.concurrencyLimiter.releaseSlot(data.path)
@@ -1025,9 +1018,6 @@ export const receiveNoteRenameAck = function (data: { lastTime?: number; path?: 
       plugin.fileHashManager.setFileHash(pending.newPath, pending.contentHash, file?.stat.mtime || 0, file?.stat.size || 0, file?.stat.ctime)
     }
   }
-  if (data.lastTime && data.lastTime > Number(plugin.localStorageManager.getMetadata("lastNoteSyncTime"))) {
-    plugin.localStorageManager.setMetadata("lastNoteSyncTime", data.lastTime)
-  }
   plugin.concurrencyLimiter.releaseFifoSlot()
 }
 
@@ -1043,8 +1033,5 @@ export const receiveNoteDeleteAck = function (data: { lastTime?: number; path?: 
   // Release concurrency slot: consistent with FileDeleteAck/ConfigDeleteAck, only check data.path
   if (data.path) {
     plugin.concurrencyLimiter.releaseSlot(data.path)
-  }
-  if (data.lastTime && data.lastTime > Number(plugin.localStorageManager.getMetadata("lastNoteSyncTime"))) {
-    plugin.localStorageManager.setMetadata("lastNoteSyncTime", data.lastTime)
   }
 }

@@ -18,6 +18,7 @@ export default {
   "setting.debug.update_source_desc": "플러그인 수동 업그레이드 시 다운로드 소스를 선택하세요. 더 빠른 다운로드 속도를 위해 CNB를 우선적으로 선택하는 것이 좋습니다.",
   "setting.debug.protobuf": "Protobuf 프로토콜 활성화",
   "setting.debug.protobuf_desc": "WebSocket 메시지 전송에서 Protobuf 이진 프로토콜을 활성화합니다. 비활성화 시 원래의 JSON 텍스트 메시지 프로토콜이 기본으로 사용됩니다. 변경 사항을 적용하려면 다시 연결해야 합니다.",
+  "setting.debug.protobuf_ios_disabled": "iOS에서 Protobuf 와이어 형식 호환성 문제가 확인되어 이 버전은 JSON 텍스트 프로토콜을 사용합니다.",
 
   // --- setting.remote ---
   "setting.remote.title": "원격",
@@ -274,6 +275,7 @@ export default {
   "ui.status.new_version": "새 버전 발견: ${version}, 클릭하면 업데이트 페이지로 이동합니다",
   "ui.status.completed": "동기화 완료",
   "ui.status.completed_with_failures": "동결 완료, ${count}개 항목 실패",
+  "ui.status.incremental_checked_empty": "증분 확인 종료: 전송 항목 없음(디렉터리 완전성 미검증)",
   "ui.status.timeout_partial": "동결 시간 초과, 일부 파일이 완료되지 않았으며 다음 동결 주기에서 계속 진행됩니다",
   "ui.status.failed": "동기화 실패",
   "ui.status.cancelled": "동기화가 취소되었습니다",
@@ -333,9 +335,11 @@ export default {
   "ui.log.category_other": "기타",
   "ui.log.summary.title_full": "동기화 완료 (전체)",
   "ui.log.summary.title_inc": "동기화 완료 (증분)",
+  "ui.log.summary.title_inc_empty": "증분 확인 종료",
   "ui.log.summary.title_cancelled_full": "동기화가 취소되었습니다 (전체)",
   "ui.log.summary.title_cancelled_inc": "동기화가 취소되었습니다 (증분)",
   "ui.log.summary.no_changes": "변경 없음",
+  "ui.log.summary.no_transport_items": "전송 항목 없음, 디렉터리 완전성 미검증",
 
   // --- ui.log.action ---
   "ui.log.action.VaultScanning_full": "노트 보관소 해시 계산 진행률(전체)",

@@ -194,11 +194,6 @@ export const receiveFolderSyncModify = async function (data: { path: string, mti
         }
         plugin.folderSyncTasks.failed++
     } finally {
-        // 实时更新同步时间戳，与 note 端保持一致
-        // Update sync timestamp in real time, consistent with note side
-        if (data.lastTime && data.lastTime > Number(plugin.localStorageManager.getMetadata("lastFolderSyncTime"))) {
-            plugin.localStorageManager.setMetadata("lastFolderSyncTime", data.lastTime)
-        }
         plugin.recordSyncCompleted('folder', data.pageIndex)
     }
 }
@@ -232,6 +227,7 @@ export const receiveFolderSyncDelete = async function (data: { path: string, las
                         // skip the delete instead of force-recursing, wait for next sync round
                         dump(`[FastSync] Folder not empty after wait, skip delete: ${normalizedPath}`);
                         SyncLogManager.getInstance().addLog('receive', 'FolderDeleteSkipped', `目录非空，跳过删除，等待下轮同步: ${normalizedPath}`, 'cancelled', data.path);
+                        plugin.folderSyncTasks.failed++
                         return
                     }
                     // 记录待删除路径
@@ -252,11 +248,6 @@ export const receiveFolderSyncDelete = async function (data: { path: string, las
         SyncLogManager.getInstance().addLog('receive', 'FolderDelete', e instanceof Error ? e.message : String(e), 'error', data.path);
         plugin.folderSyncTasks.failed++
     } finally {
-        // 实时更新同步时间戳，与 note 端保持一致
-        // Update sync timestamp in real time, consistent with note side
-        if (data.lastTime && data.lastTime > Number(plugin.localStorageManager.getMetadata("lastFolderSyncTime"))) {
-            plugin.localStorageManager.setMetadata("lastFolderSyncTime", data.lastTime)
-        }
         plugin.recordSyncCompleted('folder', data.pageIndex)
     }
 }
@@ -327,11 +318,6 @@ export const receiveFolderSyncRename = async function (data: FolderSyncRenameMes
         }
         plugin.folderSyncTasks.failed++
     } finally {
-        // 实时更新同步时间戳，与 note 端保持一致
-        // Update sync timestamp in real time, consistent with note side
-        if (data.lastTime && data.lastTime > Number(plugin.localStorageManager.getMetadata("lastFolderSyncTime"))) {
-            plugin.localStorageManager.setMetadata("lastFolderSyncTime", data.lastTime)
-        }
         plugin.recordSyncCompleted('folder', data.pageIndex)
     }
 }
@@ -351,8 +337,7 @@ export const receiveFolderSyncEnd = async function (data: unknown, plugin: FastS
     plugin.folderSyncTasks.needSyncMtime = syncData.needSyncMtimeCount || 0
     plugin.folderSyncTasks.needDelete = syncData.needDeleteCount || 0
 
-    // 无条件更新 lastFolderSyncTime，确保包含服务端本轮同步后的所有异步操作（如 SyncResourceFID）
-    // Unconditionally update lastFolderSyncTime to cover all async server-side ops after this sync round (e.g., SyncResourceFID)
-    plugin.localStorageManager.setMetadata("lastFolderSyncTime", syncData.lastTime)
+    // The terminal watermark is retained by SyncProgressTracker and committed
+    // by the whole-round completion gate after downstream materialization.
     plugin.syncTypeCompleteCount++
 }

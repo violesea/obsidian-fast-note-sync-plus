@@ -191,12 +191,10 @@ export const receiveConfigSyncModify = async function (data: ReceiveMessage, plu
         if (isVirtual) {
             if (await plugin.localStorageManager.handleReceivedUpdate(data.path, data.content)) {
                 plugin.removeIgnoredConfigFile(data.path)
-                if (data.lastTime && data.lastTime > Number(plugin.localStorageManager.getMetadata("lastConfigSyncTime"))) {
-                    plugin.localStorageManager.setMetadata("lastConfigSyncTime", data.lastTime)
-                }
                 plugin.recordSyncCompleted('setting', data.pageIndex)
                 return
             }
+            plugin.configSyncTasks.failed++
             plugin.recordSyncCompleted('setting', data.pageIndex)
             return
         }
@@ -250,6 +248,9 @@ export const receiveConfigSyncModify = async function (data: ReceiveMessage, plu
             dump(`[FastSync] Skip config overwrite, local unsynced edit detected: ${filePath}`)
             SyncLogManager.getInstance().addLog('receive', 'ConfigModifyConflict', `本地配置存在未同步的改动，跳过服务端覆盖，等待下一轮同步处理冲突: ${filePath}`, 'cancelled', data.path)
             plugin.removeIgnoredConfigFile(data.path)
+            // The server version was not materialized. Drain the page item but
+            // fail the round so the config watermark cannot move past it.
+            plugin.configSyncTasks.failed++
             plugin.recordSyncCompleted('setting', data.pageIndex)
             return
         }
@@ -274,10 +275,6 @@ export const receiveConfigSyncModify = async function (data: ReceiveMessage, plu
     if (plugin.configManager) {
         const absPath = normalizePath(data.path)
         plugin.configManager.updateFileState(absPath, data.mtime)
-    }
-
-    if (data.lastTime && data.lastTime > Number(plugin.localStorageManager.getMetadata("lastConfigSyncTime"))) {
-        plugin.localStorageManager.setMetadata("lastConfigSyncTime", data.lastTime)
     }
 
     // 更新配置哈希表
@@ -361,6 +358,7 @@ export const receiveConfigUpload = async function (data: ReceivePathMessage, plu
     }
 
     if (!contentBuf || mtime === 0) {
+        plugin.configSyncTasks.failed++
         plugin.recordSyncCompleted('setting', data.pageIndex);
         return;
     }
@@ -420,6 +418,8 @@ export const receiveConfigSyncMtime = async function (data: ReceiveMtimeMessage,
             const content = await plugin.app.vault.adapter.readBinary(filePath)
             if (!(await waitForConfigActivity(plugin))) return
             await plugin.app.vault.adapter.writeBinary(filePath, content, { ...(data.ctime > 0 && { ctime: data.ctime }), ...(data.mtime > 0 && { mtime: data.mtime }) })
+        } else {
+            plugin.configSyncTasks.failed++
         }
     } catch (e) {
         dumpError("[updateConfigFileTime] error:", e)
@@ -429,11 +429,6 @@ export const receiveConfigSyncMtime = async function (data: ReceiveMtimeMessage,
         plugin.configSyncTasks.failed++
     }
     plugin.removeIgnoredConfigFile(data.path)
-
-    // 更新同步时间
-    if (data.lastTime && data.lastTime > Number(plugin.localStorageManager.getMetadata("lastConfigSyncTime"))) {
-        plugin.localStorageManager.setMetadata("lastConfigSyncTime", data.lastTime)
-    }
 
     plugin.recordSyncCompleted('setting', data.pageIndex)
 }
@@ -488,10 +483,6 @@ export const receiveConfigSyncDelete = async function (data: { path: string, las
         plugin.configHashManager.removeFileHash(data.path)
     }
 
-    // 更新同步时间
-    if (data.lastTime && data.lastTime > Number(plugin.localStorageManager.getMetadata("lastConfigSyncTime"))) {
-        plugin.localStorageManager.setMetadata("lastConfigSyncTime", data.lastTime)
-    }
     if (data.path) { plugin.concurrencyLimiter.releaseSlot(data.path) }
 
     plugin.recordSyncCompleted('setting', data.pageIndex)
@@ -509,10 +500,8 @@ export const receiveConfigSyncEnd = async function (data: unknown, plugin: FastS
     plugin.configSyncTasks.needSyncMtime = syncData.needSyncMtimeCount || 0
     plugin.configSyncTasks.needDelete = syncData.needDeleteCount || 0
 
-    const hasUpdates = (syncData.needUploadCount || 0) + (syncData.needModifyCount || 0) + (syncData.needSyncMtimeCount || 0) + (syncData.needDeleteCount || 0) > 0;
-    if (hasUpdates) {
-        plugin.localStorageManager.setMetadata("lastConfigSyncTime", syncData.lastTime)
-    }
+    // The terminal watermark is retained by SyncProgressTracker and committed
+    // by the whole-round completion gate after downstream materialization.
     plugin.syncTypeCompleteCount++
 }
 
@@ -559,9 +548,6 @@ export const receiveConfigModifyAck = async function (data: { lastTime?: number;
             plugin.localStorageManager.savePending('pendingConfigModifies', plugin.pendingConfigModifies)
         }
     }
-    if (data.lastTime && data.lastTime > Number(plugin.localStorageManager.getMetadata("lastConfigSyncTime"))) {
-        plugin.localStorageManager.setMetadata("lastConfigSyncTime", data.lastTime)
-    }
     if (data.path) {
         plugin.concurrencyLimiter.releaseSlot(data.path)
     }
@@ -584,9 +570,6 @@ export const receiveConfigDeleteAck = function (data: { lastTime?: number; path?
             plugin.configHashManager.removeFileHash(data.path)
         }
         plugin.pendingConfigDeleteAcks.delete(data.path)
-    }
-    if (data.lastTime && data.lastTime > Number(plugin.localStorageManager.getMetadata("lastConfigSyncTime"))) {
-        plugin.localStorageManager.setMetadata("lastConfigSyncTime", data.lastTime)
     }
     if (data.path) {
         plugin.concurrencyLimiter.releaseSlot(data.path)

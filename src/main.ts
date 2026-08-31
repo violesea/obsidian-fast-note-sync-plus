@@ -138,6 +138,14 @@ export default class FastSync extends Plugin {
       // only a terminated round advances the baseline into incremental mode.
       if (this.progressTracker.hasReceivedAnyPages(type)) {
         const shortfall = this.progressTracker.forceCloseType(type);
+        const tasks = type === "note" ? this.noteSyncTasks
+          : type === "file" ? this.fileSyncTasks
+            : type === "setting" ? this.configSyncTasks
+              : this.folderSyncTasks;
+        // forceCloseType makes the accounting finite, but the missing items
+        // are failures, never a successful materialization. Keep the round
+        // from committing its baseline or success timestamp.
+        tasks.failed += shortfall;
         dump(`[SyncSession] stalled ${type} page ${pageIndex} closed out (${shortfall} failed item(s)); continuing round without transport rotation`);
         return;
       }

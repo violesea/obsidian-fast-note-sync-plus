@@ -639,10 +639,15 @@ async function runChangeFeedCatchUpOnce(plugin: FastSync, context?: string): Pro
             mtime: action.change.mtime ?? 0,
             lastTime: 0,
           };
-          if (action.type === "note") {
-            await receiveNoteSyncDelete(payload, plugin);
+          const deleteApplied = action.type === "note"
+            ? await receiveNoteSyncDelete(payload, plugin)
+            : await receiveFileSyncDelete(payload, plugin);
+          if (!deleteApplied) {
+            failures++;
+            pageFailures++;
+            dump(`[ChangeFeed] delete apply failed (${failures}): ${action.change.path}`);
           } else {
-            await receiveFileSyncDelete(payload, plugin);
+            applied++;
           }
         }
       }

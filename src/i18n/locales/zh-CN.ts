@@ -18,6 +18,7 @@ export default {
   "setting.debug.update_source_desc": "选择插件手动升级时的下载源，建议优先选择 CNB 以获得更快的下载速度。",
   "setting.debug.protobuf": "启用 Protobuf 协议",
   "setting.debug.protobuf_desc": "在 WebSocket 消息传输中启用 Protobuf 二进制协议。关闭后将默认使用原来的 JSON 文本消息协议。修改后需重新连接生效。",
+  "setting.debug.protobuf_ios_disabled": "iOS 已确认存在 Protobuf 线格式兼容问题，当前版本强制使用 JSON 文本协议。",
 
   // --- setting.remote ---
   "setting.remote.title": "远端",
@@ -274,6 +275,7 @@ export default {
   "ui.status.new_version": "发现新版本: ${version}, 点击后跳转更新页面",
   "ui.status.completed": "同步完成",
   "ui.status.completed_with_failures": "同步完成，其中 ${count} 项失败",
+  "ui.status.incremental_checked_empty": "增量检查结束：本轮无传输项（未验证目录完整性）",
   "ui.status.timeout_partial": "同步超时，部分文件未完成，将在下一轮同步继续",
   "ui.status.failed": "同步失败",
   "ui.status.cancelled": "同步已取消",
@@ -333,9 +335,11 @@ export default {
   "ui.log.category_other": "其他",
   "ui.log.summary.title_full": "同步完成 (全量)",
   "ui.log.summary.title_inc": "同步完成 (增量)",
+  "ui.log.summary.title_inc_empty": "增量检查结束",
   "ui.log.summary.title_cancelled_full": "同步已取消 (全量)",
   "ui.log.summary.title_cancelled_inc": "同步已取消 (增量)",
   "ui.log.summary.no_changes": "无变更",
+  "ui.log.summary.no_transport_items": "本轮无传输项，未验证目录完整性",
 
   // --- ui.log.action ---
   "ui.log.action.VaultScanning_full": "笔记库哈希计算进度(全量)",

@@ -11,14 +11,20 @@ export type SyncPhase = 'hash' | 'upload' | 'download' | 'idle';
 interface TypeProgress {
   // Upload status / 上传状态
   uploadComplete: boolean;     // Has the SyncEnd message been received from the server / 是否已收到服务端的 SyncEnd 消息
+  remoteResponseReceived: boolean; // A terminal SyncEnd response was received for this type
+  syncEndTime?: number;        // Server watermark carried by the terminal response
   
   // Overall page-driven tasks progress
   pageTaskTotal: number;       // Accumulated total items from all SyncPages / 从所有分页消息中累加的总项数
   pageTaskCompleted: number;   // Processed items (completed, error, skipped) / 已处理的项数
   allPagesReceived: boolean;   // Has the last SyncPage (isLast: true) been received / 是否已收到最后一页
+  paginationDrained: boolean;  // Terminal page received, or SyncEnd explicitly announced zero items
+  explicitLastPageReceived: boolean;
 
   // New field: precise received total from server for completion check / 实际收到的精准任务总数，仅用于完成判定，防卡死
   receivedTaskTotal: number;
+  expectedAccountedCount: number; // Downstream items announced by SyncEnd/pages
+  accountedCount: number;         // Downstream items accounted for exactly once
 
   // Current page download status (used specifically for triggering page ACKs)
   downloadPageIndex: number;  // Current page index / 当前页码
@@ -151,10 +157,16 @@ export class SyncProgressTracker {
     for (const type of activeTypes) {
       this.progressMap.set(type, {
         uploadComplete: false,
+        remoteResponseReceived: false,
+        syncEndTime: undefined,
         pageTaskTotal: 0,
         pageTaskCompleted: 0,
         allPagesReceived: false,
+        paginationDrained: false,
+        explicitLastPageReceived: false,
         receivedTaskTotal: 0,
+        expectedAccountedCount: 0,
+        accountedCount: 0,
         downloadPageIndex: -1,
         downloadPageCount: 0,
         downloadPageDone: 0,
@@ -239,15 +251,23 @@ export class SyncProgressTracker {
    * Record that upload (receiving SyncEnd from server) is complete for a sync type.
    * 记录某个同步类型的上传已完成 (收到服务端返回 of SyncEnd 消息)。
    */
-  recordUploadComplete(type: SyncType, completedUploadsBase = 0): void {
+  recordUploadComplete(type: SyncType, completedUploadsBase = 0, syncEndTime?: number): void {
     const prog = this.progressMap.get(type);
     if (!prog) return;
 
     prog.uploadComplete = true;
+    prog.remoteResponseReceived = true;
+    if (syncEndTime !== undefined && Number.isFinite(syncEndTime)) {
+      prog.syncEndTime = syncEndTime;
+    }
     prog.uploadTasksBase = completedUploadsBase;
-    // If no pages were received, then we have all pages (0 total tasks)
-    if (prog.pageTaskTotal === 0) {
+    // If no downstream items were announced, SyncEnd is the protocol's
+    // explicit empty response and therefore closes pagination. If a page
+    // arrives later, recordPageProgress() re-opens the gate until its
+    // terminal page is received.
+    if (prog.pageTaskTotal === 0 && prog.receivedPageIndexes.size === 0) {
       prog.allPagesReceived = true;
+      prog.paginationDrained = true;
     }
     this.notify();
   }
@@ -261,7 +281,10 @@ export class SyncProgressTracker {
   recordDownloadComplete(type: SyncType): void {
     const prog = this.progressMap.get(type);
     if (!prog) return;
-    prog.pageTaskCompleted++;
+    // The owning handler calls recordSyncCompleted() after this hook. That
+    // call is the single page-task completion event and drives ACK/accounting.
+    // Incrementing pageTaskCompleted here as well double-counts a successful
+    // file and can make one written file close a multi-file page early.
     this.notify();
   }
 
@@ -287,8 +310,12 @@ export class SyncProgressTracker {
 
     if (pageIndex === undefined) {
       // --- 旧路径：单页全局计数，逐字保留 ---
+      const hasActivePage = prog.downloadPageIndex !== -1;
       prog.pageTaskCompleted++;
       prog.downloadPageDone++;
+      if (hasActivePage) {
+        prog.accountedCount++;
+      }
 
       // 3.6.1 Page control messages contain pageIndex while their detail
       // payloads do not. Mirror legacy completions into the registered page
@@ -346,6 +373,7 @@ export class SyncProgressTracker {
 
     bucket.completedCount++;
     prog.pageTaskCompleted++;
+    prog.accountedCount++;
 
     // 15s 无明细停滞重发 timer：每次真正入账一条明细就重置倒计时
     // Stagnation-resend timer: reset the countdown on every genuine detail accounting
@@ -463,7 +491,17 @@ export class SyncProgressTracker {
   setDownloadTotal(type: SyncType, total: number, syncDownChunkNum = 200): void {
     const prog = this.progressMap.get(type);
     if (!prog) return;
-    prog.pageTaskTotal = total;
+    prog.pageTaskTotal = Math.max(prog.pageTaskTotal, total);
+    if (total > 0 && !prog.explicitLastPageReceived) {
+      // A positive SyncEnd announcement disproves an inferred empty
+      // response, even when the announcement arrives after recordUploadComplete.
+      prog.allPagesReceived = false;
+      prog.paginationDrained = false;
+    }
+    // SyncEnd's count is a lower-confidence announcement than page metadata,
+    // but it must still be retained as a floor. A disagreement must block
+    // completion instead of allowing a short page to close the round.
+    prog.expectedAccountedCount = Math.max(prog.expectedAccountedCount, total);
     prog.expectedPages = total === 0 ? 0 : Math.ceil(total / syncDownChunkNum);
     this.notify();
   }
@@ -499,11 +537,20 @@ export class SyncProgressTracker {
 
     // Accumulate precisely received total task count from server / 累加绝对精准的已收到任务总数
     prog.receivedTaskTotal += totalCount;
+    prog.expectedAccountedCount = Math.max(prog.expectedAccountedCount, prog.receivedTaskTotal);
 
     // 如果收到最后一页标志，则标记所有页均已收到；isLast 只能置 true 不可回退，
     // 防止晚到的非末页（isLast: false）把已经确认的 allPagesReceived 覆盖回 false
     if (isLast) {
+      prog.explicitLastPageReceived = true;
       prog.allPagesReceived = true;
+      prog.paginationDrained = true;
+    } else if (!prog.explicitLastPageReceived) {
+      // A non-terminal page arriving after an inferred empty SyncEnd must
+      // reopen the pagination gate. Once an explicit terminal page has been
+      // observed, late out-of-order pages do not retract it.
+      prog.allPagesReceived = false;
+      prog.paginationDrained = false;
     }
 
     // Correct UI total if received count exceeds it / 如果实际收到的数量超过了估算值，调大估算分母
@@ -557,9 +604,53 @@ export class SyncProgressTracker {
     if (!this.activeTypes.has(type)) return true;
     const prog = this.progressMap.get(type);
     if (!prog) return true;
-    // 使用实际收到的精准下载任务数加上传任务基数判定完成，防止提早判断导致清空 context
-    const downloadCompleted = prog.pageTaskCompleted - prog.uploadTasksBase;
-    return prog.uploadComplete && prog.allPagesReceived && downloadCompleted >= prog.receivedTaskTotal;
+    return prog.remoteResponseReceived
+      && prog.paginationDrained
+      && prog.accountedCount >= prog.expectedAccountedCount;
+  }
+
+  /** Return the completion evidence for one type without exposing internals. */
+  getTypeCompletionSnapshot(type: SyncType): {
+    remoteResponseReceived: boolean;
+    paginationDrained: boolean;
+    accountedCount: number;
+    expectedAccountedCount: number;
+    syncEndTime?: number;
+  } {
+    const prog = this.progressMap.get(type);
+    return {
+      remoteResponseReceived: prog?.remoteResponseReceived ?? false,
+      paginationDrained: prog?.paginationDrained ?? false,
+      accountedCount: prog?.accountedCount ?? 0,
+      expectedAccountedCount: prog?.expectedAccountedCount ?? 0,
+      syncEndTime: prog?.syncEndTime,
+    };
+  }
+
+  /** Aggregate completion evidence across all enabled sync types. */
+  getCompletionSnapshot(): {
+    remoteResponseReceived: boolean;
+    paginationDrained: boolean;
+    accountedCount: number;
+    expectedAccountedCount: number;
+  } {
+    let remoteResponseReceived = true;
+    let paginationDrained = true;
+    let accountedCount = 0;
+    let expectedAccountedCount = 0;
+    for (const type of this.activeTypes) {
+      const snapshot = this.getTypeCompletionSnapshot(type);
+      remoteResponseReceived = remoteResponseReceived && snapshot.remoteResponseReceived;
+      paginationDrained = paginationDrained && snapshot.paginationDrained;
+      accountedCount += snapshot.accountedCount;
+      expectedAccountedCount += snapshot.expectedAccountedCount;
+    }
+    return { remoteResponseReceived, paginationDrained, accountedCount, expectedAccountedCount };
+  }
+
+  /** Return the server watermark for a type's terminal response, if any. */
+  getSyncEndTime(type: SyncType): number | undefined {
+    return this.progressMap.get(type)?.syncEndTime;
   }
 
   /** Whether any download page metadata was received for this type this round. */
@@ -588,11 +679,13 @@ export class SyncProgressTracker {
   forceCloseType(type: SyncType): number {
     const prog = this.progressMap.get(type);
     if (!prog) return 0;
-    const completed = prog.pageTaskCompleted - prog.uploadTasksBase;
-    const shortfall = Math.max(0, prog.receivedTaskTotal - completed);
-    prog.pageTaskCompleted = prog.receivedTaskTotal + prog.uploadTasksBase;
+    const shortfall = Math.max(0, prog.expectedAccountedCount - prog.accountedCount);
+    prog.accountedCount = prog.expectedAccountedCount;
+    prog.pageTaskCompleted = prog.expectedAccountedCount + prog.uploadTasksBase;
     prog.pageTaskTotal = Math.max(prog.pageTaskTotal, prog.receivedTaskTotal);
     prog.allPagesReceived = true;
+    prog.paginationDrained = true;
+    prog.remoteResponseReceived = true;
     prog.uploadComplete = true;
     // 页 bucket 全部关闭，避免 pages Map 中未完成页干扰后续判定
     for (const page of prog.pages.values()) {

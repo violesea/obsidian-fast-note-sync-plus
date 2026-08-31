@@ -44,6 +44,8 @@ export interface WebSocketClientOptions {
 
   serializeMessage?: (action: string, payload: unknown) => Uint8Array;
   deserializeMessage?: (data: Uint8Array) => { action: string; [key: string]: unknown };
+  /** Runtime protocol gate. iOS currently has a server-confirmed protobuf incompatibility. */
+  shouldUseProtobuf?: () => boolean;
 }
 
 /** Result of attempting to write a text/protobuf message to the socket. */
@@ -334,7 +336,9 @@ export class WebSocketClient {
                   
                   // Only upgrade to Protobuf if the setting is enabled locally
                   // 仅在本地设置启用时才升级为 Protobuf
-                  if (result.action === "ClientInfo" && this.plugin.settings?.protobufEnabled !== false) {
+                  const protobufAllowed = this.options.shouldUseProtobuf?.()
+                    ?? this.plugin.settings?.protobufEnabled !== false;
+                  if (result.action === "ClientInfo" && protobufAllowed) {
                     this.useProtobuf = true;
                     dump("WS Client upgraded to Protobuf successfully");
                   }

@@ -43,6 +43,36 @@ tracker.recordPageProgress("note", 0, 1, false);
 tracker.recordCompleted("note", 0);
 assert.deepEqual(pageAcks, [0]);
 
+// Contract: a successful file write must be counted exactly once. The
+// download-completion hook is observational; recordCompleted() is the single
+// page-task event that advances materialization and page ACK accounting.
+{
+  const materializationTracker = new SyncProgressTracker();
+  materializationTracker.reset(["file"]);
+  materializationTracker.setDownloadTotal("file", 2);
+  materializationTracker.recordUploadComplete("file");
+  materializationTracker.recordPageProgress("file", 0, 2, true);
+  materializationTracker.recordDownloadComplete("file");
+  materializationTracker.recordCompleted("file", 0);
+  assert.equal(materializationTracker.getTypeCompletionSnapshot("file").accountedCount, 1);
+  assert.equal(materializationTracker.isTypeFullyDone("file"), false, "one of two files must keep the round open");
+  materializationTracker.recordCompleted("file", 0);
+  assert.equal(materializationTracker.getTypeCompletionSnapshot("file").accountedCount, 2);
+  assert.equal(materializationTracker.isTypeFullyDone("file"), true);
+}
+
+// Contract: an inferred empty SyncEnd may close a genuinely empty response,
+// but a later non-terminal page re-opens the gate until its terminal page is
+// observed. This prevents a late page from being hidden by an early empty End.
+{
+  const latePageTracker = new SyncProgressTracker();
+  latePageTracker.reset(["note"]);
+  latePageTracker.recordUploadComplete("note");
+  assert.equal(latePageTracker.isTypeFullyDone("note"), true);
+  latePageTracker.recordPageProgress("note", 0, 1, false);
+  assert.equal(latePageTracker.isTypeFullyDone("note"), false);
+}
+
 // Contract: a stalled page ACK is retried at most three times, then the
 // transport-recovery callback is raised instead of resending forever.
 const stalledTracker = new SyncProgressTracker();

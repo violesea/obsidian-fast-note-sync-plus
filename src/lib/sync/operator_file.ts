@@ -1181,12 +1181,14 @@ export const receiveFileUpload = async function (data: FileUploadMessage, plugin
   const file = plugin.app.vault.getFileByPath(normalizePath(data.path));
   if (!file) {
     dump("File not found for upload: " + data.path);
+    plugin.fileSyncTasks.failed++;
     plugin.recordSyncCompleted('file', data.pageIndex);
     return;
   }
   if (isLargeBinarySyncRisk(file.stat.size, plugin)) {
     dump("Skip file upload for large attachment (" + describeBinarySyncLimit() + " limit): " + data.path, file.stat.size);
     notifyLargeFileSkipped(plugin, data.path, file.stat.size, "Fast Note Sync skipped large file upload: " + data.path);
+    plugin.fileSyncTasks.failed++;
     plugin.recordSyncCompleted('file', data.pageIndex);
     return;
   }
@@ -1266,6 +1268,7 @@ export const receiveFileSyncUpdate = async function (data: ReceiveFileSyncUpdate
   if (isLargeBinarySyncRisk(data.size, plugin)) {
     dump(`Skip file download for large attachment (${describeBinarySyncLimit()} limit): ${data.path}`, data.size)
     notifyLargeFileSkipped(plugin, data.path, data.size, `Fast Note Sync skipped large file download: ${data.path}`)
+    plugin.fileSyncTasks.failed++
     plugin.recordSyncCompleted('file', data.pageIndex);
     return
   }
@@ -1297,6 +1300,7 @@ export const receiveFileSyncUpdate = async function (data: ReceiveFileSyncUpdate
   // Skip with failure accounting while cooling down; retry resumes on expiry.
   if (isDownloadCoolingDown(plugin, data.path)) {
     dump(`File download skipped (cooldown after recent failure): ${data.path}`);
+    plugin.fileSyncTasks.failed++
     plugin.recordSyncCompleted('file', data.pageIndex);
     return
   }
@@ -1337,11 +1341,9 @@ export const receiveFileSyncUpdate = async function (data: ReceiveFileSyncUpdate
     void plugin.websocket.SendMessage("FileChunkDownload", requestData)
     plugin.totalFilesToDownload++
 
-    // 更新同步时间
-    // Update sync time
-    if (data.lastTime && data.lastTime > Number(plugin.localStorageManager.getMetadata("lastFileSyncTime"))) {
-      plugin.localStorageManager.setMetadata("lastFileSyncTime", data.lastTime)
-    }
+    // The file watermark is committed only after this session is written and
+    // verified. Advancing it when metadata merely schedules a chunk request
+    // would allow a reload to skip the still-unmaterialized file.
   } catch (e) {
     plugin.concurrencyLimiter.releaseSlot(slotKey)
     throw e;
@@ -1351,13 +1353,13 @@ export const receiveFileSyncUpdate = async function (data: ReceiveFileSyncUpdate
 /**
  * 接收服务端文件删除通知
  */
-export const receiveFileSyncDelete = async function (data: ReceivePathMessage, plugin: FastSync) {
-  if (!(await waitForFileActivity(plugin))) return
-  if (plugin.settings.syncEnabled == false) return
+export const receiveFileSyncDelete = async function (data: ReceivePathMessage, plugin: FastSync): Promise<boolean> {
+  if (!(await waitForFileActivity(plugin))) return false
+  if (plugin.settings.syncEnabled == false) return false
 
   if (isPathExcluded(data.path, plugin)) {
     plugin.recordSyncCompleted('file', data.pageIndex);
-    return
+    return true
   }
 
   if (plugin.localStorageManager.getMetadata("isInitSync") && isCloudPreviewRuntimeEnabled(plugin.settings)) {
@@ -1366,49 +1368,53 @@ export const receiveFileSyncDelete = async function (data: ReceivePathMessage, p
       if (FileCloudPreview.isRestrictedType(ext)) {
         dump(`Cloud Preview: Skipping restricted file delete: ${data.path}`);
         plugin.recordSyncCompleted('file', data.pageIndex);
-        return;
+        return true;
       }
     } else {
       dump(`Cloud Preview: Skipping all file deletes: ${data.path}`);
       plugin.recordSyncCompleted('file', data.pageIndex);
-      return;
+      return true;
     }
   }
 
   dump(`Receive file delete: `, data.path)
   const normalizedPath = normalizePath(data.path)
 
-  await plugin.lockManager.withLock(normalizedPath, async () => {
-    const file = plugin.app.vault.getFileByPath(normalizedPath)
-    if (file instanceof TFile) {
-      plugin.addIgnoredFile(normalizedPath)
-      // 记录待删除路径
-      plugin.lastSyncPathDeleted.add(normalizedPath)
-      try {
-        if (!(await waitForFileActivity(plugin))) return
-        await vaultDelete(plugin.app.vault, file)
-        // 服务端推送删除,从哈希表中移除
-        plugin.fileHashManager.removeFileHash(normalizedPath)
-        plugin.lastSyncMtime.delete(normalizedPath)
-        // 更新同步时间
-        if (data.lastTime && data.lastTime > Number(plugin.localStorageManager.getMetadata("lastFileSyncTime"))) {
-          plugin.localStorageManager.setMetadata("lastFileSyncTime", data.lastTime)
+  let applied = true
+  try {
+    await plugin.lockManager.withLock(normalizedPath, async () => {
+      const file = plugin.app.vault.getFileByPath(normalizedPath)
+      if (file instanceof TFile) {
+        plugin.addIgnoredFile(normalizedPath)
+        // 记录待删除路径
+        plugin.lastSyncPathDeleted.add(normalizedPath)
+        try {
+          if (!(await waitForFileActivity(plugin))) {
+            applied = false
+            return
+          }
+          await vaultDelete(plugin.app.vault, file)
+          // 服务端推送删除,从哈希表中移除
+          plugin.fileHashManager.removeFileHash(normalizedPath)
+          plugin.lastSyncMtime.delete(normalizedPath)
+        } finally {
+          // 延时 500ms 清理
+          window.setTimeout(() => {
+            plugin.removeIgnoredFile(normalizedPath)
+            plugin.lastSyncPathDeleted.delete(normalizedPath)
+          }, 500);
         }
-      } finally {
-        // 延时 500ms 清理
-        window.setTimeout(() => {
-          plugin.removeIgnoredFile(normalizedPath)
-          plugin.lastSyncPathDeleted.delete(normalizedPath)
-        }, 500);
       }
-    }
-  }, { maxRetries: 5, retryInterval: 100 }).catch(e => {
+    }, { maxRetries: 5, retryInterval: 100 })
+  } catch (e) {
     dumpError(`[FastSync] Failed to receiveFileSyncDelete: ${normalizedPath}`, e);
     SyncLogManager.getInstance().addLog('receive', 'FileDelete', e instanceof Error ? e.message : String(e), 'error', data.path);
     plugin.fileSyncTasks.failed++
-  });
+    applied = false
+  }
 
   plugin.recordSyncCompleted('file', data.pageIndex)
+  return applied
 }
 
 /**
@@ -1446,10 +1452,7 @@ export const receiveFileSyncMtime = async function (data: ReceiveMtimeMessage, p
     if (file) {
       if (isLargeBinarySyncRisk(file.stat.size, plugin)) {
         dump(`Skip binary mtime rewrite for large attachment (${describeBinarySyncLimit()} limit): ${normalizedPath}`, file.stat.size)
-        plugin.lastSyncMtime.set(data.path, data.mtime)
-        if (data.lastTime && data.lastTime > Number(plugin.localStorageManager.getMetadata("lastFileSyncTime"))) {
-          plugin.localStorageManager.setMetadata("lastFileSyncTime", data.lastTime)
-        }
+        plugin.fileSyncTasks.failed++
         return
       }
       if (!(await waitForFileActivity(plugin))) return
@@ -1460,15 +1463,13 @@ export const receiveFileSyncMtime = async function (data: ReceiveMtimeMessage, p
         await plugin.app.vault.modifyBinary(file, content, { ...(data.ctime > 0 && { ctime: data.ctime }), ...(data.mtime > 0 && { mtime: data.mtime }) })
         // 记录 mtime
         plugin.lastSyncMtime.set(data.path, data.mtime)
-        // 更新同步时间
-        if (data.lastTime && data.lastTime > Number(plugin.localStorageManager.getMetadata("lastFileSyncTime"))) {
-          plugin.localStorageManager.setMetadata("lastFileSyncTime", data.lastTime)
-        }
       } finally {
         window.setTimeout(() => {
           plugin.removeIgnoredFile(normalizedPath)
         }, 500);
       }
+    } else {
+      plugin.fileSyncTasks.failed++
     }
   }, { maxRetries: 5, retryInterval: 100 }).catch(e => {
     dumpError(`[FastSync] Failed to receiveFileSyncMtime: ${normalizedPath}`, e);
@@ -1581,9 +1582,9 @@ export const receiveFileSyncChunkDownload = async function (data: FileSyncChunkD
       if (!(await waitForFileActivity(plugin))) return
       if (!(await plugin.app.vault.adapter.exists(session.tempDir))) {
         dumpError(`Temp dir creation failed for session ${session.sessionId}, will retry on first chunk`, e)
+        }
       }
     }
-  }
 
   // 仅在非同步期间(实时监听时)手动增加分片计数。同步期间由 SyncEnd 包装器统一预估
   if (!plugin.isSyncing) {
@@ -1627,9 +1628,9 @@ export const receiveFileSyncEnd = async function (data: unknown, plugin: FastSyn
   plugin.fileSyncTasks.needSyncMtime = syncData.needSyncMtimeCount || 0
   plugin.fileSyncTasks.needDelete = syncData.needDeleteCount || 0
 
-  // 无条件更新 lastFileSyncTime，确保包含服务端本轮同步后的所有异步操作（如 SyncResourceFID）
-  // Unconditionally update lastFileSyncTime to cover all async server-side ops after this sync round (e.g., SyncResourceFID)
-  plugin.localStorageManager.setMetadata("lastFileSyncTime", syncData.lastTime)
+  // Keep the server watermark in SyncProgressTracker. The completion gate
+  // commits it only after every announced file has been materialized and
+  // verified; SyncEnd alone is only a transport response.
   plugin.syncTypeCompleteCount++
 }
 
@@ -1903,10 +1904,6 @@ export const receiveFileSyncRename = async function (data: { oldPath: string; pa
         const renamedFile = plugin.app.vault.getFileByPath(normalizedNewPath)
         plugin.fileHashManager.setFileHash(data.path, data.contentHash || "", renamedFile instanceof TFile ? renamedFile.stat.mtime : 0, renamedFile instanceof TFile ? renamedFile.stat.size : 0)
 
-        // 更新同步时间
-        if (data.lastTime && data.lastTime > Number(plugin.localStorageManager.getMetadata("lastFileSyncTime"))) {
-          plugin.localStorageManager.setMetadata("lastFileSyncTime", data.lastTime)
-        }
       } finally {
         window.setTimeout(() => {
           plugin.removeIgnoredFile(normalizedNewPath)
@@ -1922,6 +1919,7 @@ export const receiveFileSyncRename = async function (data: { oldPath: string; pa
         if (sizeMatch) {
           if (isLargeBinarySyncRisk(targetFile.stat.size, plugin)) {
             dump(`Skip rename target hash for large attachment (${describeBinarySyncLimit()} limit): ${data.path}`, targetFile.stat.size)
+            plugin.fileSyncTasks.failed++
             plugin.recordSyncCompleted('file', data.pageIndex)
             return
           }
@@ -1942,10 +1940,10 @@ export const receiveFileSyncRename = async function (data: { oldPath: string; pa
         pathHash: data.pathHash,
       }
       void plugin.websocket.SendMessage("FileRePush", rePushData)
-      if (data.contentHash) {
-        const targetFile = plugin.app.vault.getFileByPath(normalizePath(data.path))
-        plugin.fileHashManager.setFileHash(data.path, data.contentHash, targetFile instanceof TFile ? targetFile.stat.mtime : 0, targetFile instanceof TFile ? targetFile.stat.size : 0)
-      }
+      // RePush is only a request, not local materialization. Account this
+      // rename as failed so the round can drain without committing a watermark;
+      // a later round retries after the RePush payload has actually landed.
+      plugin.fileSyncTasks.failed++
     }
   }, { maxRetries: 10, retryInterval: 100 }).catch(e => {
     dumpError(`[FastSync] Failed to receiveFileSyncRename: ${normalizedOldPath} -> ${normalizedNewPath}`, e);
@@ -1967,7 +1965,7 @@ const handleFileChunkDownloadComplete = async function (session: FileDownloadSes
   try {
     if (isLargeBinarySyncRisk(session.size, plugin)) {
       dump(`Skip assembling large downloaded attachment (${describeBinarySyncLimit()} limit): ${session.path}`, session.size)
-      await cleanupFileDownloadSession(plugin, session)
+      await cleanupFileDownloadSession(plugin, session, true)
       return
     }
     // 逐片读入后立即写入目标缓冲区并释放分片引用，避免 chunks 数组与整份 buffer 同时驻留内存 (2x 峰值)
@@ -2039,15 +2037,6 @@ const handleFileChunkDownloadComplete = async function (session: FileDownloadSes
         }, 500);
       }
 
-      // ISSUE-039：lastFileSyncTime 只在写盘读回通过后推进（原实现在此前推进，
-      // 属"收到元数据即推进时间戳"的假完成路径）。
-      // ISSUE-039: lastFileSyncTime advances only after the read-back check —
-      // the old code advanced it beforehand (the "metadata received = timestamp
-      // advanced" false-completion path).
-      if (Number(plugin.localStorageManager.getMetadata("lastFileSyncTime")) < session.lastTime) {
-        plugin.localStorageManager.setMetadata("lastFileSyncTime", session.lastTime)
-      }
-
       // ISSUE-039 完整性门禁：本地字节是唯一事实。组装后按本地字节计算哈希与
       // 服务端声明比对——不一致即失败（保留失败状态，不更新基线/时间戳/完成数），
       // 杜绝"信任服务端 hash 而写入了残缺字节"的假完成。本地算出的哈希照样入库，
@@ -2088,7 +2077,8 @@ const handleFileChunkDownloadComplete = async function (session: FileDownloadSes
     plugin.fileDownloadSessions.delete(session.sessionId)
     if (session.tempDir) await clearTempChunksDir(plugin, session.sessionId)
     plugin.downloadedFilesCount++
-    plugin.progressTracker.recordDownloadComplete('file');
+    // recordSyncCompleted below is the single completion event. The file has
+    // already passed write/read-back/hash verification at this point.
     plugin.recordSyncCompleted('file', session.pageIndex)
   } catch (e) {
     dumpError(`Error completing file download for ${session.path}`, e)
@@ -2125,10 +2115,6 @@ export const receiveFileRenameAck = function (data: { lastTime?: number }, plugi
     } else {
       dump(`FileRenameAck ignored as stale for ${pending.newPath}`)
     }
-  }
-  if (data.lastTime && data.lastTime > Number(plugin.localStorageManager.getMetadata("lastFileSyncTime"))) {
-    plugin.localStorageManager.setMetadata("lastFileSyncTime", data.lastTime)
-    dump(`FileRenameAck: lastFileSyncTime updated to`, data.lastTime)
   }
   plugin.concurrencyLimiter.releaseFifoSlot()
 }
@@ -2175,10 +2161,6 @@ export const receiveFileUploadAck = function (data: { lastTime?: number; path?: 
     const vaultName = plugin.app.vault.getName()
     try { plugin.app.saveLocalStorage(`fns-${vaultName}-uploadSession-${checkpointPathHash}`, null) } catch { /* ignore */ }
   }
-  if (data.lastTime && data.lastTime > Number(plugin.localStorageManager.getMetadata("lastFileSyncTime"))) {
-    plugin.localStorageManager.setMetadata("lastFileSyncTime", data.lastTime)
-    dump(`FileUploadAck: lastFileSyncTime updated to`, data.lastTime)
-  }
   if (data.path) {
     if (active) releaseUploadSlot(plugin, data.path, active)
     else plugin.concurrencyLimiter.releaseSlot(data.path)
@@ -2208,9 +2190,6 @@ export const receiveFileDeleteAck = function (data: { lastTime?: number; path?: 
     const journalResult = plugin.incrementalScanManager?.acknowledge("file", data.path)
     if (journalResult !== "stale") plugin.fileHashManager.removeFileHash(data.path)
     plugin.pendingFileDeleteAcks.delete(data.path)
-  }
-  if (data.lastTime && data.lastTime > Number(plugin.localStorageManager.getMetadata("lastFileSyncTime"))) {
-    plugin.localStorageManager.setMetadata("lastFileSyncTime", data.lastTime)
   }
   if (data.path) {
     plugin.concurrencyLimiter.releaseSlot(data.path)
