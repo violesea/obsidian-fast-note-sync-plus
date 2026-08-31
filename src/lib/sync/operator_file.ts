@@ -323,7 +323,9 @@ export const clearTempChunksDir = async (plugin: FastSync, sessionId: string) =>
   await clearTempDirectory(plugin, getTempChunksDir(plugin, sessionId))
 }
 
-const shouldUseMemoryDownload = (size: number) => Platform.isMobile && size <= MAX_DOWNLOAD_BUFFER_BYTES
+const shouldUseMemoryDownload = (size: number) => (
+  Platform.isMobile && !Platform.isIosApp && size <= MAX_DOWNLOAD_BUFFER_BYTES
+)
 
 const createDownloadStorage = (plugin: FastSync, sessionId: string, size: number): Pick<FileDownloadSession, "chunks" | "downloadedChunks" | "tempDir"> => {
   if (shouldUseMemoryDownload(size)) {

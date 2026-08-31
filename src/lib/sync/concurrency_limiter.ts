@@ -1,5 +1,16 @@
 import type FastSync from "../../main";
+import { Platform } from "obsidian";
 import { dump } from "../utils/helpers";
+
+export function effectiveOperationConcurrency(configured: number, isIosApp: boolean): number {
+    if (isIosApp) return 1;
+    if (!Number.isFinite(configured)) return 1;
+    return Math.max(1, Math.floor(configured));
+}
+
+export function shouldEnforceOperationLimiter(configuredEnabled: boolean, isIosApp: boolean): boolean {
+    return configuredEnabled || isIosApp;
+}
 
 /**
  * 并发管理器
@@ -24,11 +35,11 @@ export class ConcurrencyLimiter {
      * @param priority 优先级（数字越大优先级越高，用于实现先上传后下载等逻辑）
      */
     public async waitForSlot(key: string, isFifo: boolean = false, priority: number = 0): Promise<void> {
-        if (!this.plugin.settings.concurrencyControlEnabled) {
+        if (!this.isLimiterActive()) {
             return;
         }
 
-        if (this.activeKeys.size < this.plugin.settings.maxConcurrentUploads) {
+        if (this.activeKeys.size < this.getConcurrencyLimit()) {
             this.activeKeys.add(key);
             if (isFifo) this.fifoKeys.push(key);
             dump(`Concurrency: Slot acquired immediately for ${key} (Priority: ${priority}). Active: ${this.activeKeys.size}`);
@@ -57,7 +68,7 @@ export class ConcurrencyLimiter {
      * @param key 任务标识
      */
     public releaseSlot(key: string): void {
-        if (!this.plugin.settings.concurrencyControlEnabled) {
+        if (!this.isLimiterActive()) {
             return;
         }
 
@@ -80,7 +91,7 @@ export class ConcurrencyLimiter {
      * 针对没有带 path 的 ACK，释放最早的一个 FIFO 槽位
      */
     public releaseFifoSlot(): void {
-        if (!this.plugin.settings.concurrencyControlEnabled) {
+        if (!this.isLimiterActive()) {
             return;
         }
 
@@ -101,7 +112,7 @@ export class ConcurrencyLimiter {
         if (queueCount > 0) {
             dump(`Concurrency: Processing queue. Active: ${activeCount}, Queued: ${queueCount}`);
         }
-        while (this.activeKeys.size < this.plugin.settings.maxConcurrentUploads && this.queue.length > 0) {
+        while (this.activeKeys.size < this.getConcurrencyLimit() && this.queue.length > 0) {
             const next = this.queue.shift();
             if (next) {
                 dump(`Concurrency: Resuming task ${next.key} from queue.`);
@@ -124,6 +135,20 @@ export class ConcurrencyLimiter {
         for (const item of pending) {
             item.resolve();
         }
+    }
+
+    private isLimiterActive(): boolean {
+        return shouldEnforceOperationLimiter(
+            this.plugin.settings.concurrencyControlEnabled,
+            Platform.isIosApp,
+        );
+    }
+
+    private getConcurrencyLimit(): number {
+        return effectiveOperationConcurrency(
+            this.plugin.settings.maxConcurrentUploads,
+            Platform.isIosApp,
+        );
     }
 
 }

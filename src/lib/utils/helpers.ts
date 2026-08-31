@@ -546,7 +546,7 @@ async function readRange(app: App, path: string, offset: number, length: number,
  * 直接通过文件路径计算哈希 (优化：大文件仅读取头/中/尾，避免 OOM)
  * Calculate hash directly from file path (Optimization: read only head/tail for large files to avoid OOM)
  */
-export const hashFileAsync = async function (app: App, path: string, owner?: BackgroundActivityOwner): Promise<string> {
+const hashFileWithoutAdmission = async function (app: App, path: string, owner?: BackgroundActivityOwner): Promise<string> {
   if (owner) await requireForeground(owner);
   const stat = await app.vault.adapter.stat(path)
   if (!stat) return "0"
@@ -600,6 +600,29 @@ export const hashFileAsync = async function (app: App, path: string, owner?: Bac
   const hash = await computeRollingHash(view, owner)
   dump(`[HashFile] [Calc] path=${path} size=${formatFileSize(size)} hash=${hash}`)
   return hash
+}
+
+let iosHashTail: Promise<void> = Promise.resolve()
+
+export const runWithIosHashAdmission = async function <T>(task: () => Promise<T>): Promise<T> {
+  if (!Platform.isIosApp) return task()
+
+  const predecessor = iosHashTail
+  let release!: () => void
+  iosHashTail = new Promise<void>((resolve) => {
+    release = resolve
+  })
+
+  await predecessor
+  try {
+    return await task()
+  } finally {
+    release()
+  }
+}
+
+export const hashFileAsync = async function (app: App, path: string, owner?: BackgroundActivityOwner): Promise<string> {
+  return runWithIosHashAdmission(() => hashFileWithoutAdmission(app, path, owner))
 }
 
 /**
