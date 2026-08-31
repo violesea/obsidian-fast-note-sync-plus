@@ -55,6 +55,19 @@ const requireStub = (id) => {
     captureStableSnapshot: async () => ({ value: "", hash: "0", stat: { size: 0, mtime: 0, ctime: 0 } }),
     stableCaptureCoordinator: { capture: async (_key, task) => task() },
   };
+  if (id === "./vault_folder") return {
+    createVaultFolderIdempotent: async (vault, folderPath) => {
+      if (vault.getFolderByPath(folderPath) != null) return "existing";
+      try {
+        await vault.createFolder(folderPath);
+        return "created";
+      } catch (error) {
+        const stat = await vault.adapter.stat(folderPath);
+        if (stat?.type === "folder") return "existing";
+        throw error;
+      }
+    },
+  };
   throw new Error(`Unexpected require: ${id}`);
 };
 
@@ -243,6 +256,65 @@ const incoming = (contentHash, content = "") => ({
   assert.equal(calls.fetched, 0);
   assert.equal(file.content, "");
   assert.deepEqual(calls.completed, [4]);
+}
+
+// Contract: when a concurrent note creates the same parent folder first,
+// Obsidian may throw "Folder already exists" before its metadata cache sees
+// the folder. Adapter-confirmed folder existence must still allow the note to
+// materialize and advance its page accounting.
+{
+  const placeholder = makeFile("notes/example.md", "fresh");
+  const { plugin, calls } = makePlugin(placeholder, {
+    path: placeholder.path,
+    pathHash: "path-hash",
+    content: "fresh",
+    contentHash: "h:fresh",
+    ctime: 1,
+    mtime: 2,
+    lastTime: 0,
+  });
+  let materialized = null;
+  plugin.app.vault.getFileByPath = () => materialized;
+  plugin.app.vault.getFolderByPath = () => null;
+  plugin.app.vault.adapter = {
+    stat: async (target) => target === "notes" ? { type: "folder" } : null,
+  };
+  plugin.app.vault.createFolder = async () => { throw new Error("Folder already exists."); };
+  plugin.app.vault.create = async (pathName, content, options) => {
+    calls.created++;
+    materialized = makeFile(pathName, content);
+    materialized.stat.mtime = options?.mtime ?? materialized.stat.mtime;
+    materialized.stat.ctime = options?.ctime ?? materialized.stat.ctime;
+    return materialized;
+  };
+
+  await receiveNoteSyncModify(incoming("h:fresh", "fresh"), plugin);
+  assert.equal(calls.created, 1);
+  assert.equal(materialized.content, "fresh");
+  assert.deepEqual(calls.completed, [4]);
+  assert.equal(plugin.noteSyncTasks.failed, 0);
+}
+
+// Contract: an unindexed symlink alias that already has the exact server body
+// is an idempotent receive. It must not call Vault.create() and strand the page
+// with "File already exists".
+{
+  const placeholder = makeFile("notes/example.md", "same");
+  const { plugin, calls } = makePlugin(placeholder, null);
+  plugin.app.vault.getFileByPath = () => null;
+  plugin.app.vault.getFolderByPath = () => null;
+  plugin.app.vault.adapter = {
+    stat: async (target) => target === placeholder.path
+      ? { type: "file", mtime: 2, ctime: 1, size: 4 }
+      : null,
+    read: async () => "same",
+  };
+  plugin.app.vault.create = async () => { throw new Error("File already exists."); };
+
+  await receiveNoteSyncModify(incoming("h:same", "same"), plugin);
+  assert.equal(calls.created, 0);
+  assert.deepEqual(calls.completed, [4]);
+  assert.equal(plugin.noteSyncTasks.failed, 0);
 }
 
 // Contract: a zero-byte file whose durable hash claims non-empty content is

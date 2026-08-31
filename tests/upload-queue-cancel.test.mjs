@@ -102,6 +102,8 @@ const requireStub = (id) => {
       };
     case "./sync_feature_policy":
       return { isCloudPreviewRuntimeEnabled: () => false };
+    case "./vault_folder":
+      return { createVaultFolderIdempotent: async () => "existing" };
     default:
       throw new Error(`Unexpected require: ${id}`);
   }

@@ -19,45 +19,106 @@ import type FastSync from "../../main";
  * deleted after the final durable commit.
  */
 export type ScanDeltaEntry = { hash: string; mtime: number; size: number; ctime?: number };
+export type ScanProgressCheckpoint = {
+  processedCount: number;
+  totalFiles: number;
+  anchorPath: string;
+};
+export type ScanDeltaRecovery = {
+  loaded: number;
+  progress: ScanProgressCheckpoint | null;
+};
 
 const scanDeltaPath = (plugin: FastSync): string => normalizePath(`${getPluginDir(plugin)}/scanDelta.jsonl`);
 
-export const appendScanDelta = async (plugin: FastSync, kind: "note" | "file", entries: Map<string, ScanDeltaEntry>): Promise<void> => {
-  if (entries.size === 0) return;
-  try {
-    const lines: string[] = [];
-    for (const [path, e] of entries) {
-      lines.push(JSON.stringify({ k: kind, p: path, h: e.hash, m: e.mtime, s: e.size, c: e.ctime ?? 0 }));
-    }
+// Adapter.append is not guaranteed to be atomic across concurrent callers.
+// Serialize note/file/progress records so a reload can never observe two
+// interleaved JSON lines or a cursor that was written before its hash batch.
+let appendChain: Promise<void> = Promise.resolve();
+
+const appendLines = async (plugin: FastSync, lines: string[]): Promise<boolean> => {
+  if (lines.length === 0) return true;
+  const task = appendChain.then(async () => {
     await plugin.app.vault.adapter.append(scanDeltaPath(plugin), lines.join("\n") + "\n");
+  });
+  appendChain = task.catch(() => undefined);
+  try {
+    await task;
+    return true;
   } catch (e) {
-    // 检查点 IO 失败绝不打断扫描——最坏情况退回旧行为（重启重扫）
+    // The caller must retain its in-memory batch when persistence fails.
     dump(`[ScanDelta] append failed (non-fatal): ${e instanceof Error ? e.message : String(e)}`);
+    return false;
   }
 };
 
-export const loadScanDelta = async (plugin: FastSync): Promise<number> => {
+export const appendScanDelta = async (plugin: FastSync, kind: "note" | "file", entries: Map<string, ScanDeltaEntry>): Promise<boolean> => {
+  if (entries.size === 0) return true;
+  const lines: string[] = [];
+  for (const [path, e] of entries) {
+    lines.push(JSON.stringify({ k: kind, p: path, h: e.hash, m: e.mtime, s: e.size, c: e.ctime ?? 0 }));
+  }
+  return appendLines(plugin, lines);
+};
+
+export const appendScanProgress = async (plugin: FastSync, checkpoint: ScanProgressCheckpoint): Promise<boolean> => {
+  if (!Number.isSafeInteger(checkpoint.processedCount)
+    || !Number.isSafeInteger(checkpoint.totalFiles)
+    || checkpoint.processedCount <= 0
+    || checkpoint.processedCount > checkpoint.totalFiles
+    || !checkpoint.anchorPath) return false;
+  return appendLines(plugin, [JSON.stringify({
+    k: "progress",
+    v: 1,
+    n: checkpoint.processedCount,
+    t: checkpoint.totalFiles,
+    a: checkpoint.anchorPath,
+  })]);
+};
+
+const parseRecovery = (raw: string): {
+  noteEntries: Map<string, ScanDeltaEntry>;
+  fileEntries: Map<string, ScanDeltaEntry>;
+  recovery: ScanDeltaRecovery;
+} => {
+  const noteEntries = new Map<string, ScanDeltaEntry>();
+  const fileEntries = new Map<string, ScanDeltaEntry>();
+  let loaded = 0;
+  let progress: ScanProgressCheckpoint | null = null;
+  for (const line of raw.split("\n")) {
+    const t = line.trim();
+    if (!t) continue;
+    try {
+      const d: unknown = JSON.parse(t);
+      if (typeof d !== "object" || d === null) continue;
+      const rec = d as { k?: unknown; p?: unknown; h?: unknown; m?: unknown; s?: unknown; c?: unknown; v?: unknown; n?: unknown; t?: unknown; a?: unknown };
+      if (rec.k === "progress") {
+        if (rec.v === 1
+          && Number.isSafeInteger(rec.n)
+          && Number.isSafeInteger(rec.t)
+          && (rec.n as number) > 0
+          && (rec.n as number) <= (rec.t as number)
+          && typeof rec.a === "string"
+          && rec.a.length > 0) {
+          progress = { processedCount: rec.n as number, totalFiles: rec.t as number, anchorPath: rec.a };
+        }
+        continue;
+      }
+      if (typeof rec.p !== "string" || typeof rec.h !== "string") continue;
+      const entry: ScanDeltaEntry = { hash: rec.h, mtime: Number(rec.m) || 0, size: Number(rec.s) || 0, ctime: Number(rec.c) || undefined };
+      (rec.k === "file" ? fileEntries : noteEntries).set(rec.p, entry);
+      loaded++;
+    } catch { /* skip corrupt lines */ }
+  }
+  return { noteEntries, fileEntries, recovery: { loaded, progress } };
+};
+
+export const loadScanRecovery = async (plugin: FastSync): Promise<ScanDeltaRecovery> => {
   try {
     const file = scanDeltaPath(plugin);
-    if (!(await plugin.app.vault.adapter.exists(file))) return 0;
+    if (!(await plugin.app.vault.adapter.exists(file))) return { loaded: 0, progress: null };
     const raw = await plugin.app.vault.adapter.read(file);
-    const noteEntries = new Map<string, ScanDeltaEntry>();
-    const fileEntries = new Map<string, ScanDeltaEntry>();
-    let loaded = 0;
-    for (const line of raw.split("\n")) {
-      const t = line.trim();
-      if (!t) continue;
-      try {
-        const d: unknown = JSON.parse(t);
-        if (typeof d !== "object" || d === null) continue;
-        const rec = d as { k?: unknown; p?: unknown; h?: unknown; m?: unknown; s?: unknown; c?: unknown };
-        if (typeof rec.p !== "string" || typeof rec.h !== "string") continue;
-        const entry: ScanDeltaEntry = { hash: rec.h, mtime: Number(rec.m) || 0, size: Number(rec.s) || 0, ctime: Number(rec.c) || undefined };
-        (rec.k === "file" ? fileEntries : noteEntries).set(rec.p, entry);
-        loaded++;
-      } catch { /* 跳过损坏行 */ }
-    }
-    if (loaded === 0) return 0;
+    const { noteEntries, fileEntries, recovery } = parseRecovery(raw);
     // 预载目标：优先用调用方注入的 direct applier（冷建场景的调用者就是
     // FileHashManager 自身，plugin.fileHashManager 回调会指回 stub 而非被测对象）；
     // 无注入时回退到 plugin.fileHashManager（operator 扫描路径）。
@@ -73,11 +134,39 @@ export const loadScanDelta = async (plugin: FastSync): Promise<number> => {
       if (noteEntries.size) plugin.fileHashManager.bulkSetFromScanned(noteEntries, false);
       if (fileEntries.size) plugin.fileHashManager.bulkSetFromScanned(fileEntries, false);
     }
-    dump(`[ScanDelta] resumed ${loaded} hashed entr${loaded === 1 ? "y" : "ies"} from an interrupted scan`);
-    return loaded;
+    if (recovery.loaded > 0) {
+      dump(`[ScanDelta] resumed ${recovery.loaded} hashed entr${recovery.loaded === 1 ? "y" : "ies"} from an interrupted scan`);
+    }
+    return recovery;
   } catch {
-    return 0;
+    return { loaded: 0, progress: null };
   }
+};
+
+export const loadScanDelta = async (plugin: FastSync): Promise<number> => (await loadScanRecovery(plugin)).loaded;
+
+export const loadScanProgress = async (plugin: FastSync): Promise<ScanProgressCheckpoint | null> => {
+  try {
+    const file = scanDeltaPath(plugin);
+    if (!(await plugin.app.vault.adapter.exists(file))) return null;
+    return parseRecovery(await plugin.app.vault.adapter.read(file)).recovery.progress;
+  } catch {
+    return null;
+  }
+};
+
+export const validateScanProgress = (
+  checkpoint: ScanProgressCheckpoint | null,
+  orderedPaths: readonly (string | { path: string })[],
+): number => {
+  const anchor = orderedPaths[checkpoint?.processedCount ? checkpoint.processedCount - 1 : -1];
+  const anchorPath = typeof anchor === "string" ? anchor : anchor?.path;
+  if (!checkpoint
+    || checkpoint.totalFiles !== orderedPaths.length
+    || checkpoint.processedCount <= 0
+    || checkpoint.processedCount > orderedPaths.length
+    || anchorPath !== checkpoint.anchorPath) return 0;
+  return checkpoint.processedCount;
 };
 
 export const clearScanDelta = async (plugin: FastSync): Promise<void> => {

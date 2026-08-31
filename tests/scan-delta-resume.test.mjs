@@ -49,7 +49,14 @@ vm.runInNewContext(transpiled, {
   console,
 }, { filename: sourcePath });
 
-const { appendScanDelta, loadScanDelta, clearScanDelta } = module.exports;
+const {
+  appendScanDelta,
+  appendScanProgress,
+  loadScanDelta,
+  loadScanProgress,
+  validateScanProgress,
+  clearScanDelta,
+} = module.exports;
 
 const makePlugin = () => {
   const store = new Map();
@@ -134,6 +141,46 @@ const makePlugin = () => {
   await assert.doesNotReject(() => loadScanDelta(broken));
   await assert.doesNotReject(() => clearScanDelta(broken));
   console.log("scenario 4 ok: IO failures degrade silently");
+}
+
+// 5. A reload must restore a verified scan cursor, not only hash candidates.
+// The cursor is valid only for the same ordered vault snapshot. A different
+// total or anchor must fall back to zero so a changed prefix is never skipped
+// or shown as completed.
+{
+  const { plugin } = makePlugin();
+  const paths = ["a.md", "b.md", "folder", "c.pdf"];
+  const persisted = await appendScanProgress(plugin, {
+    processedCount: 3,
+    totalFiles: paths.length,
+    anchorPath: paths[2],
+  });
+  assert.equal(persisted, true, "scan progress append must report durable success");
+
+  const checkpoint = await loadScanProgress(plugin);
+  assert.equal(validateScanProgress(checkpoint, paths), 3, "same snapshot restores the processed cursor");
+  assert.equal(validateScanProgress(checkpoint, [...paths, "new.md"]), 0, "changed total invalidates the cursor");
+  assert.equal(validateScanProgress(checkpoint, ["a.md", "changed", "folder", "c.pdf"]), 3, "changes outside the anchor remain a replay concern, not a cursor rollback");
+  assert.equal(validateScanProgress(checkpoint, ["a.md", "b.md", "changed", "c.pdf"]), 0, "changed anchor invalidates the cursor");
+  console.log("scenario 5 ok: verified scan cursor survives reload");
+}
+
+// 6. Only a completed adapter append is a checkpoint. A failed write must be
+// observable to the caller so it can retain the in-memory batch and retry.
+{
+  const { plugin } = makePlugin();
+  plugin.app.vault.adapter.append = async () => { throw new Error("reload interrupted write"); };
+  assert.equal(
+    await appendScanDelta(plugin, "note", new Map([["lost.md", { hash: "h", mtime: 1, size: 1 }]])),
+    false,
+    "failed delta append must not be reported as durable",
+  );
+  assert.equal(
+    await appendScanProgress(plugin, { processedCount: 1, totalFiles: 1, anchorPath: "lost.md" }),
+    false,
+    "failed cursor append must not be reported as durable",
+  );
+  console.log("scenario 6 ok: interrupted writes remain retryable");
 }
 
 console.log("scan-delta-resume: all scenarios passed");

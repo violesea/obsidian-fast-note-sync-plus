@@ -114,6 +114,7 @@ const mirroredFiles = new Map();
 let hashCalls = 0;
 let shouldInterrupt = true;
 let hashMapSaveCalls = 0;
+const buildStateWrites = [];
 // scanDelta JSONL 的内存替身（2.5.19 起冷建检查点写入这里而非全图 localStorage）
 const scanDeltaStore = new Map();
 let scanDeltaPreloaded = 0;
@@ -145,6 +146,7 @@ function makePlugin() {
       loadLocalStorage: (key) => localStorage.get(key) ?? null,
       saveLocalStorage: (key, value) => {
         if (key === "fns-fileHashMap") hashMapSaveCalls++;
+        if (key === "fns-fileHashBuildState" && value) buildStateWrites.push(JSON.parse(String(value)));
         if (value === null || value === undefined) localStorage.delete(key);
         else localStorage.set(key, String(value));
       },
@@ -212,10 +214,16 @@ assert.equal(JSON.parse(localStorage.get("fns-fileHashBuildState")).phase, "buil
 
 const ReloadedFileHashManager = makeModule();
 const resumed = new ReloadedFileHashManager(makePlugin());
+buildStateWrites.length = 0;
 await resumed.initialize();
 assert.equal(hashCalls, 5100);
 assert.equal(resumed.getBuildStats().phase, "ready");
 assert.equal(resumed.getBuildStats().cacheHits, 5000);
+assert.equal(
+  buildStateWrites[0].processedCount,
+  5000,
+  "reload must preserve the durable processed high-water mark instead of publishing zero",
+);
 
 // Contract: bulk scan updates do not synchronously serialize the complete
 // hash map; an explicit flush still persists the latest local cache.

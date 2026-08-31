@@ -5,6 +5,7 @@ import { hashContent, dump, dumpError, isFolderSyncPathExcluded, waitForFolderEm
 import { SyncLogManager } from "./sync_log_manager";
 import type FastSync from "../../main";
 import { waitForForeground } from "./background_activity_gate";
+import { createVaultFolderIdempotent } from "./vault_folder";
 
 const waitForFolderActivity = async (plugin: FastSync): Promise<boolean> => waitForForeground(plugin);
 
@@ -174,18 +175,10 @@ export const receiveFolderSyncModify = async function (data: { path: string, mti
         await plugin.lockManager.withLock(normalizedPath, async () => {
             plugin.addIgnoredFile(normalizedPath)
             try {
-                    const existingFolder = plugin.app.vault.getAbstractFileByPath(normalizedPath)
-                    if (!existingFolder) {
-                        try {
-                            if (!(await waitForFolderActivity(plugin))) return
-                            await plugin.app.vault.createFolder(normalizedPath)
-                    } catch (e) {
-                        if (!checkAndNotifyCaseConflict(e, data.path, plugin, 'FolderModify')) {
-                            // 文件夹可能因并发创建已存在（Linux 上会抛 "Folder already exists"），忽略此错误
-                            // Folder may already exist due to concurrent creation (Linux throws "Folder already exists"), ignore
-                            dump(`Folder create ignored (may already exist): ${normalizedPath}`, e)
-                        }
-                    }
+                const existingFolder = plugin.app.vault.getAbstractFileByPath(normalizedPath)
+                if (!existingFolder) {
+                    if (!(await waitForFolderActivity(plugin))) return
+                    await createVaultFolderIdempotent(plugin.app.vault, normalizedPath)
                 }
                 plugin.folderSnapshotManager.setFolderMtime(normalizedPath, data.mtime || Date.now())
             } finally {

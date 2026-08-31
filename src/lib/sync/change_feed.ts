@@ -43,6 +43,7 @@ import {
 import type { ChangesResponse, RegisterResponse, SidecarChange } from "./change_feed_logic";
 import { requireForeground } from "./background_activity_gate";
 import { isChangeFeedRuntimeEnabled, isCloudPreviewRuntimeEnabled } from "./sync_feature_policy";
+import { createVaultFolderIdempotent } from "./vault_folder";
 
 function platformKind(): string {
   if (Platform.isIosApp) return Platform.isTablet ? "ipados" : "ios";
@@ -86,18 +87,16 @@ async function ensureParentFolder(
 
   try {
     await requireForeground(plugin);
-    await plugin.app.vault.createFolder(folder);
+    const result = await createVaultFolderIdempotent(plugin.app.vault, folder);
+    if (result === "existing") return;
     // Obsidian creates the missing parent chain for createFolder(). Record
-    // only paths that are now real, so cleanup never targets a guessed path.
+    // the preflight-missing paths only when this invocation won the create.
     for (const candidate of missing) {
-      if (plugin.app.vault.getFolderByPath(candidate) != null) createdFolders.push(candidate);
+      createdFolders.push(candidate);
     }
   } catch (error) {
-    // Concurrent materializers may win the same createFolder race. In that
-    // case this invocation owns nothing and must not delete the winner's
-    // empty folder if its later file write fails.
     await requireForeground(plugin);
-    if (plugin.app.vault.getFolderByPath(folder) == null) throw error;
+    throw error;
   }
 }
 

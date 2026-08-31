@@ -142,8 +142,35 @@ assert.ok(
   "cold-build checkpoints must persist via scanDelta JSONL appends, not full-map serialization",
 );
 assert.ok(
+  /if \(!await appendScanDelta\(this\.plugin, "note", pendingCheckpointEntries\)\) \{[\s\S]{0,180}return false;[\s\S]{0,120}pendingCheckpointEntries\.clear\(\);/.test(hashManagerSource),
+  "cold-build checkpoints must retain their batch when adapter append fails",
+);
+assert.ok(
   !/if \(hashMapChangedSinceCheckpoint\) \{\s*\n\s*this\.saveHashMapToStorage\(\);/.test(hashManagerSource),
   "cold-build checkpoint must not call saveHashMapToStorage (full-map serialization) anymore",
+);
+
+// 8. A process-reload checkpoint is a write-ahead barrier, not a best-effort
+// side effect. The scan loop must await delta/cursor persistence and must not
+// clear its in-memory batch through a fire-and-forget append.
+assert.equal(
+  operatorSource.includes("void appendScanDelta"),
+  false,
+  "operator scan checkpoints must never fire-and-forget scanDelta writes",
+);
+assert.ok(
+  /if \(!await appendScanDelta\(plugin, kind, checkpoint\)\) return false;/.test(operatorSource)
+    && /await checkpointScannedHashes\(plugin, "note", plugin\.scannedNoteHashes\)/.test(operatorSource)
+    && /await checkpointScannedHashes\(plugin, "file", plugin\.scannedFileHashes\)/.test(operatorSource),
+  "operator scan checkpoints must await durable append for both note and file batches",
+);
+assert.ok(
+  /await appendScanProgress\(plugin,/.test(operatorSource),
+  "operator scan checkpoints must persist a reload cursor after hash deltas",
+);
+assert.ok(
+  /restoredScanProgress/.test(operatorSource),
+  "operator scan must restore visible progress instead of restarting at zero",
 );
 
 console.log("issue039-stop-and-wait: all contracts hold");

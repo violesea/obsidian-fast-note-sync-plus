@@ -72,6 +72,31 @@ exhaustedTimer.callback();
 assert.deepEqual(stalledEvents, [{ type: "note", pageIndex: 0, retries: 1 }]);
 assert.equal(stalledAcks.length, 2, "no ACK is sent after the retry budget is exhausted");
 
+// Contract: failures on the very first page leave no previous ACK to resend.
+// After one quiet window the tracker must escalate the unfinished page instead
+// of returning forever; the caller can then terminate the round as failed
+// without falsely ACKing that page.
+{
+  const firstPageTracker = new SyncProgressTracker();
+  const firstPageAcks = [];
+  const firstPageStalls = [];
+  firstPageTracker.onPageComplete = (_type, pageIndex) => firstPageAcks.push(pageIndex);
+  firstPageTracker.onPageAckStalled = (type, pageIndex, retries) => firstPageStalls.push({ type, pageIndex, retries });
+  firstPageTracker.reset(["note"]);
+  firstPageTracker.recordHashProgress(100);
+  firstPageTracker.recordUploadComplete("note");
+  firstPageTracker.setDownloadTotal("note", 2);
+  firstPageTracker.recordPageProgress("note", 0, 2, false);
+  // Live 3.6.1 detail payloads omit pageIndex and therefore exercise the
+  // legacy accounting branch even though a Page control message exists.
+  firstPageTracker.recordCompleted("note");
+  const timer = Array.from(timers.values()).filter((item) => item.delay === 15000).at(-1);
+  assert.ok(timer, "an unfinished first page should schedule a bounded stagnation check");
+  timer.callback();
+  assert.deepEqual(firstPageAcks, [], "the failed first page is never ACKed");
+  assert.deepEqual(firstPageStalls, [{ type: "note", pageIndex: 0, retries: 0 }]);
+}
+
 // Contract: forceCloseType closes a stalled type's accounting with the shortfall
 // returned as failures, letting the round terminate instead of looping forever
 // (2026-08-27 iPad: same batch of files re-synced endlessly because a stuck type

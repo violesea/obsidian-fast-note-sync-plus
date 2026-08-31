@@ -66,6 +66,12 @@ vm.runInNewContext(transpiled, {
     if (id === "./operator_note") return { receiveNoteSyncDelete: async () => undefined };
     if (id === "./operator_file") return { receiveFileSyncDelete: async () => undefined };
     if (id === "./background_activity_gate") return { requireForeground: async () => undefined };
+    if (id === "./vault_folder") return {
+      createVaultFolderIdempotent: async (vault, folderPath) => {
+        await vault.createFolder(folderPath);
+        return "created";
+      },
+    };
     if (id === "./sync_feature_policy") return {
       isChangeFeedRuntimeEnabled: () => false,
       isCloudPreviewRuntimeEnabled: () => false,

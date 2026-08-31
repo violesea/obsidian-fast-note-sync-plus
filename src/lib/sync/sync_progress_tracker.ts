@@ -290,6 +290,19 @@ export class SyncProgressTracker {
       prog.pageTaskCompleted++;
       prog.downloadPageDone++;
 
+      // 3.6.1 Page control messages contain pageIndex while their detail
+      // payloads do not. Mirror legacy completions into the registered page
+      // bucket solely for bounded-stall detection; ACK emission remains on
+      // the legacy downloadPageDone branch below.
+      const legacyPageIndex = prog.downloadPageIndex;
+      const legacyBucket = legacyPageIndex === -1 ? undefined : prog.pages.get(legacyPageIndex);
+      if (legacyBucket && legacyBucket.completedCount < legacyBucket.totalCount) {
+        legacyBucket.completedCount++;
+      }
+
+      this.stagnationRetries.set(type, 0);
+      this.scheduleStagnationRecheck(type);
+
       dump(`[SyncProgressTracker] [recordCompleted] type: ${type}, downloadPageDone: ${prog.downloadPageDone}, downloadPageCount: ${prog.downloadPageCount}, downloadPageIndex: ${prog.downloadPageIndex}`);
 
       // Check if the current page has finished processing / 检查当前页是否处理完成
@@ -410,7 +423,24 @@ export class SyncProgressTracker {
     this.stagnationTimers.delete(type);
     if (this.isForcedComplete) return;
     const highest = this.lastAckedPage.get(type);
-    if (highest === undefined) return;
+    if (highest === undefined) {
+      // The first page can contain one or more failed materializations. It is
+      // intentionally not ACKed, but without a previous ACK there is nothing
+      // to resend and the old code returned forever. Escalate the earliest
+      // unfinished page after one quiet window so the caller can close the
+      // round as failed while preserving repair/baseline state.
+      const prog = this.progressMap.get(type);
+      const firstUnfinished = prog
+        ? Array.from(prog.pages.entries())
+          .filter(([, page]) => page.completedCount < page.totalCount)
+          .sort(([a], [b]) => a - b)[0]?.[0]
+        : undefined;
+      if (firstUnfinished !== undefined) {
+        dump(`[SyncProgressTracker] [Stagnation] first unfinished page cannot be ACKed: type=${type}, pageIndex=${firstUnfinished}`);
+        this.onPageAckStalled?.(type, firstUnfinished, 0);
+      }
+      return;
+    }
     const retries = (this.stagnationRetries.get(type) ?? 0) + 1;
     if (retries > SyncProgressTracker.MAX_STAGNATION_RETRIES) {
       dump(`[SyncProgressTracker] [Stagnation] ACK retry budget exhausted for type ${type}, pageIndex ${highest}`);

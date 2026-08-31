@@ -8,6 +8,7 @@ import { waitForForeground } from "./background_activity_gate";
 import { captureStableSnapshot, stableCaptureCoordinator } from "./stable_capture";
 import { HttpApiService } from "../api/http_api_service";
 import { decideWrite, shouldCheckPrecondition } from "./write_precondition";
+import { createVaultFolderIdempotent } from "./vault_folder";
 
 const waitForNoteActivity = async (plugin: FastSync): Promise<boolean> => waitForForeground(plugin);
 
@@ -509,20 +510,39 @@ export const receiveNoteSyncModify = async function (data: ReceiveMessage, plugi
           if (!(await waitForNoteActivity(plugin))) return
           await plugin.app.vault.modify(file, resolvedContent, { ...(data.ctime > 0 && { ctime: data.ctime }), ...(data.mtime > 0 && { mtime: data.mtime }) })
         } else {
+          // Obsidian deliberately leaves unsupported paths (notably symlink
+          // aliases that point back inside the same Vault) out of its TFile
+          // index. The adapter can still read those paths. If the bytes already
+          // match the server hash exactly, treat the receive as an idempotent
+          // materialization instead of attempting Vault.create(), which would
+          // throw "File already exists" and strand the whole download page.
+          const unindexedStat = await plugin.app.vault.adapter.stat(normalizedPath)
+          if (unindexedStat?.type === "file") {
+            if (!(await waitForNoteActivity(plugin))) return
+            const unindexedContent = await plugin.app.vault.adapter.read(normalizedPath)
+            const unindexedHash = await hashContentAsync(unindexedContent, plugin)
+            const expectedHash = String(data.contentHash ?? "") || await hashContentAsync(resolvedContent, plugin)
+            if (unindexedHash !== expectedHash) {
+              throw new Error(`Unindexed existing note differs from server: ${normalizedPath}`)
+            }
+            plugin.fileHashManager.setFileHash(
+              data.path,
+              unindexedHash,
+              unindexedStat.mtime,
+              unindexedStat.size,
+              unindexedStat.ctime,
+            )
+            plugin.lastSyncMtime.set(data.path, unindexedStat.mtime)
+            plugin.pendingNoteModifies.delete(data.path)
+            plugin.localStorageManager.savePending('pendingNoteModifies', plugin.pendingNoteModifies)
+            plugin.pendingNoteDeleteAcks.delete(data.path)
+            processed = true
+            return
+          }
           const folder = normalizedPath.split("/").slice(0, -1).join("/")
           if (folder != "") {
-            const dirExists = plugin.app.vault.getFolderByPath(folder)
-            if (dirExists == null) {
-              try {
-                if (!(await waitForNoteActivity(plugin))) return
-                await plugin.app.vault.createFolder(folder)
-              } catch (e) {
-                // 并发竞争时只有一个调用成功，另一方忽略"已存在"错误
-                // In concurrent race only one call succeeds; ignore "already exists" error
-                if (!(await waitForNoteActivity(plugin))) return
-                if (!plugin.app.vault.getFolderByPath(folder)) throw e
-              }
-            }
+            if (!(await waitForNoteActivity(plugin))) return
+            await createVaultFolderIdempotent(plugin.app.vault, folder)
           }
           if (!(await waitForNoteActivity(plugin))) return
           await plugin.app.vault.create(normalizedPath, resolvedContent, { ...(data.ctime > 0 && { ctime: data.ctime }), ...(data.mtime > 0 && { mtime: data.mtime }) })

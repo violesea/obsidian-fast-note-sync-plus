@@ -15,6 +15,7 @@ import {
 } from "./cloud_preview_reconciliation";
 import { captureStableSnapshot, stableCaptureCoordinator } from "./stable_capture";
 import { isCloudPreviewRuntimeEnabled } from "./sync_feature_policy";
+import { createVaultFolderIdempotent } from "./vault_folder";
 
 const waitForFileActivity = async (plugin: FastSync): Promise<boolean> => waitForForeground(plugin);
 
@@ -2015,18 +2016,8 @@ const handleFileChunkDownloadComplete = async function (session: FileDownloadSes
         } else {
           const folder = normalizedPath.split("/").slice(0, -1).join("/")
           if (folder != "") {
-            const dirExists = plugin.app.vault.getFolderByPath(folder)
-            if (dirExists == null) {
-              try {
-                if (!(await waitForFileActivity(plugin))) return
-                await plugin.app.vault.createFolder(folder)
-              } catch (e) {
-                // 并发竞争时只有一个调用成功，另一方忽略"已存在"错误
-                // In concurrent race only one call succeeds; ignore "already exists" error
-                if (!(await waitForFileActivity(plugin))) return
-                if (!plugin.app.vault.getFolderByPath(folder)) throw e
-              }
-            }
+            if (!(await waitForFileActivity(plugin))) return
+            await createVaultFolderIdempotent(plugin.app.vault, folder)
           }
           if (!(await waitForFileActivity(plugin))) return
           await plugin.app.vault.createBinary(normalizedPath, completeFile.buffer, { ...(session.ctime > 0 && { ctime: session.ctime }), ...(session.mtime > 0 && { mtime: session.mtime }) })

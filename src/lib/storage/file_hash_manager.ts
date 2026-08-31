@@ -336,6 +336,14 @@ export class FileHashManager {
       const files = this.plugin.app.vault.getFiles();
 
       const totalFiles = files.length;
+      const previousBuildState = { ...this.buildState };
+      // A recovered cold build still replays metadata to validate fingerprints,
+      // but its durable high-water mark must never be published as zero. The
+      // scanDelta entries turn the replayed prefix into cache hits.
+      const restoredBuildProgress = previousBuildState.phase === "building"
+        && previousBuildState.totalFiles === totalFiles
+        ? Math.min(previousBuildState.processedCount, totalFiles)
+        : 0;
       let processedFiles = 0;
       let hashComputed = 0;
       let cacheHits = 0;
@@ -348,7 +356,7 @@ export class FileHashManager {
         schema: 1,
         phase: "building",
         generation,
-        processedCount: 0,
+        processedCount: restoredBuildProgress,
         totalFiles,
         hashComputed: 0,
         cacheHits: 0,
@@ -378,6 +386,11 @@ export class FileHashManager {
       await loadScanDelta(this.plugin);
       delete withApplier.__applyScanDelta;
 
+      if (restoredBuildProgress > 0) {
+        notice.setMessage(`正在恢复文件哈希映射... (${restoredBuildProgress}/${totalFiles})`);
+        dump(`[HashBuildResume] restoredProcessed=${restoredBuildProgress} total=${totalFiles}`);
+      }
+
       dump(`FileHashManager: 开始遍历 ${totalFiles} 个文件`);
 
       // --- PERF: bounded concurrency for cold-build read+hash ---
@@ -399,7 +412,7 @@ export class FileHashManager {
       const pendingCheckpointEntries = new Map<string, ScanDeltaEntry>();
       let lastCheckpointProcessed = 0;
       let lastCheckpointAt = Date.now();
-      const saveCheckpoint = async (): Promise<void> => {
+      const saveCheckpoint = async (): Promise<boolean> => {
         await requireForeground(this.plugin);
         if (hashInFlight.size > 0) {
           await Promise.all(Array.from(hashInFlight));
@@ -413,7 +426,10 @@ export class FileHashManager {
         // 全图落盘只在冷建完成时发生一次。IO 失败静默——最坏退回重启重扫。
         if (hashMapChangedSinceCheckpoint) {
           if (pendingCheckpointEntries.size > 0) {
-            await appendScanDelta(this.plugin, "note", pendingCheckpointEntries);
+            if (!await appendScanDelta(this.plugin, "note", pendingCheckpointEntries)) {
+              dump(`FileHashManager: checkpoint append failed at ${processedFiles}/${totalFiles}; retaining batch`);
+              return false;
+            }
             pendingCheckpointEntries.clear();
           }
           hashMapChangedSinceCheckpoint = false;
@@ -421,7 +437,7 @@ export class FileHashManager {
         this.buildState = {
           ...this.buildState,
           phase: "building",
-          processedCount: processedFiles,
+          processedCount: Math.max(processedFiles, restoredBuildProgress),
           totalFiles,
           hashComputed,
           cacheHits,
@@ -433,6 +449,7 @@ export class FileHashManager {
         await Promise.all([this.mirror.flushAsync(), this.buildMirror.flushAsync()]);
         lastCheckpointProcessed = processedFiles;
         lastCheckpointAt = Date.now();
+        return true;
       };
 
       const shouldSaveCheckpoint = (): boolean => {
@@ -508,16 +525,26 @@ export class FileHashManager {
 
         // Update the notice only when a durable checkpoint is written.
         if (shouldSaveCheckpoint()) {
-          await saveCheckpoint();
-          notice.setMessage(`正在初始化文件哈希映射... (${processedFiles}/${totalFiles})`);
-          // 让出主线程,避免阻塞 UI
-          await new Promise(resolve => window.setTimeout(resolve, 0));
+          if (await saveCheckpoint()) {
+            const visibleProcessed = Math.max(processedFiles, restoredBuildProgress);
+            notice.setMessage(processedFiles < restoredBuildProgress
+              ? `正在恢复文件哈希映射... (${visibleProcessed}/${totalFiles}，校验 ${processedFiles}/${restoredBuildProgress})`
+              : `正在初始化文件哈希映射... (${visibleProcessed}/${totalFiles})`);
+            // 让出主线程,避免阻塞 UI
+            await new Promise(resolve => window.setTimeout(resolve, 0));
+          }
         }
       }
 
       // 等待所有并发哈希任务收尾，确保后续落盘基于完整结果
       if (hashInFlight.size > 0) {
         await Promise.all(Array.from(hashInFlight));
+      }
+
+      // Close the final partial-batch window before the one-shot full-map
+      // commit. A hard iOS reload in between remains recoverable from JSONL.
+      if (!await saveCheckpoint()) {
+        throw new Error("Unable to persist final cold-build checkpoint");
       }
 
       // Remove entries that disappeared or became excluded while the

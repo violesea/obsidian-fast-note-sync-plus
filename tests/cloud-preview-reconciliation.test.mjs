@@ -84,6 +84,7 @@ const requireStub = (id) => {
   };
   if (id === "../../main") return {};
   if (id === "./background_activity_gate") return { waitForForeground: async () => true };
+  if (id === "./vault_folder") return { createVaultFolderIdempotent: async () => "existing" };
   if (id === "./stable_capture") return {
     captureStableSnapshot: async () => ({ hash: "file-hash", stat: { size: 10, mtime: 1, ctime: 1 } }),
     stableCaptureCoordinator: { capture: async () => ({ hash: "file-hash", stat: { size: 10, mtime: 1, ctime: 1 } }) },

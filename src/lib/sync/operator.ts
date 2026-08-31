@@ -35,7 +35,7 @@ import {
 } from "./change_feed_health";
 import { isBackgroundActivityClosedError, requireForeground } from "./background_activity_gate";
 import { isChangeFeedRuntimeEnabled, isCloudPreviewRuntimeEnabled } from "./sync_feature_policy";
-import { appendScanDelta, loadScanDelta, clearScanDelta } from "./scan_delta";
+import { appendScanDelta, appendScanProgress, loadScanRecovery, validateScanProgress, clearScanDelta } from "./scan_delta";
 
 // C9: 离线超墓碑期保护 — 默认与服务端 soft-delete-retention-time 默认值对应（90 天），
 // 先硬编码常量；服务端墓碑物理清除窗口过后，长期离线设备重连若检测到"本地有服务端无"的
@@ -458,6 +458,27 @@ function commitScannedHashes(scanned: ScannedHashMap, commit: (entries: ScannedH
   const committed = new Map(scanned);
   commit(committed);
   for (const path of committed.keys()) scanned.delete(path);
+}
+
+/**
+ * Write-ahead checkpoint for hashes computed during a full scan. Entries are
+ * removed from the volatile session map only after adapter.append settles.
+ * A reload between append and the in-memory commit is safe because startup
+ * replays scanDelta; a failed append keeps the batch available for retry.
+ */
+async function checkpointScannedHashes(
+  plugin: FastSync,
+  kind: "note" | "file",
+  scanned: ScannedHashMap,
+): Promise<boolean> {
+  if (scanned.size === 0) return true;
+  const checkpoint = new Map(scanned);
+  if (!await appendScanDelta(plugin, kind, checkpoint)) return false;
+  plugin.fileHashManager.bulkSetFromScanned(checkpoint, false);
+  for (const [path, entry] of checkpoint) {
+    if (scanned.get(path) === entry) scanned.delete(path);
+  }
+  return true;
 }
 
 class SyncTransportError extends Error {
@@ -1503,7 +1524,8 @@ export const handleSync = async function (
         }
       };
 
-      const commitScanCheckpoint = async (): Promise<void> => {
+      let restoredScanProgress = 0;
+      const commitScanCheckpoint = async (): Promise<boolean> => {
         await requireForeground(plugin);
         if (hashInFlight.size > 0) {
           await Promise.all(Array.from(hashInFlight));
@@ -1514,14 +1536,26 @@ export const handleSync = async function (
         // the single durable flush for this prepared sync snapshot.
         // The JSONL delta append keeps the just-computed hashes survivable
         // across a mid-scan process kill without paying the full-map flush.
-        commitScannedHashes(plugin.scannedNoteHashes, (entries) => {
-          plugin.fileHashManager.bulkSetFromScanned(entries, false);
-          void appendScanDelta(plugin, "note", entries);
-        });
-        commitScannedHashes(plugin.scannedFileHashes, (entries) => {
-          plugin.fileHashManager.bulkSetFromScanned(entries, false);
-          void appendScanDelta(plugin, "file", entries);
-        });
+        const notePersisted = await checkpointScannedHashes(plugin, "note", plugin.scannedNoteHashes);
+        const filePersisted = await checkpointScannedHashes(plugin, "file", plugin.scannedFileHashes);
+        if (!notePersisted || !filePersisted) {
+          dump(`[ScanDelta] checkpoint incomplete at ${processedCount}/${totalFiles}; retaining volatile batch for retry`);
+          return false;
+        }
+        // The cursor is written after both hash batches. Until the replay loop
+        // catches the restored cursor, retain the previous high-water mark.
+        if (processedCount >= restoredScanProgress && processedCount > 0) {
+          const anchor = list[processedCount - 1];
+          if (anchor && !await appendScanProgress(plugin, {
+            processedCount,
+            totalFiles,
+            anchorPath: anchor.path,
+          })) {
+            dump(`[ScanDelta] progress checkpoint failed at ${processedCount}/${totalFiles}`);
+            return false;
+          }
+        }
+        return true;
       };
 
       let lastScanCheckpointProcessed = 0;
@@ -1531,7 +1565,21 @@ export const handleSync = async function (
       // 校验生效），本轮跳过这些文件的内容重算——重载后从断点继续而非从零。
       // Resume: preload hashes persisted by the previous killed scan so this
       // walk skips re-hashing them and continues from where it died.
-      await loadScanDelta(plugin);
+      const scanRecovery = await loadScanRecovery(plugin);
+      restoredScanProgress = validateScanProgress(scanRecovery.progress, list);
+      if (restoredScanProgress > 0) {
+        const resumedPct = Math.floor((restoredScanProgress / totalToProcess) * 100);
+        plugin.progressTracker.recordHashProgress(resumedPct);
+        SyncLogManager.getInstance().addOrUpdateLog({
+          id: hashingLogId,
+          type: 'info',
+          action: `VaultScanning_${plugin.currentSyncType}`,
+          status: 'pending',
+          progress: resumedPct,
+          message: `↻ 已恢复哈希扫描断点 (${restoredScanProgress}/${totalFiles})，正在校验后续条目`,
+        });
+        dump(`[ScanResume] deltaEntries=${scanRecovery.loaded} restoredProcessed=${restoredScanProgress} total=${totalFiles}`);
+      }
 
       for (const file of list) {
         await requireForeground(plugin);
@@ -1554,7 +1602,8 @@ export const handleSync = async function (
             return;
           }
           plugin.syncState.syncPhase = "scanning";
-          const pct = Math.floor((processedCount / totalToProcess) * 100);
+          const visibleProcessed = Math.max(processedCount, restoredScanProgress);
+          const pct = Math.floor((visibleProcessed / totalToProcess) * 100);
           plugin.progressTracker.recordHashProgress(pct);
           if (processedCount % 100 === 0) {
             SyncLogManager.getInstance().addOrUpdateLog({
@@ -1563,14 +1612,17 @@ export const handleSync = async function (
               action: `VaultScanning_${plugin.currentSyncType}`,
               status: 'pending',
               progress: pct,
-              message: `${plugin.currentSyncType === 'full' ? '🔍 正在全量扫描' : '🔍 正在增量扫描'}... (${processedCount}/${totalFiles})`
+              message: processedCount < restoredScanProgress
+                ? `↻ 已恢复至 ${restoredScanProgress}/${totalFiles}，正在快速校验断点前缀 (${processedCount}/${restoredScanProgress})`
+                : `${plugin.currentSyncType === 'full' ? '🔍 正在全量扫描' : '🔍 正在增量扫描'}... (${processedCount}/${totalFiles})`
             });
           }
           if (processedCount - lastScanCheckpointProcessed >= SCAN_CHECKPOINT_ENTRY_INTERVAL
             || Date.now() - lastScanCheckpointAt >= SCAN_CHECKPOINT_INTERVAL_MS) {
-            await commitScanCheckpoint();
-            lastScanCheckpointProcessed = processedCount;
-            lastScanCheckpointAt = Date.now();
+            if (await commitScanCheckpoint()) {
+              lastScanCheckpointProcessed = processedCount;
+              lastScanCheckpointAt = Date.now();
+            }
           }
         }
 
@@ -1745,8 +1797,14 @@ export const handleSync = async function (
         await Promise.all(Array.from(hashInFlight));
       }
 
-      // Persist any newly computed hashes (breaks the Catch-22)
+      // Persist the final partial checkpoint before clearing the volatile maps.
+      // This closes the <2,000-entry tail loss window when iOS reloads after
+      // scanning but before the first SyncEnd can flush the complete hash map.
       await requireForeground(plugin);
+      if (!await commitScanCheckpoint()) {
+        throw new Error("Unable to persist final scan checkpoint");
+      }
+      // Persist any newly computed hashes (breaks the Catch-22)
       commitScannedHashes(plugin.scannedNoteHashes, (entries) => plugin.fileHashManager.bulkSetFromScanned(entries));
       commitScannedHashes(plugin.scannedFileHashes, (entries) => plugin.fileHashManager.bulkSetFromScanned(entries));
       plugin.fileHashManager.flush();
