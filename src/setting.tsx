@@ -17,7 +17,11 @@ import FastSync from "./main";
 import { updateVaultName } from "./lib/settings/vault_name";
 import { saveDeviceDisplayName } from "./lib/sync/device_identity";
 import { PLUGIN_RELEASE_REPOSITORY } from "./lib/utils/version_manager";
-import { EXPERIMENTAL_SYNC_FEATURES_ENABLED } from "./lib/sync/sync_feature_policy";
+import {
+  CHANGE_FEED_ROLLOUT_VERSION,
+  CHANGE_FEED_RUNTIME_AVAILABLE,
+  EXPERIMENTAL_SYNC_FEATURES_ENABLED,
+} from "./lib/sync/sync_feature_policy";
 
 
 export interface PluginSettings {
@@ -67,6 +71,8 @@ export interface PluginSettings {
   readonlySyncEnabled: boolean
   /** FNS v2 变更流：启用后常规轮次按游标拉增量，跳过全量枚举（默认关闭，回滚=关闭重启） */
   changeFeedEnabled: boolean
+  /** 已执行的移动端变更流迁移版本；用于尊重迁移后的手动关闭 */
+  changeFeedRolloutVersion: number
   /** M7 写入乐观锁：上传前核对服务端是否自本设备上次 ACK 后变过，冲突则不覆盖（默认开启） */
   writePreconditionEnabled: boolean
   /** 变更流挎斗服务地址（fns-sidecar，如 http://127.0.0.1:9100） */
@@ -160,6 +166,7 @@ export const DEFAULT_SETTINGS: PluginSettings = {
   manualSyncEnabled: false,
   readonlySyncEnabled: false,
   changeFeedEnabled: false,
+  changeFeedRolloutVersion: 0,
   writePreconditionEnabled: true,
   sidecarUrl: "",
   sidecarToken: "",
@@ -1421,13 +1428,14 @@ export class SettingTab extends PluginSettingTab {
       $("setting.remote.client_name_desc") + "\n*(隐私提示：若不配置将默认回退为操作系统通用标识，如需自定义建议使用不包含您真实全名或设备隐私特征的代号)*"
     )
 
-    // ─── FNS v2 变更流：稳定版暂不放行，避免旁路状态机影响基础同步 ───
-    new Setting(set).setName($("setting.remote.change_feed") || "变更流同步（暂缓）").setClass("fns-setting-item-checkbox").addToggle((toggle) => {
-      toggle.setValue(EXPERIMENTAL_SYNC_FEATURES_ENABLED && this.plugin.settings.changeFeedEnabled)
-        .setDisabled(!EXPERIMENTAL_SYNC_FEATURES_ENABLED)
-      if (EXPERIMENTAL_SYNC_FEATURES_ENABLED) {
+    // ─── FNS v2 变更流：生产发现路径；与云端预览/自动删除实验完全解耦 ───
+    new Setting(set).setName($("setting.remote.change_feed") || "变更流同步").setClass("fns-setting-item-checkbox").addToggle((toggle) => {
+      toggle.setValue(CHANGE_FEED_RUNTIME_AVAILABLE && this.plugin.settings.changeFeedEnabled)
+        .setDisabled(!CHANGE_FEED_RUNTIME_AVAILABLE)
+      if (CHANGE_FEED_RUNTIME_AVAILABLE) {
         toggle.onChange(async (value) => {
           this.plugin.settings.changeFeedEnabled = value
+          this.plugin.settings.changeFeedRolloutVersion = CHANGE_FEED_ROLLOUT_VERSION
           await this.plugin.saveSettings()
           if (value) {
             showSyncNotice($("setting.remote.change_feed_enabled_notice") || "已启用变更流：重启 Obsidian 后生效；关闭并重启即可回滚")
@@ -1437,12 +1445,12 @@ export class SettingTab extends PluginSettingTab {
     })
     this.setDescWithBreaks(
       set.lastElementChild as HTMLElement,
-      EXPERIMENTAL_SYNC_FEATURES_ENABLED
+      CHANGE_FEED_RUNTIME_AVAILABLE
         ? $("setting.remote.change_feed_desc") || "启用后常规同步按游标只拉增量（跳过全库枚举与文件夹通告）。首次启用需本地与服务端基线就绪，之后新设备/游标过期会自动回落一次全量对账。"
-        : "稳定同步模式暂不启用变更流和挎斗服务；当前只走基础 WebSocket 同步，待端到端内容完整性和断线恢复验收通过后再开放。"
+        : "当前构建未提供变更流运行时。"
     )
 
-    if (EXPERIMENTAL_SYNC_FEATURES_ENABLED && this.plugin.settings.changeFeedEnabled) {
+    if (CHANGE_FEED_RUNTIME_AVAILABLE) {
       new Setting(set).setName($("setting.remote.sidecar_url") || "挎斗服务地址").addText((text) =>
         text
           .setPlaceholder("http://127.0.0.1:9100")

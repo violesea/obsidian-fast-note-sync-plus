@@ -366,6 +366,21 @@ export class EventManager {
     if (this.plugin.ignoredFiles.has(normalizedPath)) return
     if (isPathExcluded(normalizedPath, this.plugin)) return
 
+    // Persist the observation before entering the debounce window. A renderer
+    // reload can cancel timers at any point; without this write-ahead journal
+    // the external edit disappears from the next incremental round. Existing
+    // files can be classified immediately. Newly-created files are journaled
+    // by the regular vault create event, or below once Obsidian indexes them.
+    const indexedAtEvent = this.plugin.app.vault.getAbstractFileByPath(normalizedPath)
+    let journaled = false
+    if (indexedAtEvent instanceof TFile) {
+      this.plugin.incrementalScanManager?.markModified(
+        normalizedPath.endsWith(".md") ? "note" : "file",
+        normalizedPath,
+      )
+      journaled = true
+    }
+
     this.runWithDelay(
       normalizedPath,
       () => {
@@ -375,6 +390,13 @@ export class EventManager {
         if (!(file instanceof TFile)) {
           dump(`[ExternalWriteBridge] raw path not indexed as file, skipping: ${normalizedPath}`)
           return
+        }
+        if (!journaled) {
+          this.plugin.incrementalScanManager?.markModified(
+            normalizedPath.endsWith(".md") ? "note" : "file",
+            normalizedPath,
+          )
+          journaled = true
         }
         dump(`[ExternalWriteBridge] bridging external write into sync: ${normalizedPath}`)
         if (normalizedPath.endsWith(".md")) {

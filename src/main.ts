@@ -37,7 +37,7 @@ import { SyncProgressTracker } from "./lib/sync/sync_progress_tracker";
 import { LifecycleGeneration } from "./lib/sync/lifecycle_generation";
 import { SyncPageAckOutbox, type SyncPageAckType } from "./lib/sync/sync_page_ack_outbox";
 import { BackgroundActivityGate } from "./lib/sync/background_activity_gate";
-import { applyStableSyncPolicy } from "./lib/sync/sync_feature_policy";
+import { applyMobileChangeFeedRollout, applyStableSyncPolicy } from "./lib/sync/sync_feature_policy";
 
 
 
@@ -779,13 +779,22 @@ export default class FastSync extends Plugin {
 
     let hasMigration = false
 
-    // Keep released clients on the verified v1 WebSocket sync path. Older
-    // configs may have enabled the unfinished sidecar/cloud projection
-    // features; normalize those switches before any manager is constructed.
+    // Keep cloud projection experiments disabled. Change-feed has a separate
+    // production gate and is normalized independently below.
     const stablePolicy = applyStableSyncPolicy(this.settings)
     if (stablePolicy.disabledFeatures.length > 0) {
       this.settings = stablePolicy.settings
       dump(`[StableSync] disabled experimental features: ${stablePolicy.disabledFeatures.join(",")}`)
+      hasMigration = true
+    }
+
+    // 2.5.12 disabled change-feed together with cloud-preview.  Restore the
+    // now-independent production feed exactly once on already-provisioned
+    // mobile devices; desktop remains the source-side writer.
+    const changeFeedRollout = applyMobileChangeFeedRollout(this.settings, Platform.isMobile)
+    if (changeFeedRollout.migrated) {
+      this.settings = changeFeedRollout.settings
+      dump(`[StableSync] mobile change-feed rollout enabled (version=${this.settings.changeFeedRolloutVersion})`)
       hasMigration = true
     }
 
@@ -960,8 +969,7 @@ export default class FastSync extends Plugin {
   }
 
   async saveSettings() {
-    // Also enforce the release policy on external settings/config-sync writes;
-    // a stale data.json must not re-enable an experimental sync path in memory.
+    // Also enforce the cloud projection policy on external settings writes.
     const stablePolicy = applyStableSyncPolicy(this.settings)
     if (stablePolicy.disabledFeatures.length > 0) {
       this.settings = stablePolicy.settings

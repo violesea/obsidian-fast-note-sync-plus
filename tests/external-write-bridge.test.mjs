@@ -59,7 +59,7 @@ class TAbstractFile {}
 class TFile extends TAbstractFile { constructor(p) { super(); this.path = p; this.stat = { size: 1, mtime: 1, ctime: 1 }; } }
 class TFolder extends TAbstractFile { constructor(p) { super(); this.path = p; } }
 
-const calls = { noteModify: [], fileModify: [], configJournal: [], configRaw: [] };
+const calls = { noteModify: [], fileModify: [], dirtyJournal: [], configRaw: [] };
 
 const module = { exports: {} };
 const requireStub = (id) => {
@@ -131,7 +131,7 @@ const makePlugin = (overrides = {}) => ({
   },
   ignoredFiles: new Set(overrides.ignored || []),
   ignoredConfigFiles: new Set(),
-  incrementalScanManager: { markModified: (kind, p) => calls.configJournal.push(`${kind}:${p}`) },
+  incrementalScanManager: { markModified: (kind, p) => calls.dirtyJournal.push(`${kind}:${p}`) },
   configManager: { handleRawEvent: async (p) => calls.configRaw.push(p) },
   websocket: { isAuth: true },
   lockManager: { withLock: async (_k, task) => task() },
@@ -149,9 +149,11 @@ const indexed = new Map([[mdPath, new TFile(mdPath)], ["data/bin附件.png", new
 {
   const em = new EventManager(makePlugin({ indexedPaths: indexed }));
   em["watchRaw"](mdPath);
+  assert.ok(calls.dirtyJournal.includes(`note:${mdPath}`), "external md write is durably journaled before debounce");
   await advanceTimers(600);
   assert.deepEqual(calls.noteModify, [mdPath], "external md write bridges to noteModify");
   em["watchRaw"]("data/bin附件.png");
+  assert.ok(calls.dirtyJournal.includes("file:data/bin附件.png"), "external file write is durably journaled before debounce");
   await advanceTimers(600);
   assert.deepEqual(calls.fileModify, ["data/bin附件.png"], "external non-md write bridges to fileModify");
   console.log("scenario 1 ok: md/non-md external writes bridge");
@@ -193,9 +195,22 @@ const indexed = new Map([[mdPath, new TFile(mdPath)], ["data/bin附件.png", new
   em["watchRaw"](".obsidian/appearance.json");
   await advanceTimers(400);
   assert.equal(calls.noteModify.length, 1, "config path does not go through the content bridge");
-  assert.deepEqual(calls.configJournal, ["config:.obsidian/appearance.json"], "config path journaled in config channel");
+  assert.ok(calls.dirtyJournal.includes("config:.obsidian/appearance.json"), "config path journaled in config channel");
   assert.deepEqual(calls.configRaw, [".obsidian/appearance.json"], "config path dispatched via config manager");
   console.log("scenario 5 ok: config paths keep config-channel semantics");
+}
+
+// 6. A reload can cancel the debounce timer, but it must not erase the event:
+// the next authenticated incremental round replays the durable dirty entry.
+{
+  const beforeModify = calls.noteModify.length;
+  const em = new EventManager(makePlugin({ indexedPaths: indexed }));
+  em["watchRaw"](mdPath);
+  assert.ok(calls.dirtyJournal.includes(`note:${mdPath}`), "reload-safe journal entry exists immediately");
+  em.stop();
+  await advanceTimers(700);
+  assert.equal(calls.noteModify.length, beforeModify, "cancelled debounce does not perform a late live upload");
+  console.log("scenario 6 ok: reload cancels live task but preserves durable journal");
 }
 
 console.log("external-write-bridge: all scenarios passed");
