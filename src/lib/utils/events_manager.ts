@@ -5,6 +5,9 @@ import { fileModify, fileDelete, fileRename, fileDeleteByPath } from "../sync/op
 import { folderModify, folderDelete, folderRename } from "../sync/operator_folder";
 import { NoteHistoryModal } from "../../views/note-history/history-modal";
 import { dump, isPathInConfigSyncDirs, isPathExcluded, configIsPathExcluded } from "./helpers";
+
+/** 点文件/隐藏路径（.obsidian、.DS_Store、流水线 .gate_pass 等）不进正文桥接 */
+const isDotOrHiddenPath = (path: string): boolean => /(^|\/)\./.test(path)
 import { ShareModal } from "../../views/share-modal";
 import type FastSync from "../../main";
 import { $ } from "../../i18n/lang";
@@ -12,8 +15,15 @@ import { $ } from "../../i18n/lang";
 
 export class EventManager {
   private static readonly RESUME_DEBOUNCE_MS = 1000
+  /**
+   * 外部写入桥新文件的重试退避（毫秒）。Obsidian 把外部写入索引进 vault
+   * 存在秒级异步延迟，防抖到期时一次未命中就丢弃会让新文件掉出增量视野
+   * （2026-09-01 实证：新写入 2 分钟零上行）。脏账已预写，重试只负责触发上传。
+   */
+  private static readonly BRIDGE_RETRY_DELAYS_MS = [2000, 5000, 15000, 30000, 60000] as const
   private plugin: FastSync
   private rawEventTimers: Map<string, number> = new Map()
+  private bridgeRetryTimers: Map<string, number> = new Map()
   private resumeTimer: number | null = null
   private lifecycleEventsRegistered = false
   private vaultEventsRegistered = false
@@ -37,12 +47,20 @@ export class EventManager {
       this.lifecycleEventsRegistered = true
     }
 
-    // Add vault/workspace events only after hash state is ready. This method is
-    // called once before initialization and once after it, so keep both phases
-    // idempotent.
-    if (!this.plugin.fileHashManager || !this.plugin.fileHashManager.isReady()) {
-      dump("EventManager: lifecycle listeners ready; vault listeners deferred until hash state is ready")
-    } else if (!this.vaultEventsRegistered) {
+    // Add vault/workspace events as soon as the plugin managers exist. The old
+    // gate ("wait until hash state is ready") turned a slow or failed hash
+    // initialization into permanent silent death of every vault listener —
+    // including the external-write bridge — with no error anywhere. Registering
+    // before hash state loads is safe: handlers journal durable dirty entries
+    // first, and the debounced upload tasks tolerate an unloaded cache.
+    // Vault/workspace 事件在插件管理器就绪后立即注册。旧实现等哈希状态加载完，
+    // 一旦哈希初始化慢或失败，全部 vault 监听器（含外部写入桥）会永久静默死亡；
+    // 处理器先写脏账再走防抖上传，提前注册是安全的。
+    if (!this.vaultEventsRegistered) {
+      const hashReady = !!this.plugin.fileHashManager?.isReady()
+      if (!hashReady) {
+        dump("EventManager: registering vault listeners before hash state is ready (journal-first capture)")
+      }
       this.plugin.registerEvent(app.vault.on("create", this.watchModify))
       this.plugin.registerEvent(app.vault.on("modify", this.watchModify))
       this.plugin.registerEvent(app.vault.on("delete", this.watchDelete))
@@ -75,6 +93,8 @@ export class EventManager {
   public stop() {
     this.rawEventTimers.forEach((timer) => window.clearTimeout(timer))
     this.rawEventTimers.clear()
+    this.bridgeRetryTimers.forEach((timer) => window.clearTimeout(timer))
+    this.bridgeRetryTimers.clear()
     if (this.resumeTimer !== null) {
       window.clearTimeout(this.resumeTimer)
       this.resumeTimer = null
@@ -350,63 +370,74 @@ export class EventManager {
    * 安全边界：
    * - 回声抑制：插件自身物化下载的写入在 ignoredFiles 中，跳过（否则下载→raw→重传
    *   循环）；延迟到期后二次复查。
-   * - 存在性校验：只处理 Obsidian 已索引为 TFile 的路径——未索引（点文件/临时文件/
-   *   已删除/纯文件夹）一律跳过。这同时保证**绝不把外部删除传播为删除**（F-3 红线：
-   *   本地缺失不构成删除依据），.DS_Store 与流水线点标记天然被过滤。
-   * - 延迟 500ms 让写入方写完并给 Obsidian 索引留时间，缓解撕裂读；到时仍未索引则
-   *   放弃本条（下轮 reconcile 兜底）。
+   * - 点文件/隐藏路径过滤：流水线点标记、.DS_Store 等在事件时即被丢弃。
+   * - 排除规则：isPathExcluded（含白名单）在事件时过滤。
+   * - 预写脏账：事件时即按扩展名分类记账（note/file），不依赖 Obsidian 已完成
+   *   索引——外部写入的索引是异步的，等索引再记账会让新文件在慢索引/重载窗掉出
+   *   视野。markModified 幂等；删除永不在此记账，瞬时路径最多产生一条空跑扫描项。
+   * - 上传触发：500ms 防抖让写入方写完；到期未索引则按退避表重试
+   *   （2s/5s/15s/30s/60s），重试耗尽后脏账仍在，交给下轮对账兜底。
    * - 重命名窗口跳过：与 watchModify 相同的 pendingRenamePaths 语义。
    *
-   * Safety: echo-suppressed via ignoredFiles (re-checked at flush); only paths
-   * indexed as TFile are bridged (dotfiles/temp/missing/folders skipped — this
-   * also guarantees external deletions are never propagated); 500ms delay avoids
-   * torn reads; rename windows are skipped like watchModify.
+   * Safety: echo-suppressed via ignoredFiles (re-checked at flush); dot/hidden
+   * paths and excluded rules filtered at event time; the dirty journal is
+   * written ahead of the debounce window classified by extension (Obsidian
+   * indexes external writes asynchronously, so waiting for a TFile loses new
+   * files); deletions are never journaled here; the upload trigger retries
+   * with backoff when the path is not indexed yet instead of being dropped.
    */
   private bridgeExternalVaultWrite = (normalizedPath: string) => {
     if (this.plugin.ignoredFiles.has(normalizedPath)) return
     if (isPathExcluded(normalizedPath, this.plugin)) return
+    if (isDotOrHiddenPath(normalizedPath)) return
 
-    // Persist the observation before entering the debounce window. A renderer
-    // reload can cancel timers at any point; without this write-ahead journal
-    // the external edit disappears from the next incremental round. Existing
-    // files can be classified immediately. Newly-created files are journaled
-    // by the regular vault create event, or below once Obsidian indexes them.
-    const indexedAtEvent = this.plugin.app.vault.getAbstractFileByPath(normalizedPath)
-    let journaled = false
-    if (indexedAtEvent instanceof TFile) {
-      this.plugin.incrementalScanManager?.markModified(
-        normalizedPath.endsWith(".md") ? "note" : "file",
-        normalizedPath,
-      )
-      journaled = true
-    }
+    this.plugin.incrementalScanManager?.markModified(
+      normalizedPath.endsWith(".md") ? "note" : "file",
+      normalizedPath,
+    )
 
     this.runWithDelay(
       normalizedPath,
       () => {
-        if (this.plugin.ignoredFiles.has(normalizedPath)) return
-        if (this.pendingRenamePaths.has(normalizedPath)) return
-        const file = this.plugin.app.vault.getAbstractFileByPath(normalizedPath)
-        if (!(file instanceof TFile)) {
-          dump(`[ExternalWriteBridge] raw path not indexed as file, skipping: ${normalizedPath}`)
-          return
-        }
-        if (!journaled) {
-          this.plugin.incrementalScanManager?.markModified(
-            normalizedPath.endsWith(".md") ? "note" : "file",
-            normalizedPath,
-          )
-          journaled = true
-        }
-        dump(`[ExternalWriteBridge] bridging external write into sync: ${normalizedPath}`)
-        if (normalizedPath.endsWith(".md")) {
-          void noteModify(file, this.plugin, true)
-        } else {
-          void fileModify(file, this.plugin, true)
-        }
+        this.flushExternalVaultWrite(normalizedPath, 0)
       },
       500,
     )
+  }
+
+  /**
+   * 防抖到期后的上传触发；路径未索引时按退避表重试而不是丢弃。
+   * Upload trigger after the debounce window; retries with backoff while the
+   * path is still not indexed instead of dropping the event.
+   */
+  private flushExternalVaultWrite = (normalizedPath: string, attempt: number) => {
+    const pendingTimer = this.bridgeRetryTimers.get(normalizedPath)
+    if (pendingTimer !== undefined) {
+      window.clearTimeout(pendingTimer)
+      this.bridgeRetryTimers.delete(normalizedPath)
+    }
+    if (this.plugin.ignoredFiles.has(normalizedPath)) return
+    if (this.pendingRenamePaths.has(normalizedPath)) return
+    const file = this.plugin.app.vault.getAbstractFileByPath(normalizedPath)
+    if (!(file instanceof TFile)) {
+      if (attempt < EventManager.BRIDGE_RETRY_DELAYS_MS.length) {
+        const delay = EventManager.BRIDGE_RETRY_DELAYS_MS[attempt]
+        this.bridgeRetryTimers.set(normalizedPath, window.setTimeout(() => {
+          this.bridgeRetryTimers.delete(normalizedPath)
+          this.flushExternalVaultWrite(normalizedPath, attempt + 1)
+        }, delay))
+        dump(`[ExternalWriteBridge] path not indexed yet, retry ${attempt + 1}/${EventManager.BRIDGE_RETRY_DELAYS_MS.length} in ${delay}ms: ${normalizedPath}`)
+        return
+      }
+      dump(`[ExternalWriteBridge] path still unindexed after retries; dirty journal entry remains for reconciliation: ${normalizedPath}`)
+      return
+    }
+    dump(`[ExternalWriteBridge] bridging external write into sync: ${normalizedPath}`)
+    if (normalizedPath.endsWith(".md")) {
+      void noteModify(file, this.plugin, true)
+    } else {
+      void fileModify(file, this.plugin, true)
+    }
   }
 
   /**

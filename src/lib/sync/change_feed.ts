@@ -41,6 +41,8 @@ import {
   selectApplicableChanges,
 } from "./change_feed_logic";
 import type { ChangesResponse, RegisterResponse, SidecarChange } from "./change_feed_logic";
+import { unwrapEnvelope } from "./change_feed_logic";
+import type { DigestResponse, ManifestEntry } from "./digest_reconciliation_logic";
 import { requireForeground } from "./background_activity_gate";
 import { isChangeFeedRuntimeEnabled, isCloudPreviewRuntimeEnabled } from "./sync_feature_policy";
 import { createVaultFolderIdempotent } from "./vault_folder";
@@ -290,6 +292,46 @@ export class ChangeFeedClient {
       rev,
     });
     parseRegisterResponse(json, status); // 复用信封校验；仅确认 ok
+  }
+
+  /** M4 兜底抽查：子树完整性摘要（depth=0 只取根摘要，一次请求）。 */
+  async getDigest(vault: string, prefix: string = "", depth: number = 0): Promise<DigestResponse> {
+    const { status, json } = await this.request(
+      `/vault/digest?vault=${encodeURIComponent(vault)}&prefix=${encodeURIComponent(prefix)}&depth=${depth}`,
+      "GET",
+    );
+    return unwrapEnvelope<DigestResponse>(json, status);
+  }
+
+  /**
+   * M4 兜底抽查：全量 manifest（NDJSON，note+file 活条目）。
+   * requestUrl 无流式接口，一次性取回后按行解析；桌面端专用路径。
+   */
+  async getManifest(vault: string, types: string = "note,file"): Promise<ManifestEntry[]> {
+    const headers: Record<string, string> = { "x-client": CLIENT_TYPE };
+    if (this.token) headers["X-Sidecar-Token"] = this.token;
+    const url = `${this.base}/vault/manifest?vault=${encodeURIComponent(vault)}&types=${encodeURIComponent(types)}`;
+    const req = requestUrl({ url, method: "GET", headers, throw: false }).then((r) => {
+      if (r.status !== 200) {
+        throw new SidecarProtocolError(`sidecar manifest http ${r.status}`, r.status);
+      }
+      return r.text;
+    });
+    const timeout = new Promise<never>((_, reject) => {
+      window.setTimeout(() => reject(new SidecarProtocolError(`sidecar request timeout: ${url}`)), this.timeoutMs);
+    });
+    const text = await Promise.race([req, timeout]);
+    const entries: ManifestEntry[] = [];
+    for (const line of text.split("\n")) {
+      const trimmed = line.trim();
+      if (!trimmed) continue;
+      try {
+        entries.push(JSON.parse(trimmed) as ManifestEntry);
+      } catch (error) {
+        dump(`[Digest] skipping malformed manifest line: ${error}`);
+      }
+    }
+    return entries;
   }
 }
 
@@ -740,6 +782,8 @@ export function changeFeedDecisionInput(plugin: FastSync, syncMode: string) {
     deviceId: plugin.changeFeedDeviceId,
     cursorRev: cursor ? cursor.rev : null,
     baselinesReady: inc?.canUseIncrementalSync(plugin.localStorageManager.getMetadata("isInitSync")) === true,
+    // 本地哈希缓存非空 = 设备持有真实内容；基线未校准时也允许 adopt（见 logic 层注释）
+    hasLocalContent: (plugin.fileHashManager?.getStats().totalFiles ?? 0) > 0,
     syncEnabled: plugin.settings.syncEnabled !== false,
     syncMode,
   };

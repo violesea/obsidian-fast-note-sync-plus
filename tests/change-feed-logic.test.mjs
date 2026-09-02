@@ -50,13 +50,20 @@ assert.equal(L.planChangeFeedRound({ ...base, syncMode: "note" }), "off");
 assert.equal(L.planChangeFeedRound({ ...base, syncEnabled: false }), "off");
 assert.equal(L.planChangeFeedRound({ ...base, deviceId: null }), "off");
 
-// 契约：启用但基线未就绪（首装）→ defer，先走 v1 全量，完成后再采纳
+// 契约：启用但确属首装（基线未就绪且本地无内容）→ defer，先走 v1 全量，完成后再采纳
 assert.equal(L.planChangeFeedRound({ ...base, baselinesReady: false }), "defer");
+assert.equal(L.planChangeFeedRound({ ...base, baselinesReady: false, hasLocalContent: false }), "defer");
 
-// 契约：基线就绪且无游标 → adopt；有正游标 → poll；游标为 0（失效残留）→ defer
+// 契约（R4 defer 死锁修复）：本地已有内容但基线未校准（校准被重载反复打断的
+// 设备）→ adopt。变更流回放是哈希幂等的，先按 O(Δ) 收内容安全；defer 会把
+// 设备锁死在「每轮 v1 全量扫描」的永动环里。
+assert.equal(L.planChangeFeedRound({ ...base, baselinesReady: false, hasLocalContent: true }), "adopt");
+
+// 契约：基线就绪且无游标 → adopt；有正游标 → poll；游标 0 视为无有效游标
 assert.equal(L.planChangeFeedRound({ ...base, cursorRev: null }), "adopt");
 assert.equal(L.planChangeFeedRound({ ...base, cursorRev: 457200 }), "poll");
-assert.equal(L.planChangeFeedRound({ ...base, cursorRev: 0 }), "defer");
+assert.equal(L.planChangeFeedRound({ ...base, cursorRev: 0 }), "adopt");
+assert.equal(L.planChangeFeedRound({ ...base, cursorRev: 0, baselinesReady: false, hasLocalContent: false }), "defer");
 
 // Contract: a change-feed round does not resend a stale prepared snapshot
 // after reconnect; disabled, empty-sidecar, and partial-sync rounds retain the

@@ -633,7 +633,22 @@ export default class FastSync extends Plugin {
       this.eventManager = new EventManager(this)
       this.eventManager.registerEvents()
 
-      // 5. 并行初始化哈希和快照 (耗时任务)
+      // 启动错峰：Obsidian 的启动索引期是 iOS WebView 被杀的高发窗口；把 30+ MB
+      // 的哈希/基准表 JSON.parse 推迟到索引高峰之后，降低启动期内存尖峰与主线程
+      // 争抢（2026-09-01 iPad 重载风暴定案的贡献因子之一）。错峰窗口内的 vault
+      // 变更已由提前注册的事件监听器写入 dirty journal，不会丢失。
+      // Startup stagger: Obsidian's own index rebuild is the high-risk window
+      // for the iOS WebView kill; defer the 30+ MB metadata JSON.parse past
+      // that peak. Vault changes inside the window are captured by the already
+      // registered listeners into the durable dirty journal.
+      await new Promise<void>((resolve) => window.setTimeout(resolve, Platform.isMobile ? 3000 : 250))
+      if (!this.lifecycle.isCurrent(lifecycleGeneration)) return;
+
+      // 5. 并行初始化哈希和快照 (耗时任务)。初始化失败不得中断启动链——
+      // 否则监听器注册、基线标记、变更流初始化全部被跳过，同步静默瘫痪。
+      // Heavy init must not break the startup chain: a thrown initialize()
+      // used to skip everything below it (listeners re-registration guard,
+      // baseline marker, change-feed identity) and paralyze sync silently.
       const initPromises: Promise<void>[] = [
         this.fileHashManager.initialize(),
         this.folderSnapshotManager.initialize()
@@ -641,7 +656,11 @@ export default class FastSync extends Plugin {
       if (this.settings.configSyncEnabled) {
         initPromises.push(this.configHashManager.initialize())
       }
-      await Promise.all(initPromises)
+      try {
+        await Promise.all(initPromises)
+      } catch (e) {
+        dumpError("FastSync: hash/snapshot initialization failed; continuing with degraded metadata state", e)
+      }
       if (!this.lifecycle.isCurrent(lifecycleGeneration)) return;
 
       // The local metadata/hash baseline is now complete and recoverable. The
@@ -720,9 +739,9 @@ export default class FastSync extends Plugin {
       }
 
       // The lifecycle listeners were registered before initialization; this
-      // second call only installs vault/workspace listeners after hash state is
-      // ready. EventManager makes registration idempotent.
-      if (this.fileHashManager.isReady()) void this.eventManager.registerEvents()
+      // idempotent call is a no-op safety net — vault listeners already went
+      // live on the first registerEvents() regardless of hash state.
+      void this.eventManager.registerEvents()
 
       // 7. 刷新运行时设置 (包含网络探测，不阻塞主流程)
       if (this.lifecycle.isCurrent(lifecycleGeneration)) void this.reloadServices()

@@ -53,6 +53,8 @@ export default {
   "setting.remote.sidecar_url_desc": "Address of the fns-sidecar read-only change-feed service; empty disables change-feed.",
   "setting.remote.sidecar_token": "Sidecar Token",
   "setting.remote.sidecar_token_desc": "Access token for the sidecar service; may stay empty for loopback-only deployments.",
+  "setting.remote.digest_check": "Integrity backstop check (digest)",
+  "setting.remote.digest_check_desc": "Desktop only, every 24h: compares the server subtree digest against the local confirmed baseline; missing local content is fetched back after hash verification, while server-side losses are only reported and never deleted. Mobile devices are excluded automatically.",
   "setting.remote.device_id": "Device ID",
   "setting.remote.device_id_desc": "UUID generated at install time, decoupled from the device name and never changes; lets the server track each device's sync cursor.",
   "setting.remote.device_id_pending": "Generated after restart",

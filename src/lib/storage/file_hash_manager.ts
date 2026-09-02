@@ -624,6 +624,15 @@ export class FileHashManager {
   }
 
   /**
+   * 服务端确认基线的只读快照（path → content hash）。
+   * digest 兜底抽查用它计算「客户端视角的服务端集合」摘要；本地未确认写入
+   * 不在其中，摘要因此不随正在进行的编辑抖动。
+   */
+  getSyncEntries(): Array<[string, string]> {
+    return Array.from(this.syncHashMap.entries());
+  }
+
+  /**
    * 获取已成功同步的所有文件路径 (用于检测离线删除与拉取缺失文件)
    */
   getAllPaths(): string[] {

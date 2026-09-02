@@ -79,6 +79,8 @@ export interface PluginSettings {
   sidecarUrl: string
   /** 挎斗服务令牌（X-Sidecar-Token） */
   sidecarToken: string
+  /** M4 digest 兜底抽查：桌面端每 24h 对账一次服务端与本地确认基线的完整性（INV-1 守护） */
+  digestCheckEnabled: boolean
   /** 远程服务调试地址（多行） */
   debugRemoteUrls: string
   /** 是否在菜单中显示版本信息 */
@@ -170,6 +172,7 @@ export const DEFAULT_SETTINGS: PluginSettings = {
   writePreconditionEnabled: true,
   sidecarUrl: "",
   sidecarToken: "",
+  digestCheckEnabled: true,
   debugRemoteUrls: "",
   showVersionInfo: false,
   configSyncOtherDirs: "",
@@ -1477,6 +1480,19 @@ export class SettingTab extends PluginSettingTab {
       this.setDescWithBreaks(
         set.lastElementChild as HTMLElement,
         $("setting.remote.sidecar_token_desc") || "挎斗服务的访问令牌；仅本机回环部署可留空。"
+      )
+
+      // ─── M4 digest 兜底抽查（桌面端；INV-1 守护）───
+      new Setting(set).setName($("setting.remote.digest_check") || "完整性兜底抽查（digest）").setClass("fns-setting-item-checkbox").addToggle((toggle) => {
+        toggle.setValue(this.plugin.settings.digestCheckEnabled !== false)
+        toggle.onChange(async (value) => {
+          this.plugin.settings.digestCheckEnabled = value
+          await this.plugin.saveSettings()
+        })
+      })
+      this.setDescWithBreaks(
+        set.lastElementChild as HTMLElement,
+        $("setting.remote.digest_check_desc") || "桌面端每 24 小时对账一次服务端与本地基线的子树摘要：发现本地缺失即哈希校验后补齐；发现「本地已确认、服务端缺失」只告警不删除（移动端自动关闭）。"
       )
 
       new Setting(set).setName($("setting.remote.device_id") || "设备标识（deviceId）").addText((text) => {

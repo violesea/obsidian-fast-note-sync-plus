@@ -13,8 +13,10 @@ import ts from "typescript";
 // 1. An indexed external .md write bridges to noteModify; non-md to fileModify.
 // 2. Echo suppression: paths in ignoredFiles (the plugin's own materialization
 //    writes) never bridge — re-checked at flush time too.
-// 3. Paths not indexed as TFile (deleted, dotfiles, folders) never bridge —
-//    external deletions must never propagate as deletions (INV-1/F-3).
+// 3. Unindexed paths are journaled immediately (extension-classified) and
+//    retried with backoff, but never uploaded while unindexed; dotfiles are
+//    filtered at event time. External deletions must never propagate as
+//    deletions (INV-1/F-3) — only modify entries are ever journaled here.
 // 4. Excluded paths never bridge.
 // 5. Config-dir paths keep the original config-channel semantics (no content
 //    bridging when config sync is disabled).
@@ -168,23 +170,46 @@ const indexed = new Map([[mdPath, new TFile(mdPath)], ["data/bin附件.png", new
   console.log("scenario 2 ok: ignoredFiles echo suppression");
 }
 
-// 3. Not indexed as TFile (deleted / dotfile / folder) → never bridges.
+// 3. Unindexed .md path: journaled at event time, retried with backoff, and
+//    never uploaded while Obsidian has not indexed it. Dotfiles: fully skipped.
 {
   const em = new EventManager(makePlugin({ indexedPaths: indexed }));
+  const beforeModify = calls.noteModify.length;
   em["watchRaw"]("已删除/不存在的文件.md");
+  assert.ok(calls.dirtyJournal.includes("note:已删除/不存在的文件.md"), "unindexed md write is still journaled (reload-safe)");
   em["watchRaw"](".DS_Store");
-  em["watchRaw"]("某个目录");
+  assert.ok(!calls.dirtyJournal.some((e) => e.endsWith(".DS_Store")), "dotfiles are never journaled");
   await advanceTimers(700);
-  assert.equal(calls.noteModify.length, 1, "unindexed paths never bridge (external deletions must not propagate)");
-  console.log("scenario 3 ok: unindexed/deleted/dotfile paths skipped");
+  assert.equal(calls.noteModify.length, beforeModify, "unindexed path is not uploaded on the first flush");
+  await advanceTimers(2_000 + 5_000 + 15_000 + 30_000 + 60_000 + 1_000);
+  assert.equal(calls.noteModify.length, beforeModify, "external deletions must not propagate even after retries");
+  console.log("scenario 3 ok: unindexed path journaled + retried, never uploaded as delete/phantom");
+}
+
+// 3b. A path that IS indexed later bridges on a retry tick (new-file case:
+//     Obsidian indexes external writes asynchronously).
+{
+  const liveIndexed = new Map(indexed);
+  const em = new EventManager(makePlugin({ indexedPaths: liveIndexed }));
+  const beforeModify = calls.noteModify.length;
+  const newPath = "INBOX/稍后才被索引的新文件.md";
+  em["watchRaw"](newPath);
+  await advanceTimers(600);
+  assert.equal(calls.noteModify.length, beforeModify, "first flush happens before indexing, no upload yet");
+  liveIndexed.set(newPath, new TFile(newPath));
+  await advanceTimers(2_500);
+  assert.equal(calls.noteModify.length, beforeModify + 1, "retry picks up the file once Obsidian indexes it");
+  assert.ok(calls.noteModify.includes(newPath), "the bridged upload is the new file");
+  console.log("scenario 3b ok: late-indexed new file bridged via retry");
 }
 
 // 4. Excluded paths never bridge.
 {
   const em = new EventManager(makePlugin({ indexedPaths: indexed, excluded: [mdPath] }));
+  const beforeModify = calls.noteModify.length;
   em["watchRaw"](mdPath);
   await advanceTimers(700);
-  assert.equal(calls.noteModify.length, 1, "excluded path never bridges");
+  assert.equal(calls.noteModify.length, beforeModify, "excluded path never bridges");
   console.log("scenario 4 ok: exclusion rules honored");
 }
 
@@ -192,9 +217,10 @@ const indexed = new Map([[mdPath, new TFile(mdPath)], ["data/bin附件.png", new
 //    config sync enabled they journal + dispatch through the config manager.
 {
   const em = new EventManager(makePlugin({ indexedPaths: new Map([[".obsidian/appearance.json", new TFile(".obsidian/appearance.json")]]), settings: { configSyncEnabled: true } }));
+  const beforeModify5 = calls.noteModify.length;
   em["watchRaw"](".obsidian/appearance.json");
   await advanceTimers(400);
-  assert.equal(calls.noteModify.length, 1, "config path does not go through the content bridge");
+  assert.equal(calls.noteModify.length, beforeModify5, "config path does not go through the content bridge");
   assert.ok(calls.dirtyJournal.includes("config:.obsidian/appearance.json"), "config path journaled in config channel");
   assert.deepEqual(calls.configRaw, [".obsidian/appearance.json"], "config path dispatched via config manager");
   console.log("scenario 5 ok: config paths keep config-channel semantics");

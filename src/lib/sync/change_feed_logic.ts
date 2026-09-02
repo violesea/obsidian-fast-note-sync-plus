@@ -53,6 +53,13 @@ export interface ChangeFeedDecisionInput {
   cursorRev: number | null;
   /** 本地与服务端基线均已就绪（IncrementalScanManager 双基线） */
   baselinesReady: boolean;
+  /**
+   * 本地已有内容但基线尚未校准（典型：初始校准轮被重载反复打断的设备）。
+   * 此时 defer 会把设备锁死在「每轮 v1 全量扫描」的永动环里；而变更流的
+   * 回放是哈希幂等的（内容一致即跳过），先采纳游标按 O(Δ) 收内容是安全的。
+   * 真正的空库首装（无内容可幂等跳过）仍然 defer 走 v1 下载路径。
+   */
+  hasLocalContent?: boolean;
   syncEnabled: boolean;
   /** 手动部分同步（note/config）不进变更流 */
   syncMode: string;
@@ -117,8 +124,9 @@ export interface ChangeFeedCursorStateRecord {
 /**
  * 轮次模式判定。返回值语义：
  * - "off"   功能未启用/未配置/非 auto 全量轮次 → 走 v1 原路径
- * - "defer" 已启用但基线未就绪（如首次安装）→ 本轮走 v1，完成后再自然进入 adopt
- * - "adopt" 启用且基线就绪但本地无游标 → 注册设备并回溯采纳起点
+ * - "defer" 已启用但确属首次安装（无游标且本地无内容）→ 本轮走 v1，完成后再自然进入 adopt
+ * - "adopt" 启用但本地无游标 → 注册设备并回溯采纳起点；本地有内容但基线未校准
+ *   的设备也走 adopt（哈希幂等回放安全，defer 会锁死在逐轮全量扫描的永动环）
  * - "poll"  一切就绪 → 常规按游标拉取
  */
 export function planChangeFeedRound(input: ChangeFeedDecisionInput): ChangeFeedPlan {
@@ -126,10 +134,9 @@ export function planChangeFeedRound(input: ChangeFeedDecisionInput): ChangeFeedP
   if (!input.sidecarUrl || input.sidecarUrl.trim() === "") return "off";
   if (input.syncMode !== "auto") return "off";
   if (!input.deviceId) return "off";
-  if (input.cursorRev === null || input.cursorRev === undefined) {
-    return input.baselinesReady ? "adopt" : "defer";
+  if (input.cursorRev === null || input.cursorRev === undefined || input.cursorRev <= 0) {
+    return input.baselinesReady || input.hasLocalContent === true ? "adopt" : "defer";
   }
-  if (input.cursorRev <= 0) return "defer";
   return "poll";
 }
 

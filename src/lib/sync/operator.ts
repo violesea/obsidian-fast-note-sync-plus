@@ -18,6 +18,7 @@ import type { DirtyEntry, DirtySnapshot } from "./incremental_scan_manager";
 import { getPostSendSyncPhase } from "./sync_state";
 import { canCompleteSync } from "./sync_completion_gate";
 import { createIncrementalScanProgress } from "./incremental_scan_progress";
+import { maybeRunDigestReconciliation } from "./digest_reconciliation";
 import { planChangeFeedRound, changeFeedDecisionInput, runChangeFeedCatchUp, shouldRestartFreshRoundOnResume } from "./change_feed";
 import type { CatchUpResult as ChangeFeedCatchUpResult } from "./change_feed";
 import {
@@ -848,6 +849,9 @@ export async function checkSyncCompletion(plugin: FastSync, intervalId?: number,
       // so a new scan cannot append to the same path while it is being cleared.
       plugin.incrementalScanManager?.completeSync();
       await clearScanDelta(plugin);
+      // M4 digest 兜底抽查：仅在整轮零失败成功后触发；内部自带平台/开关/24h
+      // 节流闸，不过闸时静默跳过。fire-and-forget，不阻塞轮次收尾。
+      void maybeRunDigestReconciliation(plugin, "sync-complete");
     } else {
       // Preserve both the previous committed baseline and scanDelta so a
       // failed/interrupted mobile round remains retryable after reload.

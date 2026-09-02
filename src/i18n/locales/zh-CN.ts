@@ -53,6 +53,8 @@ export default {
   "setting.remote.sidecar_url_desc": "fns-sidecar 只读变更流服务的地址；留空则禁用变更流。",
   "setting.remote.sidecar_token": "挎斗服务令牌",
   "setting.remote.sidecar_token_desc": "挎斗服务的访问令牌；仅本机回环部署可留空。",
+  "setting.remote.digest_check": "完整性兜底抽查（digest）",
+  "setting.remote.digest_check_desc": "桌面端每 24 小时对账一次服务端与本地基线的子树摘要：发现本地缺失即哈希校验后补齐；发现「本地已确认、服务端缺失」只告警不删除（移动端自动关闭）。",
   "setting.remote.device_id": "设备标识（deviceId）",
   "setting.remote.device_id_desc": "安装时生成的 UUID，与设备名解耦、永不变更；用于服务端记忆每台设备的同步游标。",
   "setting.remote.device_id_pending": "重启 Obsidian 后生成",
